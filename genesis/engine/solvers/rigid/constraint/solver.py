@@ -32,6 +32,37 @@ from . import linesearch
 from . import noslip as constraint_noslip
 
 
+class SoftWeldRequest:
+    """A weld request whose success is known after the next physics step."""
+
+    def __init__(self, solver, link_a, link_b, envs_idx):
+        self._solver = solver
+        self._link_a = min(link_a, link_b)
+        self._link_b = max(link_a, link_b)
+        self.envs_idx = envs_idx.clone()
+        self._result = None
+
+    def result(self):
+        """Return one success boolean per requested environment.
+
+        Read immediately after the next physics step. The first result is cached;
+        reading before the solver evaluates the weld raises an error.
+        """
+        if self._result is not None:
+            return self._result.clone()
+        records = self._solver.get_soft_weld_constraints()
+        pair = (records["link_a"][self.envs_idx] == self._link_a) & (
+            records["link_b"][self.envs_idx] == self._link_b
+        )
+        if not bool(pair.any(dim=1).all()):
+            raise RuntimeError("Soft-weld request was removed before its result was read")
+        pending = (pair & ~records["broken"][self.envs_idx] & ~records["solved"][self.envs_idx]).any(dim=1)
+        if bool(pending.any()):
+            raise RuntimeError("Soft-weld request has not been evaluated by a physics step")
+        self._result = (pair & records["solved"][self.envs_idx] & ~records["broken"][self.envs_idx]).any(dim=1)
+        return self._result.clone()
+
+
 @qd.func
 def _append_relevant_dof(
     i_con: qd.int32,
@@ -433,15 +464,24 @@ class ConstraintSolver:
         link_a = torch.full((n_envs, max_count), -1, dtype=gs.tc_int, device=gs.device)
         link_b = torch.full_like(link_a, -1)
         broken = torch.zeros((n_envs, max_count), dtype=torch.bool, device=gs.device)
+        solved = torch.zeros_like(broken)
         force = torch.zeros((n_envs, max_count, 6), dtype=gs.tc_float, device=gs.device)
         last_force = qd_to_torch(self._solver.dyn_info.equalities.soft_weld_force, transpose=True)
+        had_rows = qd_to_torch(self._solver.dyn_info.equalities.soft_weld_had_rows, transpose=True)
         env_idx, eq_idx = mask.nonzero(as_tuple=True)
         slot_idx = mask.to(torch.int32).cumsum(dim=1)[mask] - 1
         link_a[env_idx, slot_idx] = records["obj_a"][env_idx, eq_idx]
         link_b[env_idx, slot_idx] = records["obj_b"][env_idx, eq_idx]
         broken[env_idx, slot_idx] = kinds[env_idx, eq_idx] == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD
+        solved[env_idx, slot_idx] = had_rows[env_idx, eq_idx]
         force[env_idx, slot_idx] = last_force[env_idx, eq_idx]
-        return {"link_a": link_a, "link_b": link_b, "broken": broken, "force": force}
+        return {"link_a": link_a, "link_b": link_b, "broken": broken, "solved": solved, "force": force}
+
+    def request_soft_weld_constraint(self, link1_idx, link2_idx, **kwargs):
+        """Register a trial weld and return its deferred first-step result."""
+        envs_idx = self._solver._scene._sanitize_envs_idx(kwargs.get("envs_idx"))
+        self.add_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
+        return SoftWeldRequest(self, int(link1_idx), int(link2_idx), envs_idx)
 
     def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)

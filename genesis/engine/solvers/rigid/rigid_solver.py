@@ -3363,6 +3363,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             envs_idx=envs_idx,
         )
 
+    def request_soft_weld_constraint(self, link1_idx, link2_idx, **kwargs):
+        """Request a trial weld; call the returned handle's result after stepping."""
+        return self.constraint_solver.request_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
+
     def delete_soft_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         """Delete an active or broken soft weld from selected environments."""
         return self.constraint_solver.delete_soft_weld_constraint(link1_idx, link2_idx, envs_idx)

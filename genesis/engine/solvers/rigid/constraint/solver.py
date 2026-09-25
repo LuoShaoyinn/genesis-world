@@ -498,6 +498,7 @@ class ConstraintSolver:
         max_force=math.inf,
         max_torque=math.inf,
         anchor_pos=None,
+        anchor_local=None,
         envs_idx=None,
     ):
         """Attach two links with a compliant six-row weld.
@@ -509,6 +510,7 @@ class ConstraintSolver:
         """
         if self._solver._requires_grad:
             raise RuntimeError("Dynamic soft-weld breakage is not supported with differentiable simulation")
+        local_anchor_on_second = int(anchor_local is not None and int(link1_idx) > int(link2_idx))
         link1_idx, link2_idx = sorted((int(link1_idx), int(link2_idx)))
         if link1_idx < 0 or link2_idx >= self._solver.n_links or link1_idx == link2_idx:
             raise ValueError("Soft-weld links must be two distinct valid global link indices")
@@ -517,11 +519,18 @@ class ConstraintSolver:
             raise ValueError("Soft-weld stiffness and damping must be finite and nonnegative")
         if any(math.isnan(value) or value <= 0 for value in (max_force, max_torque)):
             raise ValueError("Soft-weld force and torque limits must be positive")
+        if anchor_pos is not None and anchor_local is not None:
+            raise ValueError("Specify either anchor_pos or anchor_local")
         if anchor_pos is not None:
             anchor_pos = np.asarray(anchor_pos, dtype=float)
             if anchor_pos.shape != (3,) or not np.isfinite(anchor_pos).all():
                 raise ValueError("anchor_pos must be a finite world-space 3-vector")
             anchor_pos = tuple(map(float, anchor_pos))
+        if anchor_local is not None:
+            anchor_local = np.asarray(anchor_local, dtype=float)
+            if anchor_local.shape != (3,) or not np.isfinite(anchor_local).all():
+                raise ValueError("anchor_local must be a finite local-space 3-vector")
+            anchor_local = tuple(map(float, anchor_local))
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         if torch.unique(envs_idx).numel() != envs_idx.numel():
             raise ValueError("envs_idx must not contain duplicates")
@@ -550,6 +559,9 @@ class ConstraintSolver:
             max_torque,
             int(anchor_pos is not None),
             *(anchor_pos if anchor_pos is not None else (0.0, 0.0, 0.0)),
+            int(anchor_local is not None),
+            local_anchor_on_second,
+            *(anchor_local if anchor_local is not None else (0.0, 0.0, 0.0)),
             envs_idx,
             self._solver.dyn_state,
             self.constraint_state,
@@ -2099,6 +2111,11 @@ def kernel_add_soft_weld_constraint(
     anchor_x: qd.f32,
     anchor_y: qd.f32,
     anchor_z: qd.f32,
+    has_anchor_local: qd.i32,
+    local_anchor_on_second: qd.i32,
+    local_x: qd.f32,
+    local_y: qd.f32,
+    local_z: qd.f32,
     envs_idx: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
@@ -2145,8 +2162,16 @@ def kernel_add_soft_weld_constraint(
                 func_init_weld_record(
                     i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.SOFT_WELD, dyn_state, dyn_info, rigid_info
                 )
-                if has_anchor_pos:
+                if has_anchor_pos or has_anchor_local:
                     anchor = gs.qd_vec3([anchor_x, anchor_y, anchor_z])
+                    if has_anchor_local:
+                        anchor_link = link1_idx
+                        if local_anchor_on_second:
+                            anchor_link = link2_idx
+                        anchor = gu.qd_transform_by_trans_quat(
+                            gs.qd_vec3([local_x, local_y, local_z]),
+                            dyn_state.links.pos[anchor_link, i_b], dyn_state.links.quat[anchor_link, i_b],
+                        )
                     pos1 = gu.qd_inv_transform_by_trans_quat(
                         anchor, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
                     )

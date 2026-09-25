@@ -300,19 +300,23 @@ def test_dynamic_soft_weld_world_anchor_prevents_orbit():
     )
     anchor = scene.add_entity(gs.morphs.Box(size=(0.24, 0.24, 0.24), pos=(0.0, 0.0, 0.12), fixed=True))
     body = scene.add_entity(gs.morphs.Box(size=(0.11, 0.08, 0.07), pos=(0.0, 0.0, 0.48)))
-    scene.build(n_envs=2)
+    scene.build(n_envs=3)
     solver = scene.sim.rigid_solver
     pair = (anchor.base_link.idx, body.base_link.idx)
     gains = dict(linear_stiffness=1500.0, linear_damping=20.0, angular_stiffness=1000.0, angular_damping=20.0)
     solver.add_soft_weld_constraint(*pair, envs_idx=[0], **gains)
     solver.add_soft_weld_constraint(*pair, anchor_pos=(0.0, 0.0, 0.48), envs_idx=[1], **gains)
-    body.set_quat((0.9800666, 0.0, 0.1986693, 0.0))  # 0.4 rad pitch, both environments.
+    solver.add_soft_weld_constraint(
+        body.base_link.idx, anchor.base_link.idx, anchor_local=(0.0, 0.0, 0.0), envs_idx=[2], **gains
+    )
+    body.set_quat((0.9800666, 0.0, 0.1986693, 0.0))  # 0.4 rad pitch in every environment.
 
     for _ in range(100):
         scene.step()
     x = body.get_pos()[:, 0]
     assert abs(float(x[0])) > 0.005
     assert abs(float(x[1])) < 0.001
+    assert abs(float(x[2])) < 0.001
 
 
 @pytest.mark.required

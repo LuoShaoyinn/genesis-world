@@ -3333,6 +3333,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         max_force=float("inf"),
         max_torque=float("inf"),
         anchor_pos=None,
+        anchor_local=None,
         envs_idx=None,
     ):
         """Add or re-arm a breakable six-DoF weld at the current relative pose.
@@ -3343,6 +3344,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         ``max_force`` (N) and ``max_torque`` (N m) are per-world-axis limits.
         ``anchor_pos`` is the shared attachment point in world coordinates at
         creation time. If omitted, the lower-index link's origin is used.
+        ``anchor_local`` gives the attachment point in ``link1_idx``'s local
+        coordinates, allowing a different world anchor per environment.
         An exceeded limit breaks that environment's weld for the next physics
         substep. The same call re-arms a broken pair and captures its new pose.
         """
@@ -3356,6 +3359,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             max_force=max_force,
             max_torque=max_torque,
             anchor_pos=anchor_pos,
+            anchor_local=anchor_local,
             envs_idx=envs_idx,
         )
 

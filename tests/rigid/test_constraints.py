@@ -275,6 +275,25 @@ def test_dynamic_soft_weld_break_and_reweld():
 
 
 @pytest.mark.required
+def test_soft_weld_projected_other_anchor_rejects_distant_request():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=2),
+        rigid_options=gs.options.RigidOptions(max_dynamic_constraints=1),
+        show_viewer=False,
+    )
+    ground = scene.add_entity(gs.morphs.Box(size=(1.0, 1.0, 0.1), pos=(0, 0, -0.05), fixed=True))
+    body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
+    scene.build(n_envs=1)
+    request = scene.sim.rigid_solver.request_soft_weld_constraint(
+        body.base_link.idx, ground.base_link.idx,
+        anchor_local=(0, 0, 0), project_other_anchor_z=0.0,
+        max_force=2.0, max_torque=1000.0,
+    )
+    scene.step()
+    assert_equal(request.result(), [False])
+
+
+@pytest.mark.required
 def test_dynamic_soft_weld_spring_response():
     scene = gs.Scene(sim_options=gs.options.SimOptions(dt=0.01, substeps=2), show_viewer=False)
     anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.5), fixed=True))

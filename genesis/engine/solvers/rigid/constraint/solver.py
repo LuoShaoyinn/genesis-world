@@ -539,6 +539,7 @@ class ConstraintSolver:
         max_torque=math.inf,
         anchor_pos=None,
         anchor_local=None,
+        project_other_anchor_z=None,
         envs_idx=None,
     ):
         """Attach two links with a compliant six-row weld.
@@ -561,6 +562,9 @@ class ConstraintSolver:
             raise ValueError("Soft-weld force and torque limits must be positive")
         if anchor_pos is not None and anchor_local is not None:
             raise ValueError("Specify either anchor_pos or anchor_local")
+        if project_other_anchor_z is not None:
+            if anchor_local is None or not math.isfinite(project_other_anchor_z):
+                raise ValueError("Ground projection requires a local anchor and finite z")
         if anchor_pos is not None:
             anchor_pos = np.asarray(anchor_pos, dtype=float)
             if anchor_pos.shape != (3,) or not np.isfinite(anchor_pos).all():
@@ -602,6 +606,8 @@ class ConstraintSolver:
             int(anchor_local is not None),
             local_anchor_on_second,
             *(anchor_local if anchor_local is not None else (0.0, 0.0, 0.0)),
+            int(project_other_anchor_z is not None),
+            float(project_other_anchor_z if project_other_anchor_z is not None else 0.0),
             envs_idx,
             self._solver.dyn_state,
             self.constraint_state,
@@ -2156,6 +2162,8 @@ def kernel_add_soft_weld_constraint(
     local_x: qd.f32,
     local_y: qd.f32,
     local_z: qd.f32,
+    project_other_anchor: qd.i32,
+    other_anchor_z: qd.f32,
     envs_idx: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
@@ -2212,11 +2220,19 @@ def kernel_add_soft_weld_constraint(
                             gs.qd_vec3([local_x, local_y, local_z]),
                             dyn_state.links.pos[anchor_link, i_b], dyn_state.links.quat[anchor_link, i_b],
                         )
+                    anchor1 = anchor
+                    anchor2 = anchor
+                    if project_other_anchor:
+                        projected = gs.qd_vec3([anchor[0], anchor[1], other_anchor_z])
+                        if local_anchor_on_second:
+                            anchor1 = projected
+                        else:
+                            anchor2 = projected
                     pos1 = gu.qd_inv_transform_by_trans_quat(
-                        anchor, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
+                        anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
                     )
                     pos2 = gu.qd_inv_transform_by_trans_quat(
-                        anchor, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
+                        anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
                     )
                     for i_axis in qd.static(range(3)):
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]

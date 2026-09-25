@@ -43,23 +43,11 @@ class SoftWeldRequest:
         self._result = None
 
     def result(self):
-        """Return one success boolean per requested environment.
-
-        Read immediately after the next physics step. The first result is cached;
-        reading before the solver evaluates the weld raises an error.
-        """
+        """Return device-side success flags after the next physics step."""
         if self._result is not None:
             return self._result.clone()
-        records = self._solver.get_soft_weld_constraints()
-        pair = (records["link_a"][self.envs_idx] == self._link_a) & (
-            records["link_b"][self.envs_idx] == self._link_b
-        )
-        if not bool(pair.any(dim=1).all()):
-            raise RuntimeError("Soft-weld request was removed before its result was read")
-        pending = (pair & ~records["broken"][self.envs_idx] & ~records["solved"][self.envs_idx]).any(dim=1)
-        if bool(pending.any()):
-            raise RuntimeError("Soft-weld request has not been evaluated by a physics step")
-        self._result = (pair & records["solved"][self.envs_idx] & ~records["broken"][self.envs_idx]).any(dim=1)
+        status = self._solver.get_soft_weld_pair_status(self._link_a, self._link_b, self.envs_idx)
+        self._result = status["active"] & status["solved"]
         return self._result.clone()
 
 
@@ -483,6 +471,18 @@ class ConstraintSolver:
         self.add_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
         return SoftWeldRequest(self, int(link1_idx), int(link2_idx), envs_idx)
 
+    def get_soft_weld_pair_status(self, link1_idx, link2_idx, envs_idx=None):
+        """Return active, broken, and solved flags without a CPU readback."""
+        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
+        status = torch.zeros((envs_idx.numel(), 3), dtype=gs.tc_int, device=gs.device)
+        kernel_get_soft_weld_pair_status(
+            min(int(link1_idx), int(link2_idx)), max(int(link1_idx), int(link2_idx)),
+            envs_idx, status, self.constraint_state, self._solver.dyn_info,
+            self._solver.rigid_info, self._solver.rigid_config,
+        )
+        return {"active": status[:, 0].bool(), "broken": status[:, 1].bool(),
+                "solved": status[:, 2].bool()}
+
     def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
@@ -578,19 +578,6 @@ class ConstraintSolver:
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         if torch.unique(envs_idx).numel() != envs_idx.numel():
             raise ValueError("envs_idx must not contain duplicates")
-        records = self.get_equality_constraints(as_tensor=True, to_torch=True)
-        kinds = records["type"][envs_idx]
-        pair = ((records["obj_a"][envs_idx] == link1_idx) & (records["obj_b"][envs_idx] == link2_idx)) | (
-            (records["obj_a"][envs_idx] == link2_idx) & (records["obj_b"][envs_idx] == link1_idx)
-        )
-        active = (kinds == gs.EQUALITY_TYPE.WELD) | (kinds == gs.EQUALITY_TYPE.SOFT_WELD)
-        if bool((pair & active).any()):
-            raise ValueError("These links already have an active weld in a selected environment")
-        counts = qd_to_torch(self.constraint_state.qd_n_equalities)[envs_idx]
-        reusable = (kinds == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD).any(dim=1)
-        capacity = self._solver.n_candidate_equalities_
-        if bool(((counts >= capacity) & ~reusable).any()):
-            raise RuntimeError("No dynamic equality slots remain; increase max_dynamic_constraints")
         self._eq_const_info_cache.clear()
         status = kernel_add_soft_weld_constraint(
             link1_idx,
@@ -654,6 +641,34 @@ class ConstraintSolver:
 # =====================================================================================================================
 # ================================================= Getters / Setters =================================================
 # =====================================================================================================================
+
+
+@qd.kernel(fastcache=True)
+def kernel_get_soft_weld_pair_status(
+    link1_idx: qd.i32,
+    link2_idx: qd.i32,
+    envs_idx: qd.types.ndarray(),
+    status: qd.types.ndarray(),
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b_ in range(envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
+            if (
+                dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
+                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
+            ):
+                eq_type = dyn_info.equalities.eq_type[i_e, i_b]
+                if eq_type == gs.EQUALITY_TYPE.SOFT_WELD:
+                    status[i_b_, 0] = 1
+                    if dyn_info.equalities.soft_weld_had_rows[i_e, i_b]:
+                        status[i_b_, 2] = 1
+                elif eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                    status[i_b_, 1] = 1
 
 
 @qd.kernel(fastcache=True)

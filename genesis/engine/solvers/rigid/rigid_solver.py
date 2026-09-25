@@ -3371,6 +3371,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         """Request a trial weld; call the returned handle's result after stepping."""
         return self.constraint_solver.request_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
 
+    def get_soft_weld_pair_status(self, link1_idx, link2_idx, envs_idx=None):
+        """Read device-side state for one soft-weld pair."""
+        return self.constraint_solver.get_soft_weld_pair_status(link1_idx, link2_idx, envs_idx)
+
     def delete_soft_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         """Delete an active or broken soft weld from selected environments."""
         return self.constraint_solver.delete_soft_weld_constraint(link1_idx, link2_idx, envs_idx)

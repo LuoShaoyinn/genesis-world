@@ -244,9 +244,6 @@ def test_dynamic_soft_weld_break_and_reweld():
         link_a, link_b, max_force=1000.0, max_torque=1000.0, envs_idx=[2]
     )
 
-    with pytest.raises(RuntimeError, match="not been evaluated"):
-        strong_request.result()
-
     with pytest.raises(ValueError, match="already have an active weld"):
         solver.add_soft_weld_constraint(link_a, link_b, envs_idx=[0])
     scene.step()

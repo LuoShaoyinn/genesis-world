@@ -294,6 +294,28 @@ def test_dynamic_soft_weld_spring_response():
 
 
 @pytest.mark.required
+def test_dynamic_soft_weld_world_anchor_prevents_orbit():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=2, gravity=(0.0, 0.0, 0.0)), show_viewer=False
+    )
+    anchor = scene.add_entity(gs.morphs.Box(size=(0.24, 0.24, 0.24), pos=(0.0, 0.0, 0.12), fixed=True))
+    body = scene.add_entity(gs.morphs.Box(size=(0.11, 0.08, 0.07), pos=(0.0, 0.0, 0.48)))
+    scene.build(n_envs=2)
+    solver = scene.sim.rigid_solver
+    pair = (anchor.base_link.idx, body.base_link.idx)
+    gains = dict(linear_stiffness=1500.0, linear_damping=20.0, angular_stiffness=1000.0, angular_damping=20.0)
+    solver.add_soft_weld_constraint(*pair, envs_idx=[0], **gains)
+    solver.add_soft_weld_constraint(*pair, anchor_pos=(0.0, 0.0, 0.48), envs_idx=[1], **gains)
+    body.set_quat((0.9800666, 0.0, 0.1986693, 0.0))  # 0.4 rad pitch, both environments.
+
+    for _ in range(100):
+        scene.step()
+    x = body.get_pos()[:, 0]
+    assert abs(float(x[0])) > 0.005
+    assert abs(float(x[1])) < 0.001
+
+
+@pytest.mark.required
 def test_urdf_mimic(show_viewer, tol, scaled_urdf_mimic):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(

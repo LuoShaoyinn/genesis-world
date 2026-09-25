@@ -162,6 +162,12 @@ uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install torch
 ```
 
+For this fork's ROCm 7.2.4 build, use Python 3.12 and the `rocm` extra instead:
+
+```bash
+uv sync --python 3.12 --extra rocm
+```
+
 Run an example:
 ```bash
 uv run examples/rigid/single_franka.py

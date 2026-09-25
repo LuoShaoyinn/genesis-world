@@ -68,8 +68,9 @@ def func_equality_links(i_eq, i_b, n_links, dyn_info: array_class.DynInfo, rigid
         if obj2 >= 0:
             i_l_b = func_joint_link(obj2, i_b, n_links, dyn_info, rigid_config)
     else:
-        i_l_a = obj1
-        i_l_b = obj2
+        if eq_type != gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+            i_l_a = obj1
+            i_l_b = obj2
     return i_l_a, i_l_b
 
 

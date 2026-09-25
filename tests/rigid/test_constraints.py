@@ -216,10 +216,81 @@ def test_dynamic_weld_scene_reset():
     solver.add_weld_constraint(box1.base_link_idx, box2.base_link_idx)
     assert solver.constraint_solver.constraint_state.qd_n_equalities[0] == n_eq_base + 1
     assert solver.constraint_solver.constraint_state.qd_n_equalities[1] == n_eq_base + 1
-
     scene.reset(state=scene.get_state(), envs_idx=[0])
     assert solver.constraint_solver.constraint_state.qd_n_equalities[0] == n_eq_base
     assert solver.constraint_solver.constraint_state.qd_n_equalities[1] == n_eq_base + 1
+
+
+@pytest.mark.required
+def test_dynamic_soft_weld_break_and_reweld():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=2),
+        rigid_options=gs.options.RigidOptions(max_dynamic_constraints=2),
+        show_viewer=False,
+    )
+    anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.5), fixed=True))
+    soft_body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.2, 0.0, 0.5)))
+    hard_body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.4, 0.0, 0.5)))
+    replacement = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.6, 0.0, 0.5)))
+    scene.build(n_envs=3)
+    solver = scene.sim.rigid_solver
+    link_a, link_b = anchor.base_link.idx, soft_body.base_link.idx
+    solver.add_weld_constraint(anchor.base_link.idx, hard_body.base_link.idx)
+    solver.add_soft_weld_constraint(link_a, link_b, max_force=0.001, max_torque=1000.0, envs_idx=[0])
+    solver.add_soft_weld_constraint(link_a, link_b, max_force=1000.0, max_torque=0.001, envs_idx=[1])
+    solver.add_soft_weld_constraint(link_a, link_b, max_force=1000.0, max_torque=1000.0, envs_idx=[2])
+
+    with pytest.raises(ValueError, match="already have an active weld"):
+        solver.add_soft_weld_constraint(link_a, link_b, envs_idx=[0])
+    scene.step()
+    soft = solver.get_soft_weld_constraints()
+    assert_equal(soft["broken"], [[True], [True], [False]])
+    assert abs(float(soft["force"][0, 0, 2])) > 0.001
+    assert abs(float(soft["force"][1, 0, 4])) > 0.001
+    # The second substep excludes broken weld rows but retains the hard weld.
+    assert_equal(solver.constraint_solver.n_constraints_equality.to_numpy(), [6, 6, 12])
+    hard = solver.get_weld_constraints()
+    assert_equal(hard["link_a"], [[anchor.base_link.idx]] * 3)
+    assert_equal(hard["link_b"], [[hard_body.base_link.idx]] * 3)
+    assert abs(float(hard["force"][0, 0, 2])) > 0.1
+
+    solver.add_soft_weld_constraint(link_a, link_b, max_force=1000.0, max_torque=1000.0, envs_idx=[0])
+    assert_equal(solver.get_soft_weld_constraints()["broken"], [[False], [True], [False]])
+    # A broken record can also be reused by a different pair when the pool is full.
+    solver.add_soft_weld_constraint(link_a, replacement.base_link.idx, envs_idx=[1])
+    assert_equal(solver.get_soft_weld_constraints()["link_b"], [[link_b], [replacement.base_link.idx], [link_b]])
+    solver.delete_soft_weld_constraint(link_a, replacement.base_link.idx, envs_idx=[1])
+    assert_equal(solver.get_soft_weld_constraints()["link_a"], [[link_a], [-1], [link_a]])
+    scene.reset(state=scene.get_state(), envs_idx=[0])
+    assert_equal(solver.get_soft_weld_constraints()["link_a"], [[-1], [-1], [link_a]])
+
+
+@pytest.mark.required
+def test_dynamic_soft_weld_spring_response():
+    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=0.01, substeps=2), show_viewer=False)
+    anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.5), fixed=True))
+    body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.2, 0.0, 0.5)))
+    scene.build(n_envs=3)
+    solver = scene.sim.rigid_solver
+    link_a, link_b = anchor.base_link.idx, body.base_link.idx
+    solver.add_soft_weld_constraint(
+        link_a,
+        link_b,
+        linear_stiffness=0.0,
+        linear_damping=0.0,
+        angular_stiffness=0.0,
+        angular_damping=0.0,
+        envs_idx=[0],
+    )
+    solver.add_soft_weld_constraint(link_a, link_b, envs_idx=[1])
+    for _ in range(20):
+        scene.step()
+    height = body.get_pos()[:, 2]
+    # Zero gains behave like the unwelded environment; the compliant weld
+    # exerts a restoring force but allows visible displacement.
+    assert abs(float(height[0] - height[2])) < 1e-4
+    assert float(height[1] - height[2]) > 0.01
+    assert float(height[1]) < 0.5
 
 
 @pytest.mark.required

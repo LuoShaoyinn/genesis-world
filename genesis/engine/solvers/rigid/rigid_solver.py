@@ -3321,6 +3321,52 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def get_weld_constraints(self, as_tensor: bool = True, to_torch: bool = True):
         return self.constraint_solver.get_weld_constraints(as_tensor, to_torch)
 
+    def add_soft_weld_constraint(
+        self,
+        link1_idx,
+        link2_idx,
+        *,
+        linear_stiffness=1000.0,
+        linear_damping=40.0,
+        angular_stiffness=1000.0,
+        angular_damping=40.0,
+        max_force=float("inf"),
+        max_torque=float("inf"),
+        envs_idx=None,
+    ):
+        """Add or re-arm a breakable six-DoF weld at the current relative pose.
+
+        ``linear_stiffness`` and ``angular_stiffness`` are acceleration-level
+        restoring gains (s^-2); the damping gains are in s^-1. They tune a
+        compliant equality solve, rather than a mass-independent Hooke spring.
+        ``max_force`` (N) and ``max_torque`` (N m) are per-world-axis limits.
+        An exceeded limit breaks that environment's weld for the next physics
+        substep. The same call re-arms a broken pair and captures its new pose.
+        """
+        return self.constraint_solver.add_soft_weld_constraint(
+            link1_idx,
+            link2_idx,
+            linear_stiffness=linear_stiffness,
+            linear_damping=linear_damping,
+            angular_stiffness=angular_stiffness,
+            angular_damping=angular_damping,
+            max_force=max_force,
+            max_torque=max_torque,
+            envs_idx=envs_idx,
+        )
+
+    def delete_soft_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        """Delete an active or broken soft weld from selected environments."""
+        return self.constraint_solver.delete_soft_weld_constraint(link1_idx, link2_idx, envs_idx)
+
+    def get_soft_weld_constraints(self):
+        """Return padded batched link pairs, break flags and last wrenches.
+
+        ``force[..., :3]`` is force in N and ``force[..., 3:]`` is direct
+        torque in N m on ``link_a``. Padded entries use ``link_a == -1``.
+        """
+        return self.constraint_solver.get_soft_weld_constraints()
+
     def get_equality_constraints(self, as_tensor: bool = True, to_torch: bool = True):
         return self.constraint_solver.get_equality_constraints(as_tensor, to_torch)
 

@@ -2687,6 +2687,9 @@ class EqualitiesInfo:
     eq_data: qd.Tensor
     eq_type: qd.Tensor
     sol_params: qd.Tensor
+    soft_weld_params: qd.Tensor
+    soft_weld_force: qd.Tensor
+    soft_weld_had_rows: qd.Tensor
 
 
 def get_equalities_info(solver, is_active=True):
@@ -2698,6 +2701,11 @@ def get_equalities_info(solver, is_active=True):
         eq_data=V(dtype=gs.qd_vec11, shape=shape),
         eq_type=V(dtype=gs.qd_int, shape=shape),
         sol_params=V(dtype=gs.qd_vec7, shape=shape),
+        # [linear stiffness, linear damping, angular stiffness, angular damping,
+        #  maximum linear row force, maximum angular row force].
+        soft_weld_params=V(dtype=gs.qd_vec6, shape=shape),
+        soft_weld_force=V(dtype=gs.qd_vec6, shape=shape),
+        soft_weld_had_rows=V(dtype=gs.qd_bool, shape=shape),
     )
 
 

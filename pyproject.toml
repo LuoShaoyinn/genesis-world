@@ -78,6 +78,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rocm = ["torch", "triton"]
 dev = [
     "black",
     "pytest",
@@ -224,3 +225,13 @@ log_cli_level = "WARNING"
 # uv respects the build-system and project tables
 # PyTorch must be installed separately before Genesis due to platform-specific builds
 # See README.md for installation instructions with different PyTorch backends
+
+[tool.uv.sources]
+torch = [{ index = "rocm724", extra = "rocm" }]
+triton = [{ index = "rocm724", extra = "rocm" }]
+
+[[tool.uv.index]]
+name = "rocm724"
+url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/"
+format = "flat"
+explicit = true

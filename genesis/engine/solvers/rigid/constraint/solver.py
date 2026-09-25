@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -314,7 +315,7 @@ class ConstraintSolver:
         if self._solver._options.noslip_iterations > 0:
             self.noslip()
 
-        func_update_contact_force(
+        func_finalize_constraint_forces(
             self._solver.dyn_state,
             self._collider.collider_state,
             self.constraint_state,
@@ -322,6 +323,7 @@ class ConstraintSolver:
             self._solver.rigid_info,
             self._solver.rigid_config,
         )
+        self._eq_const_info_cache.clear()
 
     def noslip(self):
         constraint_noslip.kernel_noslip(
@@ -416,6 +418,31 @@ class ConstraintSolver:
 
         return weld_const_info
 
+    def get_soft_weld_constraints(self):
+        """Return active and broken soft welds, padded across environments.
+
+        ``force`` is the last six-component wrench on ``link_a`` (N, N m),
+        including the wrench that caused a break. Broken welds retain their
+        link pair and report ``broken=True`` until reused/deleted.
+        """
+        records = self.get_equality_constraints(as_tensor=True, to_torch=True)
+        kinds = records["type"]
+        mask = (kinds == gs.EQUALITY_TYPE.SOFT_WELD) | (kinds == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD)
+        n_envs = kinds.shape[0]
+        max_count = int(mask.sum(dim=1).max().item()) if n_envs else 0
+        link_a = torch.full((n_envs, max_count), -1, dtype=gs.tc_int, device=gs.device)
+        link_b = torch.full_like(link_a, -1)
+        broken = torch.zeros((n_envs, max_count), dtype=torch.bool, device=gs.device)
+        force = torch.zeros((n_envs, max_count, 6), dtype=gs.tc_float, device=gs.device)
+        last_force = qd_to_torch(self._solver.dyn_info.equalities.soft_weld_force, transpose=True)
+        env_idx, eq_idx = mask.nonzero(as_tuple=True)
+        slot_idx = mask.to(torch.int32).cumsum(dim=1)[mask] - 1
+        link_a[env_idx, slot_idx] = records["obj_a"][env_idx, eq_idx]
+        link_b[env_idx, slot_idx] = records["obj_b"][env_idx, eq_idx]
+        broken[env_idx, slot_idx] = kinds[env_idx, eq_idx] == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD
+        force[env_idx, slot_idx] = last_force[env_idx, eq_idx]
+        return {"link_a": link_a, "link_b": link_b, "broken": broken, "force": force}
+
     def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
@@ -452,6 +479,88 @@ class ConstraintSolver:
         kernel_delete_weld_constraint(
             int(link1_idx),
             int(link2_idx),
+            envs_idx,
+            self.constraint_state,
+            self._solver.dyn_info,
+            self._solver.rigid_info,
+            self._solver.rigid_config,
+        )
+
+    def add_soft_weld_constraint(
+        self,
+        link1_idx,
+        link2_idx,
+        *,
+        linear_stiffness=1000.0,
+        linear_damping=40.0,
+        angular_stiffness=1000.0,
+        angular_damping=40.0,
+        max_force=math.inf,
+        max_torque=math.inf,
+        envs_idx=None,
+    ):
+        """Attach two links with a compliant six-row weld.
+
+        Stiffness and damping are acceleration-level gains in s^-2 and s^-1.
+        The limits apply per world axis to the force and direct torque at the
+        attachment, in N and N m respectively.
+        Exceeding either limit breaks the weld for the next physics substep.
+        """
+        if self._solver._requires_grad:
+            raise RuntimeError("Dynamic soft-weld breakage is not supported with differentiable simulation")
+        link1_idx, link2_idx = sorted((int(link1_idx), int(link2_idx)))
+        if link1_idx < 0 or link2_idx >= self._solver.n_links or link1_idx == link2_idx:
+            raise ValueError("Soft-weld links must be two distinct valid global link indices")
+        values = (linear_stiffness, linear_damping, angular_stiffness, angular_damping)
+        if any(not math.isfinite(value) or value < 0 for value in values):
+            raise ValueError("Soft-weld stiffness and damping must be finite and nonnegative")
+        if any(math.isnan(value) or value <= 0 for value in (max_force, max_torque)):
+            raise ValueError("Soft-weld force and torque limits must be positive")
+        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
+        if torch.unique(envs_idx).numel() != envs_idx.numel():
+            raise ValueError("envs_idx must not contain duplicates")
+        records = self.get_equality_constraints(as_tensor=True, to_torch=True)
+        kinds = records["type"][envs_idx]
+        pair = ((records["obj_a"][envs_idx] == link1_idx) & (records["obj_b"][envs_idx] == link2_idx)) | (
+            (records["obj_a"][envs_idx] == link2_idx) & (records["obj_b"][envs_idx] == link1_idx)
+        )
+        active = (kinds == gs.EQUALITY_TYPE.WELD) | (kinds == gs.EQUALITY_TYPE.SOFT_WELD)
+        if bool((pair & active).any()):
+            raise ValueError("These links already have an active weld in a selected environment")
+        counts = qd_to_torch(self.constraint_state.qd_n_equalities)[envs_idx]
+        reusable = (kinds == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD).any(dim=1)
+        capacity = self._solver.n_candidate_equalities_
+        if bool(((counts >= capacity) & ~reusable).any()):
+            raise RuntimeError("No dynamic equality slots remain; increase max_dynamic_constraints")
+        self._eq_const_info_cache.clear()
+        status = kernel_add_soft_weld_constraint(
+            link1_idx,
+            link2_idx,
+            linear_stiffness,
+            linear_damping,
+            angular_stiffness,
+            angular_damping,
+            max_force,
+            max_torque,
+            envs_idx,
+            self._solver.dyn_state,
+            self.constraint_state,
+            self._solver.dyn_info,
+            self._solver.rigid_info,
+            self._solver.rigid_config,
+        )
+        if status & 1:
+            raise RuntimeError("No dynamic equality slots remain; increase max_dynamic_constraints")
+        if status & 2:
+            raise ValueError("These links already have an active weld in a selected environment")
+
+    def delete_soft_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        link1_idx, link2_idx = sorted((int(link1_idx), int(link2_idx)))
+        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
+        self._eq_const_info_cache.clear()
+        kernel_delete_soft_weld_constraint(
+            link1_idx,
+            link2_idx,
             envs_idx,
             self.constraint_state,
             self._solver.dyn_info,
@@ -523,11 +632,17 @@ def kernel_get_equality_constraints(
                     i_c = i_c_start + i_c_
                     fout[i_e, i_c_] = constraint_state.efc_force[i_c, i_b]
                 i_c_start = i_c_start + 3
-            elif dyn_info.equalities.eq_type[i_e_, i_b] == gs.EQUALITY_TYPE.WELD:
+            elif (
+                dyn_info.equalities.eq_type[i_e_, i_b] == gs.EQUALITY_TYPE.WELD
+                or dyn_info.equalities.eq_type[i_e_, i_b] == gs.EQUALITY_TYPE.SOFT_WELD
+            ):
                 for i_c_ in qd.static(range(6)):
                     i_c = i_c_start + i_c_
                     fout[i_e, i_c_] = constraint_state.efc_force[i_c, i_b]
                 i_c_start = i_c_start + 6
+            elif dyn_info.equalities.eq_type[i_e_, i_b] == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                if dyn_info.equalities.soft_weld_had_rows[i_e_, i_b]:
+                    i_c_start = i_c_start + 6
             elif dyn_info.equalities.eq_type[i_e_, i_b] == gs.EQUALITY_TYPE.JOINT:
                 fout[i_e, 0] = constraint_state.efc_force[i_c_start, i_b]
                 i_c_start = i_c_start + 1
@@ -1381,10 +1496,17 @@ def add_equality_constraints(
             if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.CONNECT:
                 func_equality_connect(i_b, i_e, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
 
-            elif dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.WELD:
+            elif (
+                dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.WELD
+                or dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD
+            ):
+                if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD:
+                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = True
                 func_equality_weld(i_b, i_e, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
             elif dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.JOINT:
                 func_equality_joint(i_b, i_e, dyn_state, constraint_state, dyn_info, rigid_info, rigid_config)
+            elif dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
 
 
 @qd.func
@@ -1589,6 +1711,10 @@ def func_equality_weld(
     )
     torquescale = dyn_info.equalities.eq_data[i_e, i_b][10]
     sol_params = dyn_info.equalities.sol_params[i_e, i_b]
+    is_soft = dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD
+    soft_params = qd.Vector.zero(gs.qd_float, 6)
+    if is_soft:
+        soft_params = dyn_info.equalities.soft_weld_params[i_e, i_b]
 
     # Transform anchor positions to global coordinates
     global_anchor1 = gu.qd_transform_by_trans_quat(
@@ -1675,6 +1801,11 @@ def func_equality_weld(
         _sort_relevant_dofs_descending(n_con, i_b, con_n_dofs, constraint_state, rigid_config)
 
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel, pos_error[i])
+        if is_soft:
+            dt = rigid_info.substep_dt[None]
+            strength = soft_params[0] * dt * dt + soft_params[1] * dt
+            imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
+            aref = -soft_params[1] * jac_qvel - soft_params[0] * pos_error[i]
         diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
 
         constraint_state.diag[n_con, i_b] = diag
@@ -1754,6 +1885,11 @@ def func_equality_weld(
     for i_con_ in qd.static(range(3)):
         i_con = i_con_ + n_con
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel[i_con_], rot_error[i_con_])
+        if is_soft:
+            dt = rigid_info.substep_dt[None]
+            strength = soft_params[2] * dt * dt + soft_params[3] * dt
+            imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
+            aref = -soft_params[3] * jac_qvel[i_con_] - soft_params[2] * rot_error[i_con_]
         diag = qd.max(invweight[1] * (1.0 - imp) / imp, EPS)
 
         constraint_state.diag[i_con, i_b] = diag
@@ -1878,6 +2014,42 @@ def add_frictionloss_constraints(
 # ====================================== Runtime User-Specified Weld Constraints ======================================
 
 
+@qd.func
+def func_init_weld_record(
+    i_e,
+    i_b,
+    link1_idx,
+    link2_idx,
+    eq_type,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+):
+    """Capture the links' current relative pose for either dynamic weld type."""
+    shared_pos = dyn_state.links.pos[link1_idx, i_b]
+    pos1 = gu.qd_inv_transform_by_trans_quat(
+        shared_pos, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
+    )
+    pos2 = gu.qd_inv_transform_by_trans_quat(
+        shared_pos, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
+    )
+
+    dyn_info.equalities.eq_type[i_e, i_b] = gs.qd_int(eq_type)
+    dyn_info.equalities.eq_obj1id[i_e, i_b] = link1_idx
+    dyn_info.equalities.eq_obj2id[i_e, i_b] = link2_idx
+    for i_3 in qd.static(range(3)):
+        dyn_info.equalities.eq_data[i_e, i_b][i_3 + 3] = pos1[i_3]
+        dyn_info.equalities.eq_data[i_e, i_b][i_3] = pos2[i_3]
+
+    relpose = gu.qd_quat_mul(gu.qd_inv_quat(dyn_state.links.quat[link1_idx, i_b]), dyn_state.links.quat[link2_idx, i_b])
+    for i_4 in qd.static(range(4)):
+        dyn_info.equalities.eq_data[i_e, i_b][i_4 + 6] = relpose[i_4]
+    dyn_info.equalities.eq_data[i_e, i_b][10] = 1.0
+    dyn_info.equalities.sol_params[i_e, i_b] = qd.Vector(
+        [2 * rigid_info.substep_dt[None], 1.0, 0.9, 0.95, 0.001, 0.5, 2.0]
+    )
+
+
 @qd.kernel(fastcache=True)
 def kernel_add_weld_constraint(
     link1_idx: qd.i32,
@@ -1898,37 +2070,75 @@ def kernel_add_weld_constraint(
         if i_e == rigid_info.n_candidate_equalities[None]:
             overflow = True
         else:
-            shared_pos = dyn_state.links.pos[link1_idx, i_b]
-            pos1 = gu.qd_inv_transform_by_trans_quat(
-                shared_pos, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
+            func_init_weld_record(
+                i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.WELD, dyn_state, dyn_info, rigid_info
             )
-            pos2 = gu.qd_inv_transform_by_trans_quat(
-                shared_pos, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
-            )
-
-            dyn_info.equalities.eq_type[i_e, i_b] = gs.qd_int(gs.EQUALITY_TYPE.WELD)
-            dyn_info.equalities.eq_obj1id[i_e, i_b] = link1_idx
-            dyn_info.equalities.eq_obj2id[i_e, i_b] = link2_idx
-
-            for i_3 in qd.static(range(3)):
-                dyn_info.equalities.eq_data[i_e, i_b][i_3 + 3] = pos1[i_3]
-                dyn_info.equalities.eq_data[i_e, i_b][i_3] = pos2[i_3]
-
-            relpose = gu.qd_quat_mul(
-                gu.qd_inv_quat(dyn_state.links.quat[link1_idx, i_b]), dyn_state.links.quat[link2_idx, i_b]
-            )
-
-            for i_4 in qd.static(range(4)):
-                dyn_info.equalities.eq_data[i_e, i_b][i_4 + 6] = relpose[i_4]
-
-            dyn_info.equalities.eq_data[i_e, i_b][10] = 1.0
-
-            dyn_info.equalities.sol_params[i_e, i_b] = qd.Vector(
-                [2 * rigid_info.substep_dt[None], 1.0, 0.9, 0.95, 0.001, 0.5, 2.0]
-            )
-
             constraint_state.qd_n_equalities[i_b] = constraint_state.qd_n_equalities[i_b] + 1
     return overflow
+
+
+@qd.kernel(fastcache=True)
+def kernel_add_soft_weld_constraint(
+    link1_idx: qd.i32,
+    link2_idx: qd.i32,
+    linear_stiffness: qd.f32,
+    linear_damping: qd.f32,
+    angular_stiffness: qd.f32,
+    angular_damping: qd.f32,
+    max_force: qd.f32,
+    max_torque: qd.f32,
+    envs_idx: qd.types.ndarray(),
+    dyn_state: array_class.DynState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+) -> qd.i32:
+    status = gs.qd_int(0)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b_ in range(envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        i_broken = gs.qd_int(-1)
+        i_reusable = gs.qd_int(-1)
+        is_duplicate = False
+        for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
+            eq_type = dyn_info.equalities.eq_type[i_e, i_b]
+            same_pair = (
+                dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
+                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
+            ) or (
+                dyn_info.equalities.eq_obj1id[i_e, i_b] == link2_idx
+                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link1_idx
+            )
+            if same_pair and (eq_type == gs.EQUALITY_TYPE.WELD or eq_type == gs.EQUALITY_TYPE.SOFT_WELD):
+                is_duplicate = True
+            if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                if i_reusable < 0:
+                    i_reusable = i_e
+                if same_pair:
+                    i_broken = i_e
+        if is_duplicate:
+            status = status | gs.qd_int(2)
+        else:
+            i_e = i_broken
+            if i_e < 0:
+                i_e = i_reusable
+            if i_e < 0:
+                i_e = constraint_state.qd_n_equalities[i_b]
+                if i_e == rigid_info.n_candidate_equalities[None]:
+                    status = status | gs.qd_int(1)
+                else:
+                    constraint_state.qd_n_equalities[i_b] = i_e + 1
+            if i_e < rigid_info.n_candidate_equalities[None]:
+                func_init_weld_record(
+                    i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.SOFT_WELD, dyn_state, dyn_info, rigid_info
+                )
+                dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
+                    [linear_stiffness, linear_damping, angular_stiffness, angular_damping, max_force, max_torque]
+                )
+                dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
+                dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+    return status
 
 
 @qd.kernel(fastcache=True)
@@ -1959,7 +2169,47 @@ def kernel_delete_weld_constraint(
                     dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
                     dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
                     dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
+                    dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
+                    dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
+                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[
+                        i_last, i_b
+                    ]
                 constraint_state.qd_n_equalities[i_b] = constraint_state.qd_n_equalities[i_b] - 1
+
+
+@qd.kernel(fastcache=True)
+def kernel_delete_soft_weld_constraint(
+    link1_idx: qd.i32,
+    link2_idx: qd.i32,
+    envs_idx: qd.types.ndarray(),
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_b_ in range(envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
+            eq_type = dyn_info.equalities.eq_type[i_e, i_b]
+            if (
+                (eq_type == gs.EQUALITY_TYPE.SOFT_WELD or eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD)
+                and dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
+                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
+            ):
+                i_last = constraint_state.qd_n_equalities[i_b] - 1
+                if i_e < i_last:
+                    dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[i_last, i_b]
+                    dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[i_last, i_b]
+                    dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
+                    dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
+                    dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
+                    dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
+                    dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
+                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[
+                        i_last, i_b
+                    ]
+                constraint_state.qd_n_equalities[i_b] = i_last
 
 
 # =====================================================================================================================
@@ -5586,7 +5836,7 @@ def func_solve_body_monolith(dyn_state, constraint_state, dyn_info, rigid_info, 
 
 
 @qd.kernel(fastcache=True)
-def func_update_contact_force(
+def func_finalize_constraint_forces(
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
     constraint_state: array_class.ConstraintState,
@@ -5654,6 +5904,64 @@ def func_update_contact_force(
             dyn_state.links.contact_force[contact_data_link_b, i_b] = (
                 dyn_state.links.contact_force[contact_data_link_b, i_b] + force
             )
+
+        # Equality rows are first in the solve. Keep a broken record (rather
+        # than moving records here) so the current substep's solved forces and
+        # integration remain consistent; it contributes no rows next substep.
+        i_row = gs.qd_int(0)
+        for i_e in range(constraint_state.qd_n_equalities[i_b]):
+            eq_type = dyn_info.equalities.eq_type[i_e, i_b]
+            if eq_type == gs.EQUALITY_TYPE.CONNECT:
+                i_row = i_row + 3
+            elif eq_type == gs.EQUALITY_TYPE.WELD:
+                i_row = i_row + 6
+            elif eq_type == gs.EQUALITY_TYPE.JOINT:
+                i_row = i_row + 1
+            elif eq_type == gs.EQUALITY_TYPE.SOFT_WELD:
+                params = dyn_info.equalities.soft_weld_params[i_e, i_b]
+                broken = False
+                for i_axis in qd.static(range(3)):
+                    row_force = constraint_state.efc_force[i_row + i_axis, i_b]
+                    dyn_info.equalities.soft_weld_force[i_e, i_b][i_axis] = row_force
+                    if qd.abs(row_force) > params[4]:
+                        broken = True
+
+                # The orientation rows use a quaternion Jacobian. Their raw
+                # multipliers are not torques; map them through the rotational
+                # Jacobian before comparing with the limit in N m.
+                link1_idx = dyn_info.equalities.eq_obj1id[i_e, i_b]
+                link2_idx = dyn_info.equalities.eq_obj2id[i_e, i_b]
+                quat1 = dyn_state.links.quat[link1_idx, i_b]
+                inv_quat2 = gu.qd_inv_quat(dyn_state.links.quat[link2_idx, i_b])
+                relpose = gs.qd_vec4(
+                    [
+                        dyn_info.equalities.eq_data[i_e, i_b][6],
+                        dyn_info.equalities.eq_data[i_e, i_b][7],
+                        dyn_info.equalities.eq_data[i_e, i_b][8],
+                        dyn_info.equalities.eq_data[i_e, i_b][9],
+                    ]
+                )
+                q = gu.qd_quat_mul(quat1, relpose)
+                torquescale = dyn_info.equalities.eq_data[i_e, i_b][10]
+                for i_axis in qd.static(range(3)):
+                    axis = qd.Vector.zero(gs.qd_float, 3)
+                    axis[i_axis] = 1.0
+                    quat_jac = gu.qd_quat_mul(gu.qd_quat_mul_axis(inv_quat2, axis), q)
+                    torque = gs.qd_float(0.0)
+                    for i_rot in qd.static(range(3)):
+                        torque = (
+                            torque
+                            + 0.5
+                            * quat_jac[i_rot + 1]
+                            * torquescale
+                            * constraint_state.efc_force[i_row + 3 + i_rot, i_b]
+                        )
+                    dyn_info.equalities.soft_weld_force[i_e, i_b][i_axis + 3] = torque
+                    if qd.abs(torque) > params[5]:
+                        broken = True
+                if broken:
+                    dyn_info.equalities.eq_type[i_e, i_b] = gs.qd_int(gs.EQUALITY_TYPE.BROKEN_SOFT_WELD)
+                i_row = i_row + 6
 
         # The settled islands fall asleep here, once the solve has written the forces their contacts and dofs keep
         # reporting for as long as they sleep, and before the integration skips their dofs.

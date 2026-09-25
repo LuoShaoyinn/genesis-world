@@ -291,6 +291,32 @@ def test_soft_weld_projected_other_anchor_rejects_distant_request():
 
 
 @pytest.mark.required
+def test_masked_soft_weld_valve_changes():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=2),
+        rigid_options=gs.options.RigidOptions(max_dynamic_constraints=1),
+        show_viewer=False,
+    )
+    ground = scene.add_entity(gs.morphs.Box(size=(1.0, 1.0, 0.1), pos=(0, 0, -0.05), fixed=True))
+    body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
+    scene.build(n_envs=2)
+    solver = scene.sim.rigid_solver
+    pair = (body.base_link.idx, ground.base_link.idx)
+    gains = dict(linear_stiffness=2400.0, linear_damping=10.0,
+                 angular_stiffness=0.016, angular_damping=0.000125,
+                 max_force=2.0, max_torque=0.015,
+                 anchor_local=(0, 0, 0), project_other_anchor_z=0.0)
+    solver.apply_soft_weld_masked(*pair, torch.tensor([True, True], device=gs.device),
+                                  torch.tensor([False, False], device=gs.device), **gains)
+    scene.step()
+    assert_equal(solver.get_soft_weld_pair_status(*pair)["broken"], [True, True])
+    solver.apply_soft_weld_masked(*pair, torch.tensor([False, False], device=gs.device),
+                                  torch.tensor([True, False], device=gs.device), **gains)
+    scene.step()
+    assert_equal(solver.get_soft_weld_pair_status(*pair)["broken"], [False, True])
+
+
+@pytest.mark.required
 def test_dynamic_soft_weld_spring_response():
     scene = gs.Scene(sim_options=gs.options.SimOptions(dt=0.01, substeps=2), show_viewer=False)
     anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.5), fixed=True))

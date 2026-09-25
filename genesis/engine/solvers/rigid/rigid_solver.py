@@ -1349,6 +1349,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             gs.raise_exception("Invalid constraint forces causing 'nan'. Please decrease Rigid simulation timestep.")
         if errno & array_class.ErrorCode.INVALID_ACC_NAN:
             gs.raise_exception("Invalid accelerations causing 'nan'. Please decrease Rigid simulation timestep.")
+        if errno & array_class.ErrorCode.OVERFLOW_DYNAMIC_EQUALITIES:
+            gs.raise_exception("No dynamic equality slots remain; increase max_dynamic_constraints.")
+        if errno & array_class.ErrorCode.DUPLICATE_DYNAMIC_WELD:
+            gs.raise_exception("A soft weld was requested for an already active pair.")
 
     def _kernel_detect_collision(self):
         self.collider.clear()
@@ -3374,6 +3378,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def get_soft_weld_pair_status(self, link1_idx, link2_idx, envs_idx=None):
         """Read device-side state for one soft-weld pair."""
         return self.constraint_solver.get_soft_weld_pair_status(link1_idx, link2_idx, envs_idx)
+
+    def apply_soft_weld_masked(self, link1_idx, link2_idx, engage_mask, release_mask, **kwargs):
+        """Apply batched valve masks without extracting environment indices on the CPU."""
+        return self.constraint_solver.apply_soft_weld_masked(
+            link1_idx, link2_idx, engage_mask, release_mask, **kwargs
+        )
 
     def delete_soft_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
         """Delete an active or broken soft weld from selected environments."""

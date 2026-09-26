@@ -354,7 +354,7 @@ def test_dynamic_soft_weld_world_anchor_prevents_orbit():
     scene.build(n_envs=3)
     solver = scene.sim.rigid_solver
     pair = (anchor.base_link.idx, body.base_link.idx)
-    gains = dict(linear_stiffness=1500.0, linear_damping=20.0, angular_stiffness=1000.0, angular_damping=20.0)
+    gains = dict(linear_stiffness=1500.0, linear_damping=20.0, angular_stiffness=1.0, angular_damping=0.02)
     solver.add_soft_weld_constraint(*pair, envs_idx=[0], **gains)
     solver.add_soft_weld_constraint(*pair, anchor_pos=(0.0, 0.0, 0.48), envs_idx=[1], **gains)
     solver.add_soft_weld_constraint(

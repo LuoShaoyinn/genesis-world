@@ -3332,8 +3332,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         *,
         linear_stiffness=1000.0,
         linear_damping=40.0,
-        angular_stiffness=1000.0,
-        angular_damping=40.0,
+        angular_stiffness=1.0,
+        angular_damping=0.02,
         max_force=float("inf"),
         max_torque=float("inf"),
         anchor_pos=None,
@@ -3343,9 +3343,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     ):
         """Add or re-arm a breakable six-DoF weld at the current relative pose.
 
-        ``linear_stiffness`` and ``angular_stiffness`` are acceleration-level
-        restoring gains (s^-2); the damping gains are in s^-1. They tune a
-        compliant equality solve, rather than a mass-independent Hooke spring.
+        ``linear_stiffness`` is in N/m and ``linear_damping`` in N s/m.
+        ``angular_stiffness`` is in N m/rad and ``angular_damping`` in
+        N m s/rad. The equality solver converts these nominal physical
+        coefficients to acceleration gains using the links' inverse weights.
+        Articulated effective mass, rotational constraint scaling, and solver
+        regularization can affect the actual reaction force.
         ``max_force`` (N) and ``max_torque`` (N m) are per-world-axis limits.
         ``anchor_pos`` is the shared attachment point in world coordinates at
         creation time. If omitted, the lower-index link's origin is used.

@@ -564,8 +564,8 @@ class ConstraintSolver:
         *,
         linear_stiffness=1000.0,
         linear_damping=40.0,
-        angular_stiffness=1000.0,
-        angular_damping=40.0,
+        angular_stiffness=1.0,
+        angular_damping=0.02,
         max_force=math.inf,
         max_torque=math.inf,
         anchor_pos=None,
@@ -1915,9 +1915,13 @@ def func_equality_weld(
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel, pos_error[i])
         if is_soft:
             dt = rigid_info.substep_dt[None]
-            strength = soft_params[0] * dt * dt + soft_params[1] * dt
+            # Convert physical stiffness/damping to the acceleration gains used
+            # by the equality solver. Keep this per environment and on device.
+            kp = soft_params[0] * invweight[0]
+            kd = soft_params[1] * invweight[0]
+            strength = kp * dt * dt + kd * dt
             imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
-            aref = -soft_params[1] * jac_qvel - soft_params[0] * pos_error[i]
+            aref = -kd * jac_qvel - kp * pos_error[i]
         diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
 
         constraint_state.diag[n_con, i_b] = diag
@@ -1999,9 +2003,11 @@ def func_equality_weld(
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel[i_con_], rot_error[i_con_])
         if is_soft:
             dt = rigid_info.substep_dt[None]
-            strength = soft_params[2] * dt * dt + soft_params[3] * dt
+            kp = soft_params[2] * invweight[1]
+            kd = soft_params[3] * invweight[1]
+            strength = kp * dt * dt + kd * dt
             imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
-            aref = -soft_params[3] * jac_qvel[i_con_] - soft_params[2] * rot_error[i_con_]
+            aref = -kd * jac_qvel[i_con_] - kp * rot_error[i_con_]
         diag = qd.max(invweight[1] * (1.0 - imp) / imp, EPS)
 
         constraint_state.diag[i_con, i_b] = diag

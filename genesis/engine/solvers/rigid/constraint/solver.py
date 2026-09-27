@@ -525,7 +525,7 @@ class ConstraintSolver:
     def apply_soft_weld_masked(
         self, link1_idx, link2_idx, engage_mask, release_mask, *,
         linear_stiffness, linear_damping, angular_stiffness, angular_damping,
-        max_force, max_torque, anchor_local, project_other_anchor_z,
+        max_force, max_torque, anchor_local, project_other_anchor_z, gain_scale=None,
     ):
         """Apply all environments' valve changes in one device kernel."""
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
@@ -541,11 +541,17 @@ class ConstraintSolver:
         release_mask = torch.as_tensor(release_mask, dtype=torch.bool, device=gs.device)
         if engage_mask.shape != (self._solver._scene.n_envs,) or release_mask.shape != engage_mask.shape:
             raise ValueError("Soft-weld masks must have one value per environment")
+        if gain_scale is None:
+            gain_scale = torch.ones_like(engage_mask, dtype=gs.tc_float)
+        else:
+            gain_scale = torch.as_tensor(gain_scale, dtype=gs.tc_float, device=gs.device)
+            if gain_scale.shape != engage_mask.shape:
+                raise ValueError("Soft-weld gain_scale must have one value per environment")
         local_anchor_on_second = int(link1_idx > link2_idx)
         link1_idx, link2_idx = sorted((link1_idx, link2_idx))
         self._eq_const_info_cache.clear()
         kernel_apply_soft_weld_masked(
-            link1_idx, link2_idx, engage_mask, release_mask,
+            link1_idx, link2_idx, engage_mask, release_mask, gain_scale,
             linear_stiffness, linear_damping, angular_stiffness, angular_damping,
             max_force, max_torque, local_anchor_on_second,
             *map(float, anchor_local), float(project_other_anchor_z),
@@ -2250,6 +2256,7 @@ def kernel_apply_soft_weld_masked(
     link2_idx: qd.i32,
     engage_mask: qd.types.ndarray(),
     release_mask: qd.types.ndarray(),
+    gain_scale: qd.types.ndarray(),
     linear_stiffness: qd.f32,
     linear_damping: qd.f32,
     angular_stiffness: qd.f32,
@@ -2345,8 +2352,12 @@ def kernel_apply_soft_weld_masked(
                     for i_axis in qd.static(range(3)):
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    scale = gain_scale[i_b]
+                    damping_scale = qd.sqrt(scale)
                     dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
-                        [linear_stiffness, linear_damping, angular_stiffness, angular_damping, max_force, max_torque]
+                        [linear_stiffness * scale, linear_damping * damping_scale,
+                         angular_stiffness * scale, angular_damping * damping_scale,
+                         max_force, max_torque]
                     )
                     dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
                     dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False

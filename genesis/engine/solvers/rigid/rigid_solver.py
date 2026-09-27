@@ -3379,8 +3379,17 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return self.constraint_solver.request_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
 
     def get_soft_weld_pair_status(self, link1_idx, link2_idx, envs_idx=None):
-        """Read device-side state for one soft-weld pair."""
+        """Read active/broken/solved device tensors for scalar or batched soft-weld pairs."""
         return self.constraint_solver.get_soft_weld_pair_status(link1_idx, link2_idx, envs_idx)
+
+    def get_soft_weld_pair_wrench(self, link1_idx, link2_idx, envs_idx=None):
+        """Read last world-frame force (N) and direct torque (N m) on the first link.
+
+        Scalar pairs return (environments, 6); broadcastable 1-D link batches
+        return (environments, pairs, 6). Missing pairs return zeros; broken
+        pairs retain their breaking wrench. Runs without CPU readback.
+        """
+        return self.constraint_solver.get_soft_weld_pair_wrench(link1_idx, link2_idx, envs_idx)
 
     def apply_soft_weld_masked(self, link1_idx, link2_idx, engage_mask, release_mask, **kwargs):
         """Apply batched valve masks without extracting environment indices on the CPU."""

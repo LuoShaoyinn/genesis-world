@@ -471,17 +471,56 @@ class ConstraintSolver:
         self.add_soft_weld_constraint(link1_idx, link2_idx, **kwargs)
         return SoftWeldRequest(self, int(link1_idx), int(link2_idx), envs_idx)
 
+    def _soft_weld_query_inputs(self, link1_idx, link2_idx, envs_idx):
+        # Shape checks use metadata only: device tensors never undergo a host readback.
+        if (isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool) or (
+            isinstance(envs_idx, np.ndarray) and envs_idx.dtype == np.bool_
+        ):
+            raise ValueError("Use integer environment indices, not a variable-length boolean mask.")
+        first = torch.as_tensor(link1_idx, dtype=gs.tc_int, device=gs.device)
+        second = torch.as_tensor(link2_idx, dtype=gs.tc_int, device=gs.device)
+        if first.ndim > 1 or second.ndim > 1:
+            raise ValueError("Link indices must be scalars or one-dimensional batches.")
+        first, second = torch.broadcast_tensors(first, second)
+        scalar = first.ndim == 0
+        pairs = torch.stack((first.reshape(-1), second.reshape(-1)), dim=-1).contiguous()
+        return pairs, self._solver._scene._sanitize_envs_idx(envs_idx), scalar
+
     def get_soft_weld_pair_status(self, link1_idx, link2_idx, envs_idx=None):
-        """Return active, broken, and solved flags without a CPU readback."""
-        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
-        status = torch.zeros((envs_idx.numel(), 3), dtype=gs.tc_int, device=gs.device)
-        kernel_get_soft_weld_pair_status(
-            min(int(link1_idx), int(link2_idx)), max(int(link1_idx), int(link2_idx)),
-            envs_idx, status, self.constraint_state, self._solver.dyn_info,
-            self._solver.rigid_info, self._solver.rigid_config,
+        """Return device-side active, broken and solved boolean tensors.
+
+        Scalar links return (environments,); broadcastable 1-D link batches
+        return (environments, pairs), preserving the requested order.
+        Missing pairs return false. Solved means an active weld had rows in the last substep.
+        No device values are read back to the CPU.
+        """
+        pairs, envs_idx, scalar = self._soft_weld_query_inputs(link1_idx, link2_idx, envs_idx)
+        status = torch.zeros((envs_idx.numel(), pairs.shape[0], 3), dtype=gs.tc_int, device=gs.device)
+        kernel_query_soft_weld_pairs(
+            pairs, envs_idx, status, False, self.constraint_state,
+            self._solver.dyn_info, self._solver.rigid_info, self._solver.rigid_config,
         )
-        return {"active": status[:, 0].bool(), "broken": status[:, 1].bool(),
-                "solved": status[:, 2].bool()}
+        if scalar:
+            status = status[:, 0]
+        return {"active": status[..., 0].bool(), "broken": status[..., 1].bool(),
+                "solved": status[..., 2].bool()}
+
+    def get_soft_weld_pair_wrench(self, link1_idx, link2_idx, envs_idx=None):
+        """Return the latest solved world-frame wrench on the requested first link.
+
+        Components are force XYZ (N), then direct torque XYZ (N m), excluding
+        the moment of the attachment force. Scalar links return (environments, 6);
+        broadcastable 1-D batches return (environments, pairs, 6).
+        Missing/unsolved pairs return zeros; broken pairs retain their breaking
+        wrench. Reversing a pair negates the wrench. No CPU readback is used.
+        """
+        pairs, envs_idx, scalar = self._soft_weld_query_inputs(link1_idx, link2_idx, envs_idx)
+        wrench = torch.zeros((envs_idx.numel(), pairs.shape[0], 6), dtype=gs.tc_float, device=gs.device)
+        kernel_query_soft_weld_pairs(
+            pairs, envs_idx, wrench, True, self.constraint_state,
+            self._solver.dyn_info, self._solver.rigid_info, self._solver.rigid_config,
+        )
+        return wrench[:, 0] if scalar else wrench
 
     def apply_soft_weld_masked(
         self, link1_idx, link2_idx, engage_mask, release_mask, *,
@@ -675,31 +714,41 @@ class ConstraintSolver:
 
 
 @qd.kernel(fastcache=True)
-def kernel_get_soft_weld_pair_status(
-    link1_idx: qd.i32,
-    link2_idx: qd.i32,
+def kernel_query_soft_weld_pairs(
+    pairs: qd.types.ndarray(),
     envs_idx: qd.types.ndarray(),
-    status: qd.types.ndarray(),
+    output: qd.types.ndarray(),
+    read_wrench: qd.template(),
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b_ in range(envs_idx.shape[0]):
+    for i_b_, i_p in qd.ndrange(envs_idx.shape[0], pairs.shape[0]):
         i_b = envs_idx[i_b_]
+        first, second = pairs[i_p, 0], pairs[i_p, 1]
+        link_a, link_b = qd.min(first, second), qd.max(first, second)
         for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
             if (
-                dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
-                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
+                dyn_info.equalities.eq_obj1id[i_e, i_b] == link_a
+                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link_b
             ):
                 eq_type = dyn_info.equalities.eq_type[i_e, i_b]
-                if eq_type == gs.EQUALITY_TYPE.SOFT_WELD:
-                    status[i_b_, 0] = 1
-                    if dyn_info.equalities.soft_weld_had_rows[i_e, i_b]:
-                        status[i_b_, 2] = 1
-                elif eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
-                    status[i_b_, 1] = 1
+                if eq_type == gs.EQUALITY_TYPE.SOFT_WELD or eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                    if qd.static(read_wrench):
+                        sign = 1.0
+                        if first != link_a:
+                            sign = -1.0
+                        for axis in qd.static(range(6)):
+                            output[i_b_, i_p, axis] = sign * dyn_info.equalities.soft_weld_force[i_e, i_b][axis]
+                    else:
+                        output[i_b_, i_p, 0] = gs.qd_int(eq_type == gs.EQUALITY_TYPE.SOFT_WELD)
+                        output[i_b_, i_p, 1] = gs.qd_int(eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD)
+                        output[i_b_, i_p, 2] = gs.qd_int(
+                            eq_type == gs.EQUALITY_TYPE.SOFT_WELD
+                            and dyn_info.equalities.soft_weld_had_rows[i_e, i_b]
+                        )
 
 
 @qd.kernel(fastcache=True)

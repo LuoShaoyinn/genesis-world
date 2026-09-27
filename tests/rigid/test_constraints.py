@@ -493,3 +493,43 @@ def test_set_sol_params(n_envs, batched, tol):
                 assert_allclose(obj.get_sol_params(), sol_params, tol=tol)
             obj.set_sol_params([0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
             assert_allclose(obj.get_sol_params(), [2.0e-02, 0.5, 1e-4, 1e-4, 0.0, 1e-4, 1.0], tol=tol)
+
+
+@pytest.mark.required
+def test_soft_weld_batched_queries():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=2),
+        rigid_options=gs.options.RigidOptions(max_dynamic_constraints=2),
+        show_viewer=False,
+    )
+    anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), fixed=True))
+    body = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0, 0, 0.5)))
+    scene.build(n_envs=3)
+    solver = scene.sim.rigid_solver
+    a, b = anchor.base_link.idx, body.base_link.idx
+    solver.add_soft_weld_constraint(a, b, max_force=0.001, envs_idx=[0])
+    solver.add_soft_weld_constraint(a, b, max_force=1000.0, envs_idx=[1])
+    assert_equal(solver.get_soft_weld_pair_wrench(a, b), torch.zeros((3, 6), device=gs.device))
+    scene.step()
+    # Include reverse order, duplicates, a missing pair, and reordered environments.
+    first = torch.tensor([a, b, a, a], device=gs.device)
+    second = torch.tensor([b, a, a, b], device=gs.device)
+    envs = torch.tensor([2, 0, 1], device=gs.device)
+    wrench = solver.get_soft_weld_pair_wrench(first, second, envs)
+    assert wrench.shape == (3, 4, 6)
+    assert_equal(wrench[:, 1], -wrench[:, 0])
+    assert_equal(wrench[:, 3], wrench[:, 0])
+    assert_equal(wrench[:, 2], torch.zeros((3, 6), device=gs.device))
+    assert_equal(wrench[0], torch.zeros((4, 6), device=gs.device))
+    records = solver.get_soft_weld_constraints()
+    torch.testing.assert_close(wrench[1:, 0], records["force"][:2, 0])
+    status = solver.get_soft_weld_pair_status(first, second, envs)
+    assert_equal(status["active"][:, 0], [False, False, True])
+    assert_equal(status["broken"][:, 0], [False, True, False])
+    assert_equal(solver.get_soft_weld_pair_status(a, b)["active"], [False, True, False])
+    assert solver.get_soft_weld_pair_wrench(a, second).shape == (3, 4, 6)
+    breaking_wrench = wrench[1, 0].clone()
+    scene.step()
+    torch.testing.assert_close(solver.get_soft_weld_pair_wrench(a, b)[0], breaking_wrench)
+    solver.delete_soft_weld_constraint(a, b, envs_idx=[0])
+    assert_equal(solver.get_soft_weld_pair_wrench(a, b)[0], torch.zeros(6, device=gs.device))

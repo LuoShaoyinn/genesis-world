@@ -547,6 +547,7 @@ class ConstraintSolver:
             gain_scale = torch.as_tensor(gain_scale, dtype=gs.tc_float, device=gs.device)
             if gain_scale.shape != engage_mask.shape:
                 raise ValueError("Soft-weld gain_scale must have one value per environment")
+            gain_scale = gain_scale.contiguous()
         local_anchor_on_second = int(link1_idx > link2_idx)
         link1_idx, link2_idx = sorted((link1_idx, link2_idx))
         self._eq_const_info_cache.clear()

@@ -17,14 +17,13 @@ import trimesh
 import genesis as gs
 import genesis.engine.solvers.rigid.rigid_solver as rigid_solver
 import genesis.utils.array_class as array_class
-from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_numpy, qd_to_torch, tensor_to_array
+from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_torch, tensor_to_array
 from genesis.utils.sdf import SDF
 
 from . import gjk, mpr, narrowphase, support_field
 from .broadphase import func_broad_phase
 from .constants import CCD_ALGORITHM_CODE
 from .contact import (
-    collider_kernel_get_contacts,
     collider_kernel_reset,
     func_clamp_prune_contacts,
     func_clamp_prune_contacts_coop,
@@ -105,29 +104,26 @@ class Collider:
         if gs.use_zerocopy:
             # Probe every view the zero-copy contact query needs (including the per-call n_contacts and
             # contact_sort_idx ones, which qd_to_torch caches on their fields). If any field sits past 2**31 bytes
-            # in its SNode tree no zero-copy view exists, and get_contacts falls back to the gather-kernel path.
+            # in its SNode tree no shared view exists, and construction fails explicitly.
             self._contact_data: dict[str, torch.Tensor] | None = {}
-            try:
-                qd_to_torch(self.collider_state.n_contacts, copy=False)
-                qd_to_torch(self.collider_state.contact_sort_idx, transpose=True, copy=False)
-                qd_to_torch(self.collider_state.first_time, copy=False)
-                qd_to_torch(self.collider_state.contact_cache.normal, copy=False)
-                qd_to_torch(self.collider_state.contact_cache.penetration, copy=False)
-                for key, name in (
-                    ("link_a", "link_a"),
-                    ("link_b", "link_b"),
-                    ("geom_a", "geom_a"),
-                    ("geom_b", "geom_b"),
-                    ("penetration", "penetration"),
-                    ("position", "pos"),
-                    ("normal", "normal"),
-                    ("force", "force"),
-                ):
-                    self._contact_data[key] = qd_to_torch(
-                        getattr(self.collider_state.contact_data, name), transpose=True, copy=False
-                    )
-            except ValueError:
-                self._contact_data = None
+            qd_to_torch(self.collider_state.n_contacts, copy=False)
+            qd_to_torch(self.collider_state.contact_sort_idx, transpose=True, copy=False)
+            qd_to_torch(self.collider_state.first_time, copy=False)
+            qd_to_torch(self.collider_state.contact_cache.normal, copy=False)
+            qd_to_torch(self.collider_state.contact_cache.penetration, copy=False)
+            for key, name in (
+                ("link_a", "link_a"),
+                ("link_b", "link_b"),
+                ("geom_a", "geom_a"),
+                ("geom_b", "geom_b"),
+                ("penetration", "penetration"),
+                ("position", "pos"),
+                ("normal", "normal"),
+                ("force", "force"),
+            ):
+                self._contact_data[key] = qd_to_torch(
+                    getattr(self.collider_state.contact_data, name), transpose=True, copy=False
+                )
 
         # Make sure that the initial state is clean
         self.clear()
@@ -1014,173 +1010,77 @@ class Collider:
         zerocopy_aligned = (
             not self.collider_config.has_prunable_contacts and not self.collider_config.spatial_sort_supported
         )
-        if gs.use_zerocopy and self._contact_data is not None:
-            n_contacts = qd_to_torch(self.collider_state.n_contacts, copy=False)
-            # 'is_padded' returns fixed-capacity tensors (plus per-env 'n_contacts'), skipping the
-            # 'n_contacts.max().item()' device->host sync that trimming to the live count needs.
-            padded = is_padded
-            if (as_tensor or n_envs == 0) and not padded:
-                n_contacts_max = (n_contacts if n_envs == 0 else n_contacts.max()).item()
-
-            if not zerocopy_aligned:
-                # Build a (_B, n_contacts_max) index tensor once, expanded to (_B, n_contacts_max, 3) for vector
-                # fields. n_contacts_max comes from the max-across-envs reduction so the same index drives every
-                # field; per-env trimming to n_contacts[i] happens in the ragged split below.
-                if not (as_tensor or n_envs == 0) and not padded:
-                    n_contacts_max = n_contacts.max().item()
-                sort_idx_view = qd_to_torch(self.collider_state.contact_sort_idx, transpose=True, copy=False)
-                if padded:
-                    # Gather the full capacity so no host-side trim (sync) is needed. Sort indices past the live
-                    # range may be stale; clamp (out-of-place, preserving the zero-copy view) keeps them in-bounds.
-                    gather_idx_flat = sort_idx_view.clamp(0, sort_idx_view.shape[1] - 1)
-                else:
-                    gather_idx_flat = sort_idx_view[:, :n_contacts_max]
-                gather_idx_vec = gather_idx_flat.unsqueeze(-1).expand(-1, -1, 3)
-                # Gather indices past each env's n_contacts are stale (the permutation only fills the live range), so
-                # the dense (n_envs, n_contacts_max) tensor has padding columns to reset to the per-field sentinel.
-                # The mask is field-independent, so build it once and broadcast over scalar and vector fields alike.
-                pad_mask = None
-                if as_tensor and n_envs > 0 and not padded:
-                    pad_mask = torch.arange(n_contacts_max, device=sort_idx_view.device)[None, :] >= n_contacts[:, None]
-
-            for key, data in self._contact_data.items():
-                if zerocopy_aligned:
-                    if n_envs == 0:
-                        if padded:
-                            data = data if keep_batch_dim else data[0]
-                        else:
-                            data = data[0, :n_contacts_max] if not keep_batch_dim else data[:, :n_contacts_max]
-                    elif as_tensor and not padded:
-                        data = data[:, :n_contacts_max]
-                    if to_torch:
-                        if gs.backend == gs.cpu:
-                            data = data.clone()
-                    else:
-                        data = tensor_to_array(data)
-                else:
-                    # data shape is (_B, max_candidate_contacts) for scalars, with a trailing 3 axis for vectors.
-                    gidx = gather_idx_vec if data.dim() == 3 else gather_idx_flat
-                    data = data.gather(dim=1, index=gidx)
-                    if pad_mask is not None:
-                        mask = pad_mask if data.dim() == 2 else pad_mask[..., None]
-                        data.masked_fill_(mask, -1 if data.dtype == gs.tc_int else 0)
-                    if n_envs == 0 and not keep_batch_dim:
-                        data = data[0]
-                    if not to_torch:
-                        data = tensor_to_array(data)
-
-                if n_envs > 0 and not as_tensor:
-                    if padded:
-                        data = tuple(data[i : i + 1] if keep_batch_dim else data[i] for i in range(n_envs))
-                    elif keep_batch_dim:
-                        data = tuple(data[i : i + 1, :j] for i, j in enumerate(n_contacts.tolist()))
-                    else:
-                        data = tuple(data[i, :j] for i, j in enumerate(n_contacts.tolist()))
-
-                contact_data[key] = data
-
-            if padded:
-                contact_data["n_contacts"] = n_contacts if to_torch else tensor_to_array(n_contacts)
-
-            return contact_data.copy()
-
-        # Find out how much dynamic memory must be allocated
-        n_contacts = qd_to_numpy(self.collider_state.n_contacts)
-        n_contacts_max = n_contacts.max().item()
-        # 'is_padded' is honored here too so the result matches the zero-copy path on every backend (this path
-        # already syncs to size its buffers, so padding only fixes the shape). Padding needs the dense rectangular
-        # layout, so force it even for a ragged (as_tensor=False) request; per-env slices are taken from it below.
+        if not gs.use_zerocopy or self._contact_data is None:
+            raise RuntimeError(
+                "Contact queries require shared Quadrants/PyTorch views; "
+                "the device-to-host contact export fallback has been removed."
+            )
+        n_contacts = qd_to_torch(self.collider_state.n_contacts, copy=False)
+        # 'is_padded' returns fixed-capacity tensors (plus per-env 'n_contacts'), skipping the
+        # 'n_contacts.max().item()' device->host sync that trimming to the live count needs.
         padded = is_padded
-        dense = as_tensor or padded
-        n_contacts_arr = n_contacts
-        if dense:
-            out_size = n_contacts_max * max(n_envs, 1)
-        else:
-            *n_contacts_starts, out_size = np.cumsum(n_contacts)
-        n_contacts = n_contacts.tolist()
+        if (as_tensor or n_envs == 0) and not padded:
+            n_contacts_max = (n_contacts if n_envs == 0 else n_contacts.max()).item()
 
-        # Allocate output buffer
-        if to_torch:
-            iout = torch.full((out_size, 4), -1, dtype=gs.tc_int, device=gs.device)
-            fout = torch.zeros((out_size, 10), dtype=gs.tc_float, device=gs.device)
-        else:
-            iout = np.full((out_size, 4), -1, dtype=gs.np_int)
-            fout = np.zeros((out_size, 10), dtype=gs.np_float)
-
-        # Copy contact data
-        if n_contacts_max > 0:
-            collider_kernel_get_contacts(iout, fout, self.collider_state, self._solver.rigid_config, dense)
-
-        # Build structured view (no copy)
-        if dense:
-            nb = max(n_envs, 1)
-            iout = iout.reshape((nb, n_contacts_max, 4))
-            fout = fout.reshape((nb, n_contacts_max, 10))
+        if not zerocopy_aligned:
+            # Build a (_B, n_contacts_max) index tensor once, expanded to (_B, n_contacts_max, 3) for vector
+            # fields. n_contacts_max comes from the max-across-envs reduction so the same index drives every
+            # field; per-env trimming to n_contacts[i] happens in the ragged split below.
+            if not (as_tensor or n_envs == 0) and not padded:
+                n_contacts_max = n_contacts.max().item()
+            sort_idx_view = qd_to_torch(self.collider_state.contact_sort_idx, transpose=True, copy=False)
             if padded:
-                # Widen from the live count to the fixed capacity the zero-copy path returns (contact buffers are
-                # sized max(max_candidate_contacts, 1)). New slots keep the sentinel (-1 ints / 0 floats).
-                capacity = max(self.collider_info.max_candidate_contacts[None], 1)
-                if to_torch:
-                    iout_full = torch.full((nb, capacity, 4), -1, dtype=gs.tc_int, device=gs.device)
-                    fout_full = torch.zeros((nb, capacity, 10), dtype=gs.tc_float, device=gs.device)
-                else:
-                    iout_full = np.full((nb, capacity, 4), -1, dtype=gs.np_int)
-                    fout_full = np.zeros((nb, capacity, 10), dtype=gs.np_float)
-                iout_full[:, :n_contacts_max] = iout
-                fout_full[:, :n_contacts_max] = fout
-                iout, fout = iout_full, fout_full
-            if n_envs == 0 and not keep_batch_dim:
-                iout, fout = iout[0], fout[0]
-            if as_tensor or n_envs == 0:
-                iout_chunks = (iout[..., 0], iout[..., 1], iout[..., 2], iout[..., 3])
-                fout_chunks = (fout[..., 0], fout[..., 1:4], fout[..., 4:7], fout[..., 7:])
-                values = (*iout_chunks, *fout_chunks)
+                # Gather the full capacity so no host-side trim (sync) is needed. Sort indices past the live
+                # range may be stale; clamp (out-of-place, preserving the zero-copy view) keeps them in-bounds.
+                gather_idx_flat = sort_idx_view.clamp(0, sort_idx_view.shape[1] - 1)
             else:
-                # Ragged + padded, batched: one fixed-capacity slice per env (no host-side trim, no sync).
-                iout_envs = (iout[i : i + 1] if keep_batch_dim else iout[i] for i in range(n_envs))
-                fout_envs = (fout[i : i + 1] if keep_batch_dim else fout[i] for i in range(n_envs))
-                iout_chunks = ((io[..., 0], io[..., 1], io[..., 2], io[..., 3]) for io in iout_envs)
-                fout_chunks = ((fo[..., 0], fo[..., 1:4], fo[..., 4:7], fo[..., 7:]) for fo in fout_envs)
-                values = (*zip(*iout_chunks), *zip(*fout_chunks))
-        else:
-            # Split smallest dimension first, then largest dimension
-            if n_envs == 0:
-                iout_chunks = (iout[..., 0], iout[..., 1], iout[..., 2], iout[..., 3])
-                fout_chunks = (fout[..., 0], fout[..., 1:4], fout[..., 4:7], fout[..., 7:])
-                values = (*iout_chunks, *fout_chunks)
-            elif n_contacts_max >= n_envs:
-                if to_torch:
-                    iout_chunks = torch.split(iout, n_contacts)
-                    fout_chunks = torch.split(fout, n_contacts)
-                else:
-                    iout_chunks = np.split(iout, n_contacts_starts)
-                    fout_chunks = np.split(fout, n_contacts_starts)
-                iout_chunks = ((out[..., 0], out[..., 1], out[..., 2], out[..., 3]) for out in iout_chunks)
-                fout_chunks = ((out[..., 0], out[..., 1:4], out[..., 4:7], out[..., 7:]) for out in fout_chunks)
-                values = (*zip(*iout_chunks), *zip(*fout_chunks))
-            else:
-                iout_chunks = (iout[..., 0], iout[..., 1], iout[..., 2], iout[..., 3])
-                fout_chunks = (fout[..., 0], fout[..., 1:4], fout[..., 4:7], fout[..., 7:])
-                if n_envs == 1:
-                    values = [(value,) for value in (*iout_chunks, *fout_chunks)]
-                else:
-                    if to_torch:
-                        iout_chunks = (torch.split(out, n_contacts) for out in iout_chunks)
-                        fout_chunks = (torch.split(out, n_contacts) for out in fout_chunks)
-                    else:
-                        iout_chunks = (np.split(out, n_contacts_starts) for out in iout_chunks)
-                        fout_chunks = (np.split(out, n_contacts_starts) for out in fout_chunks)
-                    values = (*iout_chunks, *fout_chunks)
+                gather_idx_flat = sort_idx_view[:, :n_contacts_max]
+            gather_idx_vec = gather_idx_flat.unsqueeze(-1).expand(-1, -1, 3)
+            # Gather indices past each env's n_contacts are stale (the permutation only fills the live range), so
+            # the dense (n_envs, n_contacts_max) tensor has padding columns to reset to the per-field sentinel.
+            # The mask is field-independent, so build it once and broadcast over scalar and vector fields alike.
+            pad_mask = None
+            if as_tensor and n_envs > 0 and not padded:
+                pad_mask = torch.arange(n_contacts_max, device=sort_idx_view.device)[None, :] >= n_contacts[:, None]
 
-        # Store contact information in cache
-        contact_data.update(
-            zip(("link_a", "link_b", "geom_a", "geom_b", "penetration", "position", "normal", "force"), values)
-        )
+        for key, data in self._contact_data.items():
+            if zerocopy_aligned:
+                if n_envs == 0:
+                    if padded:
+                        data = data if keep_batch_dim else data[0]
+                    else:
+                        data = data[0, :n_contacts_max] if not keep_batch_dim else data[:, :n_contacts_max]
+                elif as_tensor and not padded:
+                    data = data[:, :n_contacts_max]
+                if to_torch:
+                    if gs.backend == gs.cpu:
+                        data = data.clone()
+                else:
+                    data = tensor_to_array(data)
+            else:
+                # data shape is (_B, max_candidate_contacts) for scalars, with a trailing 3 axis for vectors.
+                gidx = gather_idx_vec if data.dim() == 3 else gather_idx_flat
+                data = data.gather(dim=1, index=gidx)
+                if pad_mask is not None:
+                    mask = pad_mask if data.dim() == 2 else pad_mask[..., None]
+                    data.masked_fill_(mask, -1 if data.dtype == gs.tc_int else 0)
+                if n_envs == 0 and not keep_batch_dim:
+                    data = data[0]
+                if not to_torch:
+                    data = tensor_to_array(data)
+
+            if n_envs > 0 and not as_tensor:
+                if padded:
+                    data = tuple(data[i : i + 1] if keep_batch_dim else data[i] for i in range(n_envs))
+                elif keep_batch_dim:
+                    data = tuple(data[i : i + 1, :j] for i, j in enumerate(n_contacts.tolist()))
+                else:
+                    data = tuple(data[i, :j] for i, j in enumerate(n_contacts.tolist()))
+
+            contact_data[key] = data
 
         if padded:
-            contact_data["n_contacts"] = (
-                torch.as_tensor(n_contacts_arr, device=gs.device) if to_torch else n_contacts_arr
-            )
+            contact_data["n_contacts"] = n_contacts if to_torch else tensor_to_array(n_contacts)
 
         return contact_data.copy()
 

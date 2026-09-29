@@ -3196,6 +3196,12 @@ class RigidEntity(KinematicEntity):
             contact count, with 'valid_mask' flagging the real contacts. This avoids a per-step device-to-host
             synchronization; the values are otherwise identical on every backend. Defaults to False.
 
+        Raises
+        ------
+        RuntimeError
+            If shared Quadrants/PyTorch contact views are unavailable. Host-copy fallback is not supported.
+            Use performance mode and `is_padded=True` for fixed-shape training queries without count readback.
+
         Returns
         -------
         contact_info : dict

@@ -527,14 +527,14 @@ class ConstraintSolver:
         linear_stiffness, linear_damping, angular_stiffness, angular_damping,
         max_force, max_torque, anchor_local, project_other_anchor_z, gain_scale=None,
     ):
-        """Apply all environments' valve changes in one device kernel."""
+        """Apply valve changes on device; projection height is scalar or one GPU value per environment."""
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
         if link1_idx == link2_idx or min(link1_idx, link2_idx) < 0 or max(link1_idx, link2_idx) >= self._solver.n_links:
             raise ValueError("Soft-weld links must be two distinct valid indices")
         if self._solver._requires_grad:
             raise RuntimeError("Dynamic soft-weld breakage is not supported with differentiable simulation")
         values = (linear_stiffness, linear_damping, angular_stiffness, angular_damping,
-                  max_force, max_torque, project_other_anchor_z, *anchor_local)
+                  max_force, max_torque, *anchor_local)
         if not all(math.isfinite(value) for value in values) or min(max_force, max_torque) <= 0:
             raise ValueError("Soft-weld parameters must be finite with positive limits")
         engage_mask = torch.as_tensor(engage_mask, dtype=torch.bool, device=gs.device)
@@ -548,6 +548,14 @@ class ConstraintSolver:
             if gain_scale.shape != engage_mask.shape:
                 raise ValueError("Soft-weld gain_scale must have one value per environment")
             gain_scale = gain_scale.contiguous()
+        if isinstance(project_other_anchor_z, (float, int)) and not math.isfinite(project_other_anchor_z):
+            raise ValueError("Projection height must be finite")
+        project_other_anchor_z = torch.as_tensor(project_other_anchor_z, dtype=gs.tc_float, device=gs.device)
+        if project_other_anchor_z.ndim == 0:
+            project_other_anchor_z = project_other_anchor_z.expand(engage_mask.shape)
+        if project_other_anchor_z.shape != engage_mask.shape:
+            raise ValueError("Projection height must be scalar or one value per environment")
+        project_other_anchor_z = project_other_anchor_z.contiguous()
         local_anchor_on_second = int(link1_idx > link2_idx)
         link1_idx, link2_idx = sorted((link1_idx, link2_idx))
         self._eq_const_info_cache.clear()
@@ -555,7 +563,7 @@ class ConstraintSolver:
             link1_idx, link2_idx, engage_mask, release_mask, gain_scale,
             linear_stiffness, linear_damping, angular_stiffness, angular_damping,
             max_force, max_torque, local_anchor_on_second,
-            *map(float, anchor_local), float(project_other_anchor_z),
+            *map(float, anchor_local), project_other_anchor_z,
             self._solver.dyn_state, self.constraint_state, self._solver.dyn_info,
             self._solver.rigid_info, self._solver.rigid_config, self._solver._errno,
         )
@@ -2268,7 +2276,7 @@ def kernel_apply_soft_weld_masked(
     local_x: qd.f32,
     local_y: qd.f32,
     local_z: qd.f32,
-    other_anchor_z: qd.f32,
+    other_anchor_z: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
@@ -2338,7 +2346,7 @@ def kernel_apply_soft_weld_masked(
                         gs.qd_vec3([local_x, local_y, local_z]),
                         dyn_state.links.pos[cup_link, i_b], dyn_state.links.quat[cup_link, i_b],
                     )
-                    ground_anchor = gs.qd_vec3([cup_anchor[0], cup_anchor[1], other_anchor_z])
+                    ground_anchor = gs.qd_vec3([cup_anchor[0], cup_anchor[1], other_anchor_z[i_b]])
                     anchor1 = cup_anchor
                     anchor2 = ground_anchor
                     if local_anchor_on_second:

@@ -394,15 +394,17 @@ def parse_urdf(morph, surface):
         j_info["sol_params"] = gu.default_solver_params()
         j_info["dofs_invweight"] = np.full((j_info["n_dofs"],), fill_value=-1.0)
 
-        joint_friction, joint_damping = 0.0, 0.0
+        joint_friction, joint_damping, joint_armature = 0.0, 0.0, 0.0
         if joint.dynamics is not None:
             if joint.dynamics.friction is not None:
                 joint_friction = joint.dynamics.friction
             if joint.dynamics.damping is not None:
                 joint_damping = joint.dynamics.damping
+            if joint.dynamics.armature is not None:
+                joint_armature = joint.dynamics.armature
         j_info["dofs_frictionloss"] = np.full(j_info["n_dofs"], joint_friction)
         j_info["dofs_damping"] = np.full(j_info["n_dofs"], joint_damping)
-        j_info["dofs_armature"] = np.zeros(j_info["n_dofs"])
+        j_info["dofs_armature"] = np.full(j_info["n_dofs"], joint_armature)
 
         kp = gu.default_dofs_kp(j_info["n_dofs"])
         kv = gu.default_dofs_kv(j_info["n_dofs"])

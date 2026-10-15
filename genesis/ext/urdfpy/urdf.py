@@ -1404,17 +1404,35 @@ class JointDynamics(URDFType):
     friction : float
         The static friction value of the joint (N for prismatic joints,
         Nm for revolute).
+    armature : float, optional
+        Reflected motor inertia (kg for prismatic joints, kg m^2 for revolute joints).
+        This is a Genesis extension to URDF. Must be finite and nonnegative.
     """
 
     _ATTRIBS = {
         "damping": (float, False),
         "friction": (float, False),
+        "armature": (float, False),
     }
     _TAG = "dynamics"
 
-    def __init__(self, damping, friction):
+    def __init__(self, damping, friction, armature=None):
         self.damping = damping
         self.friction = friction
+        self.armature = armature
+
+    @property
+    def armature(self):
+        """float : Reflected motor inertia, or None when not authored."""
+        return self._armature
+
+    @armature.setter
+    def armature(self, value):
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError("Joint armature must be finite and nonnegative.")
+        self._armature = value
 
     @property
     def damping(self):
@@ -1454,6 +1472,7 @@ class JointDynamics(URDFType):
         return JointDynamics(
             damping=self.damping,
             friction=self.friction,
+            armature=self.armature,
         )
 
 

@@ -716,15 +716,23 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["pendulum_with_joint_dynamics", "joint_with_partial_dynamics"])
 @pytest.mark.parametrize("joint_damping, joint_friction", [(1.0, 2.0), (1.0, None), (None, 2.0)])
-def test_urdf_joint_dynamics(joint_damping, joint_friction, xml_path):
+@pytest.mark.parametrize("joint_armature", [None, 0.001])
+def test_urdf_joint_dynamics(joint_damping, joint_friction, joint_armature, xml_path):
     # A <dynamics> tag authoring only one of damping/friction leaves the other one unset. It must fall back to zero
     # like an absent tag rather than reaching the solver as a null value.
+    tree = ET.parse(xml_path)
+    joint = tree.getroot().find("joint")
+    if joint_armature is not None:
+        joint.find("dynamics").set("armature", str(joint_armature))
+    ET.SubElement(joint, "safety_controller", k_position="3.0", k_velocity="0.1")
+    tree.write(xml_path)
     scene = gs.Scene()
     robot = scene.add_entity(
         gs.morphs.URDF(
             file=xml_path,
             pos=(0, 0, 0.8),
             convexify=True,
+            default_armature=0.1,
         ),
     )
     scene.build()
@@ -734,6 +742,9 @@ def test_urdf_joint_dynamics(joint_damping, joint_friction, xml_path):
     assert_allclose(robot.joints[1].desc.dofs_damping, expected_damping, tol=gs.EPS)
     assert_allclose(robot.joints[0].desc.dofs_frictionloss, 0.0, tol=gs.EPS)
     assert_allclose(robot.joints[1].desc.dofs_frictionloss, expected_frictionloss, tol=gs.EPS)
+    assert_allclose(robot.get_dofs_armature()[-1], 0.1 if joint_armature is None else joint_armature, tol=gs.EPS)
+    assert_allclose(robot.get_dofs_kp()[-1], 3.0, tol=gs.EPS)
+    assert_allclose(robot.get_dofs_kv()[-1], 0.1, tol=gs.EPS)
 
 
 @pytest.mark.slow  # ~200s

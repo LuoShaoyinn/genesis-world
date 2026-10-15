@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,13 +17,14 @@ from genesis.engine.solvers.rigid.abd.inverse_kinematics import (
     kernel_inverse_kinematics_entity,
     kernel_set_ik_targets,
 )
-from genesis.engine.states.solvers import KinematicSolverCheckpoint, KinematicSolverState
+from genesis.engine.states.solvers import KinematicSolverState, SolverCheckpoint
 from genesis.options.morphs import Morph
 from genesis.options.solvers import KinematicOptions
 from genesis.utils.misc import (
     assign_indexed_tensor,
     broadcast_tensor,
     indices_to_mask,
+    qd_to_numpy,
     qd_to_torch,
     qd_zero_grad,
     sanitize_indexed_tensor,
@@ -349,10 +351,25 @@ class KinematicSolver(Solver):
         self._n_trees = np.unique(links_tree_root_idx[links_tree_root_idx >= 0]).size
         self.n_trees_ = max(1, self._n_trees)
 
-        # batch_links_info is required when heterogeneous simulation is used.
-        # We must update options because get_links_info reads from solver._options.batch_links_info.
+        # The level of a link in its root and in its tree is its number of ancestors below the root link of either (see
+        # trees_levels_links_idx in array_class.py). Each pass moves every link one ancestor up, so the depth of a link
+        # is the number of passes it takes to run out of parents.
+        links_depth = np.zeros(self.n_links, dtype=gs.np_int)
+        links_ancestor_idx = self._links_parent_idx
+        while (links_ancestor_idx >= 0).any():
+            has_ancestor = links_ancestor_idx >= 0
+            links_depth += has_ancestor
+            links_ancestor_idx = np.where(has_ancestor, self._links_parent_idx[links_ancestor_idx], -1)
+        self._links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
+        self._links_root_level = links_depth - links_depth[self._links_root_idx]
+        self._links_tree_level = np.where(links_tree_root_idx >= 0, links_depth - links_depth[links_tree_root_idx], -1)
+
+        # Heterogeneous simulation stores the link, joint and dof info per environment, every variant stating its own
+        # (see '_dispatch_heterogeneous_kinematics'). We must update options because the getters read from them.
         if self._enable_heterogeneous:
             self._options.batch_links_info = True
+            self._options.batch_joints_info = True
+            self._options.batch_dofs_info = True
 
         self._build_static_config()
         self._create_data_manager()
@@ -389,8 +406,8 @@ class KinematicSolver(Solver):
             requires_grad=False,
             use_hibernation=False,
             batch_links_info=self._options.batch_links_info,
-            batch_dofs_info=False,
-            batch_joints_info=False,
+            batch_dofs_info=self._options.batch_dofs_info,
+            batch_joints_info=self._options.batch_joints_info,
             enable_mujoco_compatibility=False,
             enable_elliptic_friction=False,
             enable_signorini_contact=False,
@@ -412,14 +429,17 @@ class KinematicSolver(Solver):
         self.kinematics_scratch = self.data_manager.kinematics_scratch
 
     @property
-    def data(self) -> Iterator[array_class.DataItem]:
-        yield from array_class.iter_data(self.rigid_config, "rigid_config")
-        yield from array_class.iter_data(self.data_manager.errno, "errno", array_class.DataKind.STATE)
+    def data(self) -> Iterator[array_class.DataItem | array_class.ConfigItem]:
+        yield from array_class.iter_data(self, "rigid_config")
+        yield from array_class.iter_data(self.data_manager, "errno", array_class.DataKind.STATE)
         structs = ["rigid_info", "dyn_info", "dyn_state", "rigid_adjoint_cache"]
         if self.rigid_config.requires_grad:
             structs.append("dyn_state_adjoint_cache")
         for name in structs:
-            yield from array_class.iter_data(getattr(self.data_manager, name), name)
+            yield from array_class.iter_data(self.data_manager, name)
+        # The flags describe the derived poses and velocities, so they travel with them
+        yield from array_class.iter_data(self, "_is_forward_pos_updated", array_class.DataKind.DERIVED)
+        yield from array_class.iter_data(self, "_is_forward_vel_updated", array_class.DataKind.DERIVED)
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- hook methods -------------------------------------
@@ -476,8 +496,7 @@ class KinematicSolver(Solver):
         # trees_root_idx in array_class.py)
         links_tree_idx = np.full(self.n_links_, -1, dtype=gs.np_int)
         if self._n_roots:
-            links_root_idx = np.array([link.root_idx for link in self.links], dtype=gs.np_int)
-            roots_link_idx, links_root_rank = np.unique(links_root_idx, return_inverse=True)
+            roots_link_idx, links_root_rank = np.unique(self._links_root_idx, return_inverse=True)
             roots_link_end = np.zeros(self._n_roots, dtype=gs.np_int)
             np.maximum.at(roots_link_end, links_root_rank, np.arange(1, self.n_links + 1, dtype=gs.np_int))
             self.rigid_info.roots_link_idx.from_numpy(roots_link_idx)
@@ -515,6 +534,82 @@ class KinematicSolver(Solver):
             self.rigid_info.trees_root_idx.fill(0)
             self.rigid_info.trees_link_end.fill(0)
         self.rigid_info.links_tree_idx.from_numpy(links_tree_idx)
+
+        # Fill the level tables of every tree and root for the level sweep (see trees_levels_links_idx in
+        # array_class.py). A scene without any tree keeps its padded tree slot at zero levels.
+        if self._n_roots and self.rigid_config.enable_level_sweep:
+            for links_group_idx, links_group_level, n_groups, groups_fields in (
+                (
+                    links_tree_idx,
+                    self._links_tree_level,
+                    self.n_trees_,
+                    (
+                        self.rigid_info.trees_level_start,
+                        self.rigid_info.trees_n_levels,
+                        self.rigid_info.trees_levels_links_idx,
+                        None,
+                        self.rigid_info.trees_levels_links_end,
+                    ),
+                ),
+                (
+                    links_root_rank,
+                    self._links_root_level,
+                    self._n_roots,
+                    (
+                        self.rigid_info.roots_level_start,
+                        self.rigid_info.roots_n_levels,
+                        self.rigid_info.roots_levels_links_idx,
+                        self.rigid_info.roots_levels_links_start,
+                        self.rigid_info.roots_levels_links_end,
+                    ),
+                ),
+            ):
+                group_links = np.arange(self.n_links, dtype=gs.np_int)[links_group_idx >= 0]
+                links_group = links_group_idx[group_links]
+                links_level = links_group_level[group_links]
+                groups_n_levels = np.zeros(n_groups, dtype=gs.np_int)
+                np.maximum.at(groups_n_levels, links_group, links_level + 1)
+                groups_level_start = np.zeros(n_groups, dtype=gs.np_int)
+                np.cumsum(np.bincount(links_group, minlength=n_groups)[:-1], out=groups_level_start[1:])
+                # The links of every group, group after group, level after level, and each level in ascending order
+                entries_order = np.lexsort((group_links, links_level, links_group))
+                groups_levels_links_idx = group_links[entries_order]
+                entries_group = links_group[entries_order]
+                entries_level = links_level[entries_order]
+                entries_idx = np.arange(len(groups_levels_links_idx), dtype=gs.np_int)
+                # An entry ends its level where the next entry starts another level or another group
+                is_level_last = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_last[:-1] = (np.diff(entries_group) != 0) | (np.diff(entries_level) != 0)
+                levels_last_entry = entries_idx[is_level_last]
+                groups_levels_links_end = levels_last_entry[np.searchsorted(levels_last_entry, entries_idx)] + 1
+                is_level_first = np.ones(len(groups_levels_links_idx), dtype=bool)
+                is_level_first[1:] = is_level_last[:-1]
+                levels_first_entry = entries_idx[is_level_first]
+                groups_levels_links_start = levels_first_entry[
+                    np.searchsorted(levels_first_entry, entries_idx, side="right") - 1
+                ]
+                for field, value in zip(
+                    groups_fields,
+                    (
+                        groups_level_start,
+                        groups_n_levels,
+                        groups_levels_links_idx,
+                        groups_levels_links_start,
+                        groups_levels_links_end,
+                    ),
+                ):
+                    if field is not None and len(value):
+                        field.from_numpy(value)
+            child_links = np.arange(self.n_links, dtype=gs.np_int)[self._links_parent_idx >= 0]
+            links_child_start = np.zeros(self.n_links_ + 1, dtype=gs.np_int)
+            np.cumsum(
+                np.bincount(self._links_parent_idx[child_links], minlength=self.n_links_), out=links_child_start[1:]
+            )
+            self.rigid_info.links_child_start.from_numpy(links_child_start)
+            if len(child_links):
+                self.rigid_info.links_child_idx.from_numpy(
+                    child_links[np.lexsort((-child_links, self._links_parent_idx[child_links]))]
+                )
 
     def _init_link_fields(self):
         if self.links:
@@ -559,6 +654,8 @@ class KinematicSolver(Solver):
                 self.rigid_config,
             )
 
+        self._dispatch_heterogeneous_kinematics()
+
         # Set initial qpos
         self.qpos = self.rigid_info.qpos
         self.qpos0 = self.rigid_info.qpos0
@@ -576,11 +673,14 @@ class KinematicSolver(Solver):
                     init_qpos[q_s:q_e, i_b] = entity._desc.variants[variant_idx[i_b]].init_qpos
 
             self.qpos0.from_numpy(init_qpos)
+            dofs_limit = np.broadcast_to(
+                qd_to_numpy(self.dyn_info.dofs.limit, transpose=True), (self._B, self.n_dofs_, 2)
+            )
             is_init_qpos_out_of_bounds = False
             for joint in self.joints:
                 if joint.type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC):
-                    is_init_qpos_out_of_bounds |= (joint.desc.dofs_limit[0, 0] > init_qpos[joint.q_start]).any()
-                    is_init_qpos_out_of_bounds |= (init_qpos[joint.q_start] > joint.desc.dofs_limit[0, 1]).any()
+                    is_init_qpos_out_of_bounds |= (dofs_limit[:, joint.dof_start, 0] > init_qpos[joint.q_start]).any()
+                    is_init_qpos_out_of_bounds |= (init_qpos[joint.q_start] > dofs_limit[:, joint.dof_start, 1]).any()
             if is_init_qpos_out_of_bounds:
                 gs.logger.warning("Neutral robot position (qpos0) exceeds joint limits.")
             self.qpos.from_numpy(init_qpos)
@@ -589,6 +689,86 @@ class KinematicSolver(Solver):
 
         # Dispatch heterogeneous variant vgeom ranges per-environment
         self._dispatch_heterogeneous_vgeoms()
+
+    def _dispatch_heterogeneous_kinematics(self):
+        """Write the link frames and the joint and dof parameters of each heterogeneous variant to the envs carrying it.
+
+        The init kernels broadcast those of the primary to every environment, while heterogeneous simulation batches
+        the link, joint and dof info (see 'build').
+        """
+        entities = [entity for entity in self._entities if entity._desc.variants]
+        if not entities:
+            return
+
+        # Field layout, batch second, since the arrays are written back as fields
+        links_pos = qd_to_numpy(self.dyn_info.links.pos, transpose=False, copy=True)
+        links_quat = qd_to_numpy(self.dyn_info.links.quat, transpose=False, copy=True)
+        joints_pos = qd_to_numpy(self.dyn_info.joints.pos, transpose=False, copy=True)
+        joints_sol_params = qd_to_numpy(self.dyn_info.joints.sol_params, transpose=False, copy=True)
+        dofs_info = self.dyn_info.dofs
+        dofs_fields = (
+            (dofs_info.motion_ang, "dofs_motion_ang"),
+            (dofs_info.motion_vel, "dofs_motion_vel"),
+            (dofs_info.limit, "dofs_limit"),
+            (dofs_info.stiffness, "dofs_stiffness"),
+            (dofs_info.damping, "dofs_damping"),
+            (dofs_info.frictionloss, "dofs_frictionloss"),
+            (dofs_info.armature, "dofs_armature"),
+            (dofs_info.act_gain, "dofs_act_gain"),
+            (dofs_info.act_bias, "dofs_act_bias"),
+            (dofs_info.force_range, "dofs_force_range"),
+        )
+        dofs_values = [qd_to_numpy(field, transpose=False, copy=True) for field, _ in dofs_fields]
+
+        for entity in entities:
+            variants_links = [entity._desc.links, *(variant.links for variant in entity._desc.variants[1:])]
+            envs_variant_idx = _balanced_variant_mapping(len(variants_links), self._B)
+            links_slice = slice(entity.link_start, entity.link_end)
+            variants_links_pos = np.stack([[l_desc.pos for l_desc in links] for links in variants_links])
+            variants_links_quat = np.stack([[l_desc.quat for l_desc in links] for links in variants_links])
+            links_pos[links_slice] = variants_links_pos[envs_variant_idx].swapaxes(0, 1)
+            links_quat[links_slice] = variants_links_quat[envs_variant_idx].swapaxes(0, 1)
+
+            # A file morph drops its joints without degrees of freedom, so a fixed one may leave the entity without any
+            if entity.n_joints == 0:
+                continue
+            variants_joints = [
+                [asdict(j_desc) for l_desc in links for j_desc in l_desc.joints] for links in variants_links
+            ]
+            joints_slice = slice(entity.joint_start, entity.joint_end)
+            variants_joints_pos = np.stack([[j_fields["pos"] for j_fields in joints] for joints in variants_joints])
+            joints_pos[joints_slice] = variants_joints_pos[envs_variant_idx].swapaxes(0, 1)
+            variants_sol_params = np.stack(
+                [[j_fields["sol_params"] for j_fields in joints] for joints in variants_joints]
+            )
+            variants_sol_params = self._sanitize_joint_sol_params(variants_sol_params).reshape(
+                variants_sol_params.shape
+            )
+            joints_sol_params[joints_slice] = variants_sol_params[envs_variant_idx].swapaxes(0, 1)
+            dofs_slice = slice(entity.dof_start, entity.dof_end)
+            for dofs_value, (_, name) in zip(dofs_values, dofs_fields):
+                variants_value = np.stack(
+                    [np.concatenate([j_fields[name] for j_fields in joints]) for joints in variants_joints]
+                )
+                dofs_value[dofs_slice] = variants_value[envs_variant_idx].swapaxes(0, 1)
+
+        self.dyn_info.links.pos.from_numpy(links_pos)
+        self.dyn_info.links.quat.from_numpy(links_quat)
+        self.dyn_info.joints.pos.from_numpy(joints_pos)
+        self.dyn_info.joints.sol_params.from_numpy(joints_sol_params)
+        for (field, _), dofs_value in zip(dofs_fields, dofs_values):
+            field.from_numpy(dofs_value)
+
+        # The state of a fixed root link is set at init alone (see kernel_init_link_fields), so it takes the frame of
+        # the variant its environment carries too
+        fixed_roots_idx = [entity.link_start for entity in entities if entity.base_link.is_fixed]
+        if fixed_roots_idx:
+            links_state_pos = qd_to_numpy(self.dyn_state.links.pos, transpose=False, copy=True)
+            links_state_quat = qd_to_numpy(self.dyn_state.links.quat, transpose=False, copy=True)
+            links_state_pos[fixed_roots_idx] = links_pos[fixed_roots_idx]
+            links_state_quat[fixed_roots_idx] = links_quat[fixed_roots_idx]
+            self.dyn_state.links.pos.from_numpy(links_state_pos)
+            self.dyn_state.links.quat.from_numpy(links_state_quat)
 
     def _dispatch_heterogeneous_vgeoms(self):
         """Override per-link vgeom ranges for heterogeneous variants. RigidSolver extends this."""
@@ -806,23 +986,10 @@ class KinematicSolver(Solver):
             self._is_forward_pos_updated = False
             self._is_forward_vel_updated = False
 
-    def __getstate__(self) -> KinematicSolverCheckpoint:
-        state = super().__getstate__()
-        return KinematicSolverCheckpoint(
-            arrays=state.arrays,
-            configs=state.configs,
-            kinds=state.kinds,
-            is_forward_pos_updated=self._is_forward_pos_updated,
-            is_forward_vel_updated=self._is_forward_vel_updated,
-        )
-
     @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
-    def __setstate__(self, state: KinematicSolverCheckpoint) -> None:
+    def __setstate__(self, state: SolverCheckpoint) -> None:
         super().__setstate__(state)
-        if array_class.DataKind.DERIVED in state.kinds:
-            self._is_forward_pos_updated = state.is_forward_pos_updated
-            self._is_forward_vel_updated = state.is_forward_vel_updated
-        else:
+        if array_class.DataKind.DERIVED not in state.kinds:
             # Without the derived arrays, forward kinematics runs now so the scene is drawn where the record put it. The
             # next step recomputes the rest of the derived state.
             self._is_forward_pos_updated = self._is_forward_vel_updated = False
@@ -1410,10 +1577,7 @@ class KinematicSolver(Solver):
         hold, and restores the one it does. Returns positions (n_envs, n_links, 3) and orientations
         (n_envs, n_links, 4), without the batch dimension when the scene is not batched.
         """
-        if self.n_envs == 0:
-            envs_idx = torch.zeros(1, dtype=gs.tc_int)
-        else:
-            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         qpos = broadcast_tensor(qpos, gs.tc_float, (len(envs_idx), entity.n_qs), ("envs_idx", "qs_idx")).contiguous()
 
         qs_idx = torch.arange(entity._q_start, entity._q_start + entity.n_qs, dtype=gs.tc_int, device=gs.device)
@@ -1647,16 +1811,6 @@ class KinematicSolver(Solver):
         if self.is_built:
             return self._n_qs
         return sum(entity.n_qs for entity in self._entities)
-
-    @property
-    def is_forward_pos_updated(self) -> bool:
-        """Whether the link and geom poses are current for the configuration, so the next step skips forward kinematics."""
-        return self._is_forward_pos_updated
-
-    @property
-    def is_forward_vel_updated(self) -> bool:
-        """Whether the link velocities are current for the generalized velocities."""
-        return self._is_forward_vel_updated
 
     @property
     def n_dofs(self):

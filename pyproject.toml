@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genesis-world"
-version = "1.4.2"
+version = "1.4.4"
 description = "A universal and generative physics engine"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "psutil",
-    "quadrants==1.3.0",
+    "quadrants==1.3.3",
     # * 2.13.0 sets the private state of a model built by 'model_construct', which pickling reads.
     "pydantic>=2.13.0",
     "numpy>=1.26.4",
@@ -27,6 +27,8 @@ dependencies = [
     "moviepy>=2.0.0",
     # Streams video frames to file, for 'camera.start_recording' and the 'VideoFile' recorder
     "av",
+    # Compresses the frames of trajectory files, fast enough for the writer thread to keep pace with stepping
+    "zstandard",
     # Used by `pyrender` to manage onscreen graphical windows
     # * 2.1.8 breaks headless windowing, which is used in unit tests of the interactive viewer.
     # * 2.0.15 <= 2.1.8 breaks old-style option overwrite for string literal.
@@ -204,6 +206,7 @@ addopts = [
     # Note that the retry mechanism is not compatible with "--forked".
     "-m not (benchmarks or examples)",
 ]
+xfail_strict = true
 filterwarnings = [
     "ignore::_pytest.warning_types.PytestUnknownMarkWarning",
     "ignore::DeprecationWarning",

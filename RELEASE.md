@@ -1,5 +1,70 @@
 # Genesis Release Note
 
+## 1.4.4
+
+The minor release speeds up rigid body simulation on GPU while significantly improving the robustness of perturbation-based multi-contact without extra runtime cost.
+
+### New Features
+
+* Let heterogeneous entities differ in scale, fixed base pose and joint parameters. (@duburcqa) (#3497)
+
+### Bug Fixes
+
+* Fix convex contact depth, normal and placement errors. (@duburcqa) (#3512, #3513, #3518, #3520, #3521)
+* Fix convex collision detection edge-cases. (@duburcqa) (#3472, #3514, #3517)
+* Fix multiple box-box contacts edge-cases. (@duburcqa) (#3504)
+* Fix non-deterministic GPU simulations. (@duburcqa) (#3510)
+* Fix alpha cutout of masked glTF material. (@kevin9327) (#3341)
+* Fix named terrain cache invalidation when its subterrain parameters change. (@MohammadHijjawi97) (#3456)
+* Fix contact markers frozen in place after a scene reset. (@duburcqa) (#3493)
+
+### Miscellaneous
+
+* Speed up rigid body simulation on GPU. (@duburcqa) (#3458, #3459, #3462, #3470)
+* Reduce the memory footprint of heterogeneous entities. (@duburcqa) (#3488)
+* Allow fast prototyping by dramatically reducing kernel recompilation. (@duburcqa) (#3464)
+* Bound the number of rigid solver compilations across scenes of different sizes. (@duburcqa) (#3461)
+* Support recording numpy scalars to files. (@MohammadHijjawi97) (#3457)
+* Migrate from deprecated TorchScript to torch.compile. (@duburcqa) (#3479)
+* Show the changes made by setters in the interactive viewer right away. (@duburcqa) (#3494)
+
+## 1.4.3
+
+This minor release focuses on improving the simulation speed for non-batch to moderate batch sizes (~4000) while reduce memory usage across the board. Besides, compilation should be up to x3 faster on Windows OS.
+
+### Bug Fixes
+
+* Fix several edge-cases related to glTF parsing. (@kevin9327) (#3342, #3343)
+* Preserve textures when replying trajectories. (@duburcqa) (#3395)
+* Preserve material textures from collision geoms duplicated as visual geoms when parsing MJCF files. (@MohammadHijjawi97) (#3399)
+* Fix 'z_up_to_R' failing when up is omitted. (@Milotrince) (#3396)
+* Fix compilation failure in performance mode on Apple Metal. (@duburcqa) (#3421)
+* Fix SDF boundary visualization. (@MohammadHijjawi97) (#3425)
+* Fix Genesis log messages printed twice when user configures root logging. (@Kashu7100) (#3427)
+* Fix the scan lines of a full-rotation spherical raycast pattern. (@MohammadHijjawi97) (#3424)
+* Fix pose getters not complying with deterministic mode on GPU. (@Milotrince) (#3387)
+* Apply scalar cross-axis coupling to IMU readings. (@cyanseek) (#3436)
+* Record the readings of multi-output sensors like IMUs. (@MohammadHijjawi97) (#3419)
+* Update the camera extrinsics when the camera moves. (@MohammadHijjawi97) (#3418)
+* Fix materials properties defined by TemperatureGrid sensors only applied by the first one. (@Milotrince) (#3439)
+* Fix normalisation of log-scaled depth images. (@jeetrex17) (#3442)
+* Check broad phase pair overflow when hibernation is enabled. (@Milotrince) (#3415)
+
+### Miscellaneous
+
+* Speed up raycasting, tactile sensing and SAP contact queries. (@duburcqa) (#3390)
+* Speed up the center of mass computation on GPU for long kinematic chains. (@duburcqa) (#3405)
+* Speed up multi-contact detection on GPU for scenes with small batch size. (@duburcqa) (#3404)
+* Speed up rigid body simulation on GPU for branched kinematic trees. (@duburcqa) (#3397)
+* Speed up rigid body simulation on GPU when the host launch overhead dominates. (@duburcqa) (#3388, #3394, #3433)
+* Speed up non-batched rigid simulation on GPU. (@duburcqa) (#3438)
+* Reduce the GPU memory footprint of rigid simulation. (@duburcqa) (#3403)
+* Reduce memory usage when using heightfield terrain. (@Kashu7100) (#3378)
+* Stop enforcing torch's global default device and dtype. (@Kashu7100) (#3431)
+* Speed up scene build by caching the description. (@Milotrince) (#3451)
+* Replace the dumb theme with a raw theme that prints plain, compact log lines. (@duburcqa) (#3452)
+* Upgrade to Quadrants 1.3.3. (@hughperkins) (#3407)
+
 ## 1.4.2
 
 This release focuses on significantly improving performance on large scale scenes via hibernation. Hibernated islands should do not incure any runtime anymore. Besides, the Signorini contact resolution is in better shape but should still be consider experimental due to convergence issue.

@@ -197,8 +197,13 @@ def test_partition_logics(show_viewer, n_envs, multi_free_body_path):
 def test_partition_maximal_and_invariance(show_viewer, fixed_base_dual_arm):
     # The dual arm hanging from a fixed torso against its twin whose free torso is welded to the world at runtime:
     # the twin is one island throughout, the fixed one splits per arm until the arms touch, and both fall alike. The
-    # arms of the first env start lower, so its islands merge first.
+    # arms of the first env start lower, so its islands merge first. The arms start off mirror images, since their
+    # contact would otherwise have two directions of least penetration, and the elliptic friction cone holds them at
+    # rest against each other, where the pyramidal one lets them creep at a rate that differs between the twins.
     scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(
+            friction_cone=gs.friction_cone.elliptic,
+        ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(1.5, -4.0, 1.5),
             camera_lookat=(1.5, 0.0, 0.8),
@@ -221,8 +226,8 @@ def test_partition_maximal_and_invariance(show_viewer, fixed_base_dual_arm):
     )
     scene.build(n_envs=2)
     scene.rigid_solver.add_weld_constraint(dual_arm_welded.base_link_idx, plane.base_link_idx)
-    dual_arm.set_dofs_position([[0.9, -0.9], [0.0, 0.0]])
-    dual_arm_welded.set_dofs_position([[0.9, -0.9], [0.0, 0.0]], dofs_idx_local=[6, 7])
+    dual_arm.set_dofs_position([[0.9, -0.8], [0.1, 0.0]])
+    dual_arm_welded.set_dofs_position([[0.9, -0.8], [0.1, 0.0]], dofs_idx_local=[6, 7])
     n_islands = scene.rigid_solver.constraint_solver.constraint_state.island.n_islands
 
     # The welded dual arm is one island, the two arms of the fixed dual arm are two islands until they touch, one from
@@ -230,7 +235,9 @@ def test_partition_maximal_and_invariance(show_viewer, fixed_base_dual_arm):
     has_envs_differed = False
     for i_step in range(80):
         scene.step()
-        is_arms_touching = tensor_to_array(dual_arm.get_contacts(with_entity=dual_arm)["valid_mask"].any(dim=-1))
+        # FIXME: pytorch#TBD - 'any' over an empty dimension returns uninitialized memory on MPS, so the contacts are
+        # reduced on the host, an environment without any contact leaving that dimension empty
+        is_arms_touching = tensor_to_array(dual_arm.get_contacts(with_entity=dual_arm)["valid_mask"]).any(axis=-1)
         assert_equal(qd_to_numpy(n_islands), 3 - is_arms_touching)
         has_envs_differed |= is_arms_touching[0] != is_arms_touching[1]
         if i_step == 0:
@@ -389,6 +396,8 @@ def test_islands_converge_independently(show_viewer, n_envs):
 
 
 @pytest.mark.required
+# Outside performance mode the decomposed solver is enforced on GPU, which leaves the monolith untestable.
+@pytest.mark.performance_mode(True)
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_monolith_seed_oversaturated(show_viewer, monkeypatch):
     # enable_cooperative_constraint_kernels is bounded by get_gpu_core_count(), so faking extreme GPU saturation
@@ -542,16 +551,18 @@ def test_hibernation_with_pruning(show_viewer, n_envs):
 
 @pytest.mark.required
 @pytest.mark.parametrize("mujoco_compatibility", [False, True])
-def test_dof_length_scales_with_body_size(mujoco_compatibility):
+def test_dof_length_scales_with_body_size(offset_hinge_box, mujoco_compatibility):
     # dof_length puts each rotational dof velocity on a linear (m/s) scale by the body radius (1 for translation), so
     # the same angular velocity reads as a larger surface speed on a larger body. A free sphere gets a rotational
     # dof_length equal to its radius - both with our per-axis swept radius and with MuJoCo's COM bounding sphere
     # (gated behind mujoco_compatibility), since the two coincide for a sphere. dof_length is stored per environment,
     # so a heterogeneous entity gets a different radius per variant (each variant's geoms are active only in its own
     # envs). The two sphere variants map to envs 0-1 and 2-3; the homogeneous spheres make the scene multi-island so
-    # hibernation (and thus dof_length) is active.
+    # hibernation (and thus dof_length) is active. The hinged box variants differ in scale, which moves the hinge of
+    # the larger one out as far as it grows the box, so that its swept radius scales along.
     radii = (0.1, 0.3)
     variant_radii = (0.02, 0.06)
+    hinge_scales = (1.0, 2.0)
     scene = gs.Scene(
         rigid_options=gs.options.RigidOptions(
             use_hibernation=True,
@@ -561,6 +572,7 @@ def test_dof_length_scales_with_body_size(mujoco_compatibility):
     )
     spheres = [scene.add_entity(gs.morphs.Sphere(radius=r, pos=(2.0 * i, 0.0, 1.0))) for i, r in enumerate(radii)]
     het = scene.add_entity(morph=tuple(gs.morphs.Sphere(radius=r, pos=(0.0, 2.0, 1.0)) for r in variant_radii))
+    het_hinge = scene.add_entity(morph=tuple(gs.morphs.MJCF(file=offset_hinge_box, scale=s) for s in hinge_scales))
     scene.build(n_envs=4)
 
     dof_length = qd_to_numpy(scene.rigid_solver.dyn_info.dofs.dof_length)
@@ -571,6 +583,9 @@ def test_dof_length_scales_with_body_size(mujoco_compatibility):
     rotational = dof_length[het.dof_start + 3 : het.dof_start + 6]  # (3, n_envs)
     assert_allclose(rotational[:, [0, 1]], variant_radii[0], tol=gs.EPS)
     assert_allclose(rotational[:, [2, 3]], variant_radii[1], tol=gs.EPS)
+    # The radius reaches the far box corners, about the hinge or about the center of mass with MuJoCo compatibility
+    hinge_radius = np.linalg.norm((0.05, 0.02, 0.03)) if mujoco_compatibility else np.hypot(0.1 + 0.05, 0.03)
+    assert_allclose(dof_length[het_hinge.dof_start], np.repeat(hinge_scales, 2) * hinge_radius, tol=gs.EPS)
 
 
 @pytest.mark.required

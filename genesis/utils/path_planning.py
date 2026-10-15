@@ -1002,7 +1002,8 @@ class RRTConnect(PathPlanner):
 
         if is_invalid.all():
             self._entity.set_qpos(qpos_cur, envs_idx=envs_idx if self._solver.n_envs else None, zero_velocity=False)
-            return torch.zeros(num_waypoints, len(envs_idx), sol.shape[-1], device=gs.device), is_invalid
+            sol = torch.zeros((num_waypoints, len(envs_idx), sol.shape[-1]), dtype=gs.tc_float, device=gs.device)
+            return sol, is_invalid
 
         mask = rrt_connect_valid_mask(res_idx)
         if self._solver.n_envs > 1:

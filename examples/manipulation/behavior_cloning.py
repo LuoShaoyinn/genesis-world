@@ -267,7 +267,7 @@ class ExperienceBuffer:
         # calculate the size of each mini-batch
         batch_size = self._size // num_mini_batches
         for _ in range(num_epochs):
-            indices = torch.randperm(self._size)
+            indices = torch.randperm(self._size, device=self._device)
             for batch_idx in range(0, self._size, batch_size):
                 batch_indices = indices[batch_idx : batch_idx + batch_size]
 

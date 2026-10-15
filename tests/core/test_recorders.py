@@ -9,7 +9,7 @@ import av
 import genesis as gs
 from genesis.utils.image_exporter import as_grayscale_image
 
-from ..utils.assertions import assert_allclose, rgb_array_to_png_bytes
+from ..utils.assertions import assert_allclose, assert_equal, rgb_array_to_png_bytes
 
 
 @pytest.fixture
@@ -220,15 +220,23 @@ def test_file_writers(tmp_path):
     csv_writer = gs.recorders.CSVFile(filename=csv_file, header=("in_contact",))
     contact_sensor.start_recording(csv_writer)
 
+    imu = scene.add_sensor(
+        gs.sensors.IMU(
+            entity_idx=box.idx,
+        ),
+    )
+    imu_file = tmp_path / "imu_data.csv"
+    imu.start_recording(gs.recorders.CSVFile(filename=imu_file))
+
     csv_array_file = tmp_path / "array_data.csv"
     scene.add_recorder(
-        data_func=lambda: {"batch": np.arange(6).reshape(2, 3)},
+        data_func=lambda: {"batch": np.arange(6).reshape(2, 3), "scale": np.float32(0.5)},
         rec_options=gs.recorders.CSVFile(filename=csv_array_file),
     )
 
     npz_file = tmp_path / "scene_data.npz"
     scene.add_recorder(
-        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1},
+        data_func=lambda: {"box_pos": box.get_pos(), "dummy": 1, "scale": np.float32(0.5)},
         rec_options=gs.recorders.NPZFile(filename=npz_file),
     )
 
@@ -241,7 +249,10 @@ def test_file_writers(tmp_path):
     timings = scene.timings
     assert timings["physics"] > 0.0 and timings["recorders"] > 0.0
     assert timings["sensors"] >= timings[f"sensors/{type(contact_sensor).__name__}"] > 0.0
-    assert timings["total"] >= sum(time for phase, time in timings.items() if phase != "total" and "/" not in phase)
+    assert timings["step"] >= sum(
+        time for phase, time in timings.items() if phase not in ("step", "period") and "/" not in phase
+    )
+    assert timings["period"] > 0.0
 
     scene.stop_recording()
 
@@ -254,20 +265,38 @@ def test_file_writers(tmp_path):
         assert rows[1][1] in ("False", "0")  # not in contact initially
         assert rows[-1][1] in ("True", "1")  # in contact after falling
 
+    with open(imu_file, "r") as f:
+        rows = list(csv.reader(f))
+        assert len(rows) == STEPS + 2
+        assert rows[0] == ["timestamp", *(f"{name}_{i}" for name in ("lin_acc", "ang_vel", "mag") for i in range(3))]
+
     assert csv_array_file.exists()
     with open(csv_array_file, "r") as f:
         reader = csv.reader(f)
         rows = list(reader)
 
-        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5"]
-        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5"]
+        assert rows[0] == ["timestamp", "batch_0", "batch_1", "batch_2", "batch_3", "batch_4", "batch_5", "scale"]
+        assert rows[1][1:] == ["0", "1", "2", "3", "4", "5", "0.5"]
 
     assert npz_file.exists()
     data = np.load(npz_file)
     assert "timestamp" in data
     assert "box_pos" in data
     assert "dummy" in data
+    assert_allclose(data["scale"], 0.5, tol=gs.EPS)
     assert len(data["timestamp"]) == STEPS + 1
+
+    # A step a pre-step callback vetoes leaves no trace, and the next step measures its period from the last one that
+    # advanced, the vetoed one in between included
+    timings = scene.timings
+    is_paused = True
+    scene.register_pre_step_callback(lambda: is_paused)
+    scene.step()
+    assert scene.timings.keys() == timings.keys()
+    assert_equal(list(scene.timings.values()), list(timings.values()))
+    is_paused = False
+    scene.step()
+    assert scene.timings["period"] > timings["step"] > 0.0
 
 
 @pytest.mark.required

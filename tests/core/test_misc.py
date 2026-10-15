@@ -291,6 +291,7 @@ def test_coacd_options_pca_validation():
         (np.array((-5, -1), dtype=np.int32), (-5, 3)),
         (np.array((1, 3), dtype=np.uint32), (1, 3)),
         (np.array((-2.0, -1.0), dtype=np.float64), (2, 3)),
+        (np.arange(4)[::-2], (3, 1)),
         (torch.tensor((-2, -1), dtype=torch.int32), (2, 3)),
         (torch.tensor((-5, -1), dtype=torch.int32), (-5, 3)),
         (torch.tensor((0, 3), dtype=torch.uint8), (0, 3)),
@@ -339,6 +340,14 @@ def test_indices_to_mask_selects_the_cross_product(as_boolean):
     # these inputs would give the two values on the diagonal.
     assert_equal(buf[indices_to_mask(envs_idx, dofs_idx)], torch.tensor(((5, 7), (15, 17)), dtype=torch.int32))
     assert_equal(buf[indices_to_mask(envs_idx)], buf[torch.tensor((1, 3))])
+
+
+@pytest.mark.required
+def test_init_preserves_torch_defaults():
+    assert torch.get_default_device() == torch.device("cpu")
+    assert torch.get_default_dtype() == torch.float32
+    for tensor in (gs.tensor((1.0, 2.0)), gs.zeros(3), gs.arange(3), gs.rand(3), gs.zeros_like(gs.zeros(3))):
+        assert tensor.device.type == gs.device.type
 
 
 @pytest.mark.required
@@ -662,7 +671,7 @@ def test_per_env_time(show_viewer, n_envs, tol):
 
     for _ in range(N_MORE_STEPS):
         scene.step()
-    scene.reset(envs_idx=torch.tensor((False, True, False)))
+    scene.reset(envs_idx=torch.tensor((False, True, False), device=gs.device))
     assert_allclose(scene.get_time(), [N_MORE_STEPS * DT, 0.0, N_MORE_STEPS * DT], tol=tol)
 
 

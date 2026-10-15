@@ -616,7 +616,7 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(show_viewer):
 
     # Attach the sphere to its center
     sphere_poss = sphere.get_state().pos[0]
-    sphere_poss -= torch.tensor(sphere.morph.pos)
+    sphere_poss -= torch.tensor(sphere.morph.pos, device=gs.device)
     sphere_center_idx = int(torch.argmin(torch.linalg.norm(sphere_poss, dim=-1)))
     sphere_target_poss = sphere.init_positions[sphere_center_idx]
     sphere.set_vertex_constraints(sphere_center_idx, sphere_target_poss)
@@ -657,7 +657,7 @@ def test_implicit_sap_coupler_hard_constraint_and_collision(show_viewer):
 
         # Check that the sphere is more or less a sphere
         sphere_poss = sphere.get_state().pos
-        sphere_poss -= torch.tensor(sphere.morph.pos)
+        sphere_poss -= torch.tensor(sphere.morph.pos, device=gs.device)
         sphere_dist_max = torch.linalg.norm(sphere_poss, dim=-1).max(dim=-1).values
         assert_allclose(sphere_dist_max, SPHERE_RADIUS, tol=0.01)
 

@@ -23,7 +23,6 @@ from .conftest import (
     check_gs_tm_textures,
 )
 
-
 # ==================== Scale Tests ====================
 
 
@@ -295,6 +294,8 @@ def test_urdf_mesh_processing(mesh_path, mesh_urdf, show_viewer):
         "normal_accessor_zero_glb",
         "texcoord_0_accessor_zero_glb",
         "texcoord_1_accessor_zero_glb",
+        "triangle_strip_nodes_glb",
+        "non_uniform_node_scale_glb",
     ],
 )
 def test_glb_parse_geometry(request, glb_file, tol):
@@ -312,11 +313,25 @@ def test_glb_parse_geometry(request, glb_file, tol):
     )
 
     tm_scene = trimesh.load(glb_path, process=False)
+    # A mesh whose primitives all declare NORMAL carries authored normals, which map through the inverse transpose
+    # of the node transform's linear part. 'apply_transform' maps the normals it holds through the linear part
+    # itself, so the authored ones are mapped here and written back over its result. A mesh declaring none leaves
+    # its normals to be derived from the geometry, which both parsers do once the node transform is applied.
+    glb = pygltflib.GLTF2().load(glb_path)
+    authored_normals_names = {
+        mesh.name for mesh in glb.meshes if all(prim.attributes.NORMAL is not None for prim in mesh.primitives)
+    }
     tm_meshes = {}
     for node_name in tm_scene.graph.nodes_geometry:
         transform, geometry_name = tm_scene.graph[node_name]
         ts_mesh = tm_scene.geometry[geometry_name].copy(include_cache=True)
+        normals = None
+        if geometry_name in authored_normals_names:
+            normals = ts_mesh.vertex_normals @ np.linalg.inv(transform[:3, :3])
+            normals /= np.linalg.norm(normals, axis=1, keepdims=True)
         ts_mesh = ts_mesh.apply_transform(transform)
+        if normals is not None:
+            ts_mesh.vertex_normals = normals
         tm_meshes[geometry_name] = ts_mesh
     assert len(tm_meshes) == len(gs_meshes)
 
@@ -351,20 +366,39 @@ def test_glb_draco_missing_normals_texcoord(glb_file):
 
 
 @pytest.mark.required
-def test_glb_texcoord(emissive_material_variants_glb):
-    # Material 0 reads the float set 0 and material 1 the normalized set 1, so both meshes carry the authored UVs
+def test_glb_material_variants(material_variants_glb):
     gs_meshes = gltf_utils.parse_mesh_glb(
-        emissive_material_variants_glb,
+        material_variants_glb,
         group_by_material=True,
         scale=None,
         is_mesh_zup=True,
         surface=gs.surfaces.Default(),
     )
-    assert len(gs_meshes) == 2
-    # V is flipped to the image-space convention
+    assert len(gs_meshes) == 6
+
+    # Material 0 reads the float set 0 and material 1 the normalized set 1, so every mesh carries the authored UVs,
+    # with V flipped to the image-space convention
     expected_uvs = np.array([[0.125, 0.75], [0.375, 0.5], [0.625, 0.25]], dtype=np.float32)
     for gs_mesh in gs_meshes:
         assert_allclose(gs_mesh.trimesh.visual.uv, expected_uvs, tol=1.0 / np.iinfo(np.uint16).max)
+
+    # A masked material splits the alpha ramp at its cutoff, taken after the alpha factor: 0.6 of full opacity is
+    # 153, between the third and the fourth texel, and a factor of 0.6 leaves only the last texel at 0.5 or above.
+    # A blended material keeps the ramp and an opaque one discards it.
+    expected_opacities = {
+        "masked": [0, 0, 0, 255, 255],
+        "masked_factor": [0, 0, 0, 0, 255],
+        "blended": [0, 64, 128, 192, 255],
+        "opaque": [255, 255, 255, 255, 255],
+    }
+    opacities = {
+        gs_mesh.metadata["name"]: gs_mesh.surface.opacity_texture.image_array[0]
+        for gs_mesh in gs_meshes
+        if gs_mesh.metadata["name"] in expected_opacities
+    }
+    assert opacities.keys() == expected_opacities.keys()
+    for material_name, expected in expected_opacities.items():
+        assert_equal(opacities[material_name], expected, err_msg=material_name)
 
 
 # ==================== Material/Texture Parsing Tests ====================
@@ -508,10 +542,10 @@ def test_glb_shared_texture_not_duplicated(tmp_path):
 
 
 @pytest.mark.required
-def test_glb_uv_set_and_unlit_albedo_resolution(emissive_material_variants_glb):
+def test_glb_uv_set_and_unlit_albedo_resolution(material_variants_glb):
     # A single UV set is baked per mesh, following whichever texture actually samples it, and unlit imagery must not be
     # hidden by the white base that a missing color installs. parse_glb_material returns the chosen texCoord and surface.
-    glb = pygltflib.GLTF2().load(emissive_material_variants_glb)
+    glb = pygltflib.GLTF2().load(material_variants_glb)
     glb.convert_images(pygltflib.ImageFormat.DATAURI)
 
     # A base-color atlas owns the UV set; an emissive on a different texCoord does not replace it.
@@ -801,6 +835,7 @@ def test_mjcf_2d_texture_mapping(textured_mjcf):
         "plane_infinite",
         "ellipsoid_uniform",
         "box_uniform",
+        "box_uniform_collision",
     )
     EXPECTED_EXPLICIT_UVS = ((0.125, 0.25), (0.5, 0.875), (0.625, 0.75), (0.75, 0.25))
 
@@ -840,6 +875,10 @@ def test_mjcf_2d_texture_mapping(textured_mjcf):
     spatial_uvs = np.concatenate([vgeoms[name].uvs for name in SPATIAL_GEOM_NAMES], axis=0)
     expected_spatial_uvs = np.column_stack((spatial_xy[:, 0] - 0.5, -1.25 * spatial_xy[:, 1] - 0.5))
     assert_allclose(spatial_uvs, expected_spatial_uvs, tol=gs.EPS)
+
+    collision_texture = vgeoms["box_uniform_collision"].vmesh.surface.diffuse_texture
+    assert isinstance(collision_texture, gs.textures.ImageTexture)
+    assert_equal(collision_texture.image_array, vgeoms["box_uniform"].vmesh.surface.diffuse_texture.image_array)
 
     fitted_uniform = vgeoms["box_fitted"]
     fitted_uniform_xy = fitted_uniform.init_vverts[:, :2] / np.multiply(SCALE, (1.0, 2.0))

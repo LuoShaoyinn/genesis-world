@@ -9,6 +9,7 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
+from functools import cached_property
 from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
 
 import numpy as np
@@ -48,9 +49,10 @@ from genesis.recorders import RecorderManager
 from genesis.recorders.trajectory import Trajectory, save_checkpoint
 from genesis.repr_base import RBC
 from genesis.utils import serialization
-from genesis.utils.array_class import check_data
+from genesis.utils.array_class import DataItem, check_data
 from genesis.utils.misc import sanitize_index, tensor_to_array
 from genesis.utils.serialization import ARRAY_MEMBER, MANIFEST_NAME, pixel_less_textures
+from genesis.utils.tools import RunningMean
 from genesis.utils.warnings import warn_once
 from genesis.vis import Visualizer
 
@@ -64,6 +66,8 @@ if TYPE_CHECKING:
 
 
 SCENE_FORMAT = ".gscene"
+# The stepping time each sample of the step rate log covers, so that its smoothing spans a fixed time whatever the rate
+STEP_RATE_LOG_INTERVAL = 0.05
 
 
 @dataclasses.dataclass
@@ -111,8 +115,8 @@ def description_digest(desc: SceneDescription) -> str:
     'Scene.load' replaces. Two scenes sharing the digest allocate the same state, so a record of one restores into the
     other. The Genesis version and sources are left out, so a record survives the code moving on.
 
-    The digest exports the description in memory, meshes included, so it is taken once per built scene and once per
-    trajectory opened, never per restore.
+    The digest exports the description in memory, meshes included, so a scene takes it on its first save or restore
+    and keeps it, and a trajectory takes it once when opened.
     """
     defaults = SceneOptions()
     visual = {
@@ -243,6 +247,10 @@ class Scene(RBC):
 
         # simulator
         self._sim = Simulator(scene=self, options=self.options)
+        # The smoothed step rate the log reports, and the steps and stepping time of the sample being gathered
+        self._step_rate_mean = RunningMean(alpha=self.options.profiling.FPS_tracker_alpha)
+        self._n_sample_steps = 0
+        self._sample_periods_sum = 0.0
 
         # visualizer
         self._visualizer = Visualizer(
@@ -264,7 +272,6 @@ class Scene(RBC):
 
         self._uid = gs.UID()
         self._is_built = False
-        self._desc_digest: str | None = None
         self._pre_step_callbacks: list = []
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
@@ -294,6 +301,9 @@ class Scene(RBC):
             if getattr(self, "_sim", None) is not None:
                 self._sim.destroy()
                 self._sim = None
+
+            # The viewer plugins stopped by the visualizer still require a built scene
+            self._is_built = False
 
     @overload
     def add_entity(
@@ -333,9 +343,12 @@ class Scene(RBC):
         Parameters
         ----------
         morph : gs.morphs.Morph | list[gs.morphs.Morph]
-            The morph of the entity. If a list of morphs is provided, the entity will be heterogeneous
-            (rigid only, single-link entities only). Each parallel environment will simulate a different
-            geometry variant from the list.
+            The morph of the entity. If a list of morphs is provided, the entity is heterogeneous (rigid and kinematic
+            entities only): each parallel environment simulates one of them, the environments being split into
+            contiguous blocks of nearly equal size. The morphs must share their kinematic topology (the same links,
+            connected by joints of the same names, types and numbers of degrees of freedom), while their geometry,
+            inertia, link frames (e.g. a different 'scale', or a different pose for a fixed base) and joint parameters
+            may differ.
         material : gs.materials.Material | None, optional
             The material of the entity. If None, use ``gs.materials.Rigid()``.
         surface : gs.surfaces.Surface | None, optional
@@ -869,19 +882,24 @@ class Scene(RBC):
             # reset state
             self._reset()
 
-            # The description is fixed once built, so its digest is taken once (see 'description_digest')
-            self._desc_digest = description_digest(self._desc)
             self._is_built = True
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
+            if self._sim.rigid_solver.is_active:
+                try:
+                    self._sim.rigid_solver.check_errno()
+                except gs.GenesisException:
+                    self.destroy()
+                    raise
             self._reset()
 
         # visualizer
         with gs.logger.timer("Building visualizer..."):
             self._visualizer.build()
 
-        # recorders
+        # recorders, which lay out the phases a step times once (see 'StepTimer.add_phases')
+        self._sim.step_timer.add_phases("recorders", "rendering", "video")
         self._recorder_manager.build()
 
     def _parallelize(
@@ -1058,8 +1076,8 @@ class Scene(RBC):
         # frame's advance by returning True. The scene treats them opaquely, without knowing what they do or who
         # registered them (e.g. an InteractiveScene driving GUI-requested rebuild/pause). The visualizer is still
         # refreshed when the advance is vetoed, so the viewer keeps rendering and stays responsive while paused.
-        fps_tracker = self._sim.fps_tracker
-        fps_tracker.start()
+        step_timer = self._sim.step_timer
+        step_timer.start()
         advance = not any([callback() for callback in tuple(self._pre_step_callbacks)])
 
         if advance:
@@ -1067,21 +1085,41 @@ class Scene(RBC):
                 gs.raise_exception("Forward simulation not allowed after backward pass. Please reset scene state.")
             # The recorders read the state a step starts from, with the inputs the step consumes: 'Simulator.step'
             # zeroes the applied forces at its end. The pre-step callbacks ran, so their inputs are read as well.
-            with fps_tracker.phase("recorders"):
+            with step_timer.phase("recorders"):
                 self._recorder_manager.step(self._sim.cur_step_global)
             self._sim.step()
 
         if update_visualizer:
             # Force the refresh when the sim did not advance (e.g. paused) so edits made off the step loop -
             # like a GUI joint slider calling set_qpos - are still drawn and the viewer does not appear frozen.
-            with fps_tracker.phase("rendering"):
+            with step_timer.phase("rendering"):
                 self._visualizer.update(force=not advance, auto=refresh_visualizer)
 
-        if advance:
-            with fps_tracker.phase("video"):
-                for camera in self._visualizer.cameras:
-                    camera.update_recording()
-        fps_tracker.step(count=advance)
+        # A vetoed step never happened for the timings: the next 'start' discards the one it opened
+        if not advance:
+            return
+        with step_timer.phase("video"):
+            for camera in self._visualizer.cameras:
+                camera.update_recording()
+        step_timer.step()
+        # The step rate the loop achieves is the inverse of the period of its steps (see 'StepTimer'), sampled over
+        # STEP_RATE_LOG_INTERVAL of stepping and logged for every environment and per environment
+        period = step_timer.timings.get("period")
+        if self.options.profiling.show_FPS and period is not None:
+            self._n_sample_steps += 1
+            self._sample_periods_sum += period
+            if self._sample_periods_sum >= STEP_RATE_LOG_INTERVAL:
+                self._step_rate_mean.update(self._n_sample_steps / self._sample_periods_sum)
+                self._n_sample_steps = 0
+                self._sample_periods_sum = 0.0
+                rate = self._step_rate_mean.value
+                if self.n_envs > 0:
+                    gs.logger.info(
+                        f"Running at ~<{rate * self.n_envs:,.2f}>~ FPS "
+                        f"(~<{rate:.2f}>~ FPS per env, ~<{self.n_envs}>~ envs)."
+                    )
+                else:
+                    gs.logger.info(f"Running at ~<{rate:.2f}>~ FPS.")
 
     def stop_recording(self):
         # The recorders read before each step, so the state the last step left is recorded here, whatever the
@@ -1612,9 +1650,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. If None, the recorded ones stand. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. If None, the recorded ones stand. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. If None, the recorded one stands. Defaults to None.
 
@@ -1637,11 +1675,23 @@ class Scene(RBC):
     ) -> "Scene":
         """Create the scene a description states, waiting to be built.
 
-        The viewer, visualizer and renderer options are replaced where given. The physics options stand as described,
-        since they size the arrays a recorded state fills.
+        The viewer and visualizer options override the described ones field by field, for the fields they set, and the
+        renderer is replaced where given. The physics options stand as described, since they size the arrays a
+        recorded state fills.
         """
-        replaced = (("viewer", viewer_options), ("vis", vis_options), ("renderer", renderer))
-        options = described.options.model_copy(update={name: value for name, value in replaced if value is not None})
+        # A field left at its default keeps the described value, so asking for one change keeps the lights, the
+        # background and the camera the scene was authored with.
+        updates = {}
+        for name, recorded, given in (
+            ("viewer", described.options.viewer, viewer_options),
+            ("vis", described.options.vis, vis_options),
+        ):
+            if given is not None:
+                given_fields = {field: value for field, value in dict(given).items() if field in given.model_fields_set}
+                updates[name] = recorded.model_copy(update=given_fields)
+        if renderer is not None:
+            updates["renderer"] = renderer
+        options = described.options.model_copy(update=updates)
         scene = cls(show_viewer=show_viewer, options=options)
         # 'add_entity' would resolve a material and a surface the description already holds, and read the asset it
         # replaces.
@@ -1698,8 +1748,8 @@ class Scene(RBC):
     ) -> "Scene":
         """Create and build the scene a checkpoint file holds, standing in the final state the file records.
 
-        The file is one written by 'save_checkpoint' or by recording a 'TrajectoryFile' to its end. The viewer,
-        visualizer and renderer options may be replaced (see 'load').
+        The file is one written by 'save_checkpoint' or by recording a 'TrajectoryFile' to its end. The viewer and
+        visualizer options may be overridden and the renderer replaced (see 'load').
 
         Parameters
         ----------
@@ -1708,9 +1758,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. Defaults to None.
 
@@ -1734,8 +1784,8 @@ class Scene(RBC):
     ) -> Trajectory:
         """Open a recorded trajectory in the scene it was recorded from, created and built here, to seek and replay.
 
-        The file is one written by recording a 'TrajectoryFile'. The viewer, visualizer and renderer options may be
-        replaced (see 'load').
+        The file is one written by recording a 'TrajectoryFile'. The viewer and visualizer options may be overridden
+        and the renderer replaced (see 'load').
 
         Parameters
         ----------
@@ -1744,9 +1794,9 @@ class Scene(RBC):
         show_viewer : bool, optional
             Whether to open an interactive viewer on the scene. Defaults to False.
         viewer_options : ViewerOptions, optional
-            Viewer options replacing the recorded ones. Defaults to None.
+            Viewer options overriding the recorded ones, for the fields they set. Defaults to None.
         vis_options : VisOptions, optional
-            Visualizer options replacing the recorded ones. Defaults to None.
+            Visualizer options overriding the recorded ones, for the fields they set. Defaults to None.
         renderer : RendererOptions, optional
             Renderer replacing the recorded one. Defaults to None.
 
@@ -1795,7 +1845,8 @@ class Scene(RBC):
             )
         for name, solver in solvers.items():
             record = state.sim.solvers[name]
-            check_data((item for item in solver.data if item.kind in record.kinds), record.arrays)
+            items = (item for item in solver.data if isinstance(item, DataItem) and item.kind in record.kinds)
+            check_data(items, record.arrays)
         # The recorders finish the run first (see 'reset'), and the restart follows the state, so the visualizer draws
         # the state put back.
         self._recorder_manager.record(self._sim.cur_step_global)
@@ -1851,22 +1902,27 @@ class Scene(RBC):
 
     @property
     def timings(self):
-        """Wall time in seconds of the phases of a call to `step`, averaged over the latest `timings_window` steps
-        (see ProfilingOptions) among the steps that ran the phase, keyed by phase:
+        """Wall time in seconds of every phase of the latest call to `step` that advanced the simulation, by phase.
+
+        The phases are:
 
         - physics: the solvers advancing the state over the substeps.
         - sensors: the sensor updates, and sensors/<class name> the share of each sensor class.
         - rendering: the viewer refresh.
         - recorders: the recorders reading the state.
         - video: the cameras rendering and encoding the frame of a recording.
-        - total: the whole step, the pre-step callbacks included.
+        - step: the whole call to `step`, the pre-step callbacks included.
+        - period: the wall time from the start of the previous call to `step` that advanced the simulation to the start
+          of this one, the time spent between the two included, so its inverse is the step rate the loop achieves.
 
-        A phase the step left out (the simulation vetoed by a pre-step callback, the visualizer update skipped) is
-        absent from that step, so the mapping is empty before the first step. On the GPU backends a phase covers the
-        host work of launching its kernels, which the device completes asynchronously, so the phases split the step on
-        the CPU backend and the total holds on every backend once a step reads the device back.
+        A phase the step left out (the visualizer update skipped) is absent. A step a pre-step callback vetoed never
+        happened for the timings, which it leaves as they were. The mapping is empty before the first step, and the
+        first step has no `period`. The values are raw, so a quantity read from them every step is smoothed with a
+        `RunningMean` (in genesis.utils.tools). On the GPU backends a phase covers the host work of launching its
+        kernels, which the device completes asynchronously, so the phases split the step on the CPU backend, and `step`
+        holds on every backend once it reads the device back.
         """
-        return self._sim.fps_tracker.timings
+        return self._sim.step_timer.timings
 
     @property
     def requires_grad(self):
@@ -1935,6 +1991,11 @@ class Scene(RBC):
         scene rather than the state it has simulated to.
         """
         return self._desc
+
+    @cached_property
+    def _desc_digest(self) -> str:
+        """The digest of this scene's description (see 'description_digest'), which a saved state must share."""
+        return description_digest(self._desc)
 
     def get_entity(self, name: str | None = None, *, uid: str | None = None) -> "Entity":
         """

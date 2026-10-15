@@ -96,7 +96,7 @@ def test_link_velocity(gs_sim, tol):
         if writing == "mass":
             solver.set_links_mass([1.0, 3.0])
         else:
-            solver.set_links_COM(solver.get_links_COM() + torch.tensor([0.05, -0.02, 0.0]))
+            solver.set_links_COM(solver.get_links_COM() + torch.tensor([0.05, -0.02, 0.0], device=gs.device))
 
         masses = tensor_to_array(solver.get_links_mass())
         centers = tensor_to_array(solver.get_links_pos(ref=gs.link_ref_frame.link_COM))
@@ -622,9 +622,17 @@ def test_multi_robot_inverse_kinematics(show_viewer, tol):
 
 
 @pytest.mark.slow("gpu")  # gpu ~300s
-@pytest.mark.required
-@pytest.mark.parametrize("n_envs, batch_dofs_info", [(0, True), (2, False), (2, True)])
-@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+@pytest.mark.parametrize(
+    "backend, n_envs, batch_dofs_info",
+    [
+        pytest.param(gs.cpu, 0, True, marks=pytest.mark.required),
+        pytest.param(gs.cpu, 2, False, marks=pytest.mark.required),
+        (gs.cpu, 2, True),
+        pytest.param(gs.gpu, 0, True, marks=pytest.mark.required),
+        pytest.param(gs.gpu, 2, False, marks=pytest.mark.required),
+        pytest.param(gs.gpu, 2, True, marks=pytest.mark.required),
+    ],
+)
 def test_path_planning_avoidance(backend, n_envs, batch_dofs_info, show_viewer, tol):
     CUBE_SIZE = 0.07
     DOF_LIMIT = 0.5

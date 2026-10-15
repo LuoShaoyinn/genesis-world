@@ -3,13 +3,15 @@ import marshal
 import math
 import os
 import pickle as pkl
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
+
+import numpy as np
 
 import coacd
 import igl
 import Imath
-import numpy as np
 import OpenEXR
 import tetgen
 import trimesh
@@ -187,8 +189,12 @@ def get_gsd_path(verts, faces, sdf_res, sdf_cell_size):
     return os.path.join(get_gsd_cache_dir(), f"{hashkey}.gsd")
 
 
-def get_gnd_path(name, subterrain_types, subterrain_size, horizontal_scale, vertical_scale, n_subterrains):
-    hashkey = get_hashkey(name, subterrain_types, subterrain_size, horizontal_scale, vertical_scale, n_subterrains)
+def get_gnd_path(
+    name, subterrain_types, subterrain_size, horizontal_scale, vertical_scale, n_subterrains, subterrain_parameters
+):
+    hashkey = get_hashkey(
+        name, subterrain_types, subterrain_size, horizontal_scale, vertical_scale, n_subterrains, subterrain_parameters
+    )
     return os.path.join(get_gnd_cache_dir(), f"{hashkey}.gnd")
 
 
@@ -232,8 +238,25 @@ def get_usd_bake_path(file_path):
 
 
 def get_hashkey(*args):
+    # Containers are replaced by the tuples of their items, sorted for sets and for dicts other than OrderedDict since
+    # equal ones may iterate in different orders (string hashes are salted per process). Items are replaced before their
+    # container, so that sorting compares canonical representations, which order items of any type.
+    values, nodes = [], [(args, False)]
+    while nodes:
+        node, is_expanded = nodes.pop()
+        if is_expanded:
+            items = [values.pop() for _ in range(len(node))]
+            if isinstance(node, (set, frozenset)) or (isinstance(node, dict) and not isinstance(node, OrderedDict)):
+                items.sort(key=repr)
+            values.append(tuple(items))
+        elif isinstance(node, (dict, list, tuple, set, frozenset)):
+            nodes.append((node, True))
+            nodes.extend((item, False) for item in (node.items() if isinstance(node, dict) else node))
+        else:
+            values.append(node)
+
     hasher = hashlib.sha256()
-    for arg in (*args, gs.__version__.encode()):
+    for arg in (*values[0], gs.__version__.encode()):
         if isinstance(arg, Path):
             file_stats = arg.stat()
             arg = (str(arg).encode(), file_stats.st_size, file_stats.st_mtime)
@@ -351,10 +374,11 @@ def compute_sdf_data(mesh, res):
 def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
     texture = surface.get_rgba()
 
-    # 'trimesh' uses uvs starting from the top-left corner, so flip them to Genesis' convention.
+    # 'trimesh' uses uvs starting from the top-left corner, so flip them to Genesis' convention. The flip runs at the
+    # precision a mesh stores its uvs at, so a mesh drawn from uvs read back from a file matches the one it was built as.
     flipped_uvs = None
     if uvs is not None:
-        flipped_uvs = uvs.copy()
+        flipped_uvs = uvs.astype(gs.np_float)
         flipped_uvs[:, 1] = 1.0 - flipped_uvs[:, 1]
 
     # Composite emissive additively on top of the base color, but only when the base color is the packed albedo
@@ -909,12 +933,14 @@ def apply_transform(transform, positions, normals=None):
 
     transformed_normals = normals
     if normals is not None:
-        rot_mat = transform[:3, :3]
-        if np.abs(3.0 - np.trace(rot_mat)) > gs.EPS**2:  # has rotation or scaling
-            transformed_normals = normals @ rot_mat
-            scale = np.linalg.norm(rot_mat, axis=1, keepdims=True)
-            if np.any(np.abs(scale - 1.0) > gs.EPS):  # has scale
-                transformed_normals /= np.linalg.norm(transformed_normals, axis=1, keepdims=True)
+        lin_mat = transform[:3, :3]
+        if not np.allclose(lin_mat, np.identity(3), atol=gs.EPS):  # has rotation or scaling
+            # A normal is a covector, so it maps through the cofactor matrix of the linear part, whose rows are the
+            # cross products of the other two rows. That matrix sends the cross product of two edges to the cross
+            # product of the transformed edges, keeping a normal perpendicular to its own triangle under any scaling.
+            cofactor_mat = np.cross(np.roll(lin_mat, -1, axis=0), np.roll(lin_mat, -2, axis=0))
+            transformed_normals = normals @ cofactor_mat
+            transformed_normals /= np.linalg.norm(transformed_normals, axis=1, keepdims=True)
 
     return transformed_positions, transformed_normals
 

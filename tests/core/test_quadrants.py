@@ -115,14 +115,9 @@ def gs_static_child(args: list[str]):
     scene.rigid_solver.collider.detection()
     actual_contacts = scene.rigid_solver.collider.collider_state.n_contacts.to_numpy()
     assert actual_contacts == args.expected_num_contacts
-    if scene.rigid_solver.collider.collider_config.has_non_box_plane_convex_convex:
-        from genesis.engine.solvers.rigid.collider import _func_narrowphase_contact0
+    from genesis.engine.solvers.rigid.collider.collider import kernel_detection
 
-        kernel_to_check = _func_narrowphase_contact0
-    else:
-        from genesis.engine.solvers.rigid.collider import func_narrow_phase_convex_specializations
-
-        kernel_to_check = func_narrow_phase_convex_specializations
+    kernel_to_check = kernel_detection
 
     assert kernel_to_check._primal.src_ll_cache_observations.cache_key_generated == args.expected_use_src_ll_cache
     assert kernel_to_check._primal.src_ll_cache_observations.cache_validated == args.expected_src_ll_cache_hit
@@ -131,11 +126,20 @@ def gs_static_child(args: list[str]):
     sys.exit(RET_SUCCESS)
 
 
-@pytest.mark.required
 @pytest.mark.parametrize("backend", [None])  # Disable genesis initialization at worker level
-@pytest.mark.parametrize("test_backend", ["cpu", "gpu"])
-@pytest.mark.parametrize("use_ndarray", [False, True])
-@pytest.mark.parametrize("enable_multicontact, expected_num_contacts", [(False, 1), (True, 4)])
+@pytest.mark.parametrize(
+    "enable_multicontact, expected_num_contacts, use_ndarray, test_backend",
+    [
+        pytest.param(False, 1, False, "cpu", marks=pytest.mark.required),
+        pytest.param(True, 4, False, "cpu", marks=pytest.mark.required),
+        (False, 1, True, "cpu"),
+        pytest.param(True, 4, True, "cpu", marks=pytest.mark.required),
+        pytest.param(False, 1, False, "gpu", marks=pytest.mark.required),
+        pytest.param(True, 4, False, "gpu", marks=pytest.mark.required),
+        pytest.param(False, 1, True, "gpu", marks=pytest.mark.required),
+        pytest.param(True, 4, True, "gpu", marks=pytest.mark.required),
+    ],
+)
 def test_static(
     enable_multicontact: bool,
     expected_num_contacts: int,
@@ -200,16 +204,24 @@ def gs_num_envs_child(args: list[str]):
             pos=(0.0, 0.0, 0.18),
         )
     )
+    scene.add_entity(
+        gs.morphs.Sphere(
+            radius=0.05,
+            pos=(0.0, 0.3, 0.04),
+        )
+    )
     scene.build(n_envs=args.n_envs, env_spacing=(0.5, 0.5))
 
     scene.rigid_solver.collider.detection()
     qd.sync()
 
-    from genesis.engine.solvers.rigid.rigid_solver import kernel_step_1
+    from genesis.engine.solvers.rigid.rigid_solver import kernel_substep_dynamics
 
-    assert kernel_step_1._primal.fe_ll_cache_observations.cache_hit == args.expected_fe_ll_cache_hit
-    assert kernel_step_1._primal.src_ll_cache_observations.cache_key_generated == args.expected_use_src_ll_cache
-    assert kernel_step_1._primal.src_ll_cache_observations.cache_loaded == args.expected_src_ll_cache_hit
+    assert kernel_substep_dynamics._primal.fe_ll_cache_observations.cache_hit == args.expected_fe_ll_cache_hit
+    assert (
+        kernel_substep_dynamics._primal.src_ll_cache_observations.cache_key_generated == args.expected_use_src_ll_cache
+    )
+    assert kernel_substep_dynamics._primal.src_ll_cache_observations.cache_loaded == args.expected_src_ll_cache_hit
 
     sys.exit(RET_SUCCESS)
 
@@ -307,10 +319,10 @@ def change_scene(args: list[str]):
     z = qpos.reshape((*qpos.shape[:-1], args.n_objs, 7))[..., 2]
     assert_allclose(z, 0.2, atol=1e-3)
 
-    from genesis.engine.solvers.rigid.rigid_solver import kernel_step_1
+    from genesis.engine.solvers.rigid.rigid_solver import kernel_substep_dynamics
 
-    assert kernel_step_1._primal.src_ll_cache_observations.cache_validated == args.expected_src_ll_cache_hit
-    assert kernel_step_1._primal.src_ll_cache_observations.cache_loaded == args.expected_src_ll_cache_hit
+    assert kernel_substep_dynamics._primal.src_ll_cache_observations.cache_validated == args.expected_src_ll_cache_hit
+    assert kernel_substep_dynamics._primal.src_ll_cache_observations.cache_loaded == args.expected_src_ll_cache_hit
 
     sys.exit(RET_SUCCESS)
 

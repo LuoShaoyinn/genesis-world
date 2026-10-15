@@ -535,8 +535,8 @@ def test_parsing_inertia_defaults(
         assert_allclose(entity_chain.get_dofs_velocity(), entity_chain_ref.get_dofs_velocity(), tol=max(tol, 5e-7))
         assert_allclose(entity_chain.get_quat(), entity_chain_ref.get_quat(), tol=max(tol, 5e-7))
         assert_allclose(
-            entity_chain.get_pos() - torch.tensor(entity_chain.morph.pos),
-            entity_chain_ref.get_pos() - torch.tensor(entity_chain_ref.morph.pos),
+            entity_chain.get_pos() - torch.tensor(entity_chain.morph.pos, device=gs.device),
+            entity_chain_ref.get_pos() - torch.tensor(entity_chain_ref.morph.pos, device=gs.device),
             tol=max(tol, 5e-7),
         )
 
@@ -754,18 +754,8 @@ def test_default_armature(xml_path, trees_and_slider_mjcf, tol):
     )
     # One variant per environment, each weighing differently and asking its own default.
     morphs_heterogeneous = [
-        morph_class(
-            file=xml_path,
-            pos=(2.0, 0.0, 0.0),
-            scale=1.0,
-            default_armature=DEFAULT_ARMATURE,
-        ),
-        morph_class(
-            file=xml_path,
-            pos=(2.0, 0.0, 0.0),
-            scale=2.0,
-            default_armature=None,
-        ),
+        morph_class(file=xml_path, pos=(2.0, 0.0, 0.0), scale=1.0, default_armature=DEFAULT_ARMATURE),
+        morph_class(file=xml_path, pos=(2.0, 0.0, 0.0), scale=2.0, default_armature=None),
     ]
 
     # An attached pair is one kinematic tree spanning two entities, only the mounted one asking a default, beside the
@@ -821,6 +811,7 @@ def test_default_armature(xml_path, trees_and_slider_mjcf, tol):
     armature_heterogeneous = robot_heterogeneous.get_dofs_armature()
     assert_allclose(armature_heterogeneous[0, 6], DEFAULT_ARMATURE, tol=gs.EPS)
     assert_allclose(armature_heterogeneous[1, 6], 0.0, tol=gs.EPS)
+    assert_allclose(robot_heterogeneous.get_mass()[1], 8.0 * robot_heterogeneous.get_mass()[0], tol=tol)
 
     # Rotor inertia lowers the inverse weight of its own joint and, through the inverse mass matrix of the tree, of every
     # joint coupled to it, attached entities included: a weight parsed before the default was applied would miss it.
@@ -958,21 +949,11 @@ def test_color_overwrite(overwrite, urdf_with_external_assets, show_viewer):
         assert_equal(color, (255, 0, 0, 255) if overwrite else (51, 51, 51, 255))
 
     for vgeom in humanoid.vgeoms:
-        # FIXME: The original material is lost because the visuals are collision geometries that has been duplicated as
-        # visual to circumvent the lack of dedicated visuals.
-        is_true_visual = vgeom.vmesh.metadata["name"] == "nose"
-        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite or not is_true_visual
+        assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite
         visual = vgeom.vmesh.trimesh.visual
         assert visual.defined
         color = np.unique(visual.vertex_colors, axis=0)
-        if is_true_visual:
-            if overwrite:
-                assert_equal(color, (255, 0, 0, 255))
-            else:
-                with pytest.raises(AssertionError):
-                    assert_equal(color, (128, 128, 128, 255))
-        else:
-            assert_equal(color, (255, 0, 0, 255) if overwrite else (128, 128, 128, 255))
+        assert_equal(color, (255, 0, 0, 255) if overwrite else (204, 153, 102, 255))
 
     for vgeom in axis.vgeoms:
         assert vgeom.vmesh.metadata["is_visual_overwritten"] == overwrite

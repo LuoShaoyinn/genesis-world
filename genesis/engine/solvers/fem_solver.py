@@ -1065,10 +1065,11 @@ class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
     def save_ckpt(self, ckpt_name):
         if self.is_active:
             if ckpt_name not in self._ckpt:
-                self._ckpt[ckpt_name] = dict()
-                self._ckpt[ckpt_name]["pos"] = torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float)
-                self._ckpt[ckpt_name]["vel"] = torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float)
-                self._ckpt[ckpt_name]["active"] = torch.zeros((self._B, self.n_elements), dtype=gs.tc_int)
+                self._ckpt[ckpt_name] = {
+                    "pos": torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float, device=gs.device),
+                    "vel": torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float, device=gs.device),
+                    "active": torch.zeros((self._B, self.n_elements), dtype=gs.tc_int, device=gs.device),
+                }
 
             self._kernel_get_state(
                 0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"], self._ckpt[ckpt_name]["active"]

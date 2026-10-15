@@ -1,3 +1,4 @@
+import builtins
 import sys
 from functools import wraps
 
@@ -7,34 +8,51 @@ import genesis as gs
 
 from .tensor import Tensor
 
-_torch_ops = (
+# Ops given the requested dtype and 'device=gs.device', so that they allocate there directly and random ones draw from
+# its generator at that precision. The other ops follow the device of their input.
+_torch_factory_ops = (
     torch.tensor,
     torch.asarray,
     torch.as_tensor,
-    torch.as_strided,
-    torch.from_numpy,
     torch.zeros,
-    torch.zeros_like,
     torch.ones,
-    torch.ones_like,
     torch.arange,
     torch.range,
     torch.linspace,
     torch.logspace,
     torch.eye,
     torch.empty,
-    torch.empty_like,
     torch.empty_strided,
     torch.full,
-    torch.full_like,
     torch.rand,
-    torch.rand_like,
     torch.randn,
-    torch.randn_like,
     torch.randint,
-    torch.randint_like,
     torch.randperm,
 )
+_torch_ops = (
+    *_torch_factory_ops,
+    torch.as_strided,
+    torch.from_numpy,
+    torch.zeros_like,
+    torch.ones_like,
+    torch.empty_like,
+    torch.full_like,
+    torch.rand_like,
+    torch.randn_like,
+    torch.randint_like,
+)
+
+
+def _to_gs_dtype(dtype):
+    """Map a Python or torch scalar type to the torch dtype that Genesis uses for this kind of scalar."""
+    match dtype:
+        case builtins.float | torch.float32 | torch.float64:
+            return gs.tc_float
+        case builtins.int | torch.int32 | torch.int64:
+            return gs.tc_int
+        case builtins.bool | torch.bool:
+            return torch.bool
+    gs.raise_exception(f"Unsupported dtype: {dtype}")
 
 
 def torch_op_wrapper(torch_op):
@@ -46,10 +64,16 @@ def torch_op_wrapper(torch_op):
         if not gs._initialized:
             gs.raise_exception("Genesis not initialized yet.")
 
+        # Allocating at the requested scalar type before conversion would fail for float64 on devices lacking it (MPS)
+        if dtype is not None:
+            dtype = _to_gs_dtype(dtype)
+
         if torch_op is torch.from_numpy:
             torch_tensor = torch_op(*args)
         elif torch_op is torch.tensor:
-            torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad)
+            torch_tensor = torch_op(*args, dtype=dtype, requires_grad=requires_grad, device=gs.device)
+        elif torch_op in _torch_factory_ops:
+            torch_tensor = torch_op(*args, dtype=dtype, device=gs.device, **kwargs)
         else:
             torch_tensor = torch_op(*args, **kwargs)
 
@@ -66,16 +90,7 @@ def from_torch(torch_tensor, dtype=None, requires_grad=False, detach=True, scene
     """
     By default, detach is True, meaning that this function returns a new leaf tensor which is not connected to torch_tensor's computation gragh.
     """
-    if dtype is None:
-        dtype = torch_tensor.dtype
-    if dtype in (float, torch.float32, torch.float64):
-        dtype = gs.tc_float
-    elif dtype in (int, torch.int32, torch.int64):
-        dtype = gs.tc_int
-    elif dtype in (bool, torch.bool):
-        dtype = torch.bool
-    else:
-        gs.raise_exception(f"Unsupported dtype: {dtype}")
+    dtype = _to_gs_dtype(torch_tensor.dtype if dtype is None else dtype)
 
     if torch_tensor.requires_grad and (not detach) and (not requires_grad):
         gs.logger.warning(

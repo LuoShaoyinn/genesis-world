@@ -45,7 +45,7 @@ class Emitter(RBC):
         self._sim = entity.sim
         self._solver = entity.solver
         self._next_particle = 0
-        gs.logger.info(f"~<{self._repr_briefer()}>~ created using ~<{entity._repr_briefer()}.")
+        gs.logger.info(f"~<{self._repr_briefer()}>~ created using ~<{entity._repr_briefer()}>~.")
 
     def reset(self):
         """

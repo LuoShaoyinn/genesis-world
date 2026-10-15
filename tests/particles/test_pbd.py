@@ -125,7 +125,7 @@ def test_cloth_attach_fixed_point(n_envs, material_type, show_viewer, tol):
         cloth.process_input()
         poss = cloth.get_particles_pos().clone()
         assert_allclose(poss.mean(dim=-2), init_com, tol=1e-2)
-        poss += torch.tensor([0.5, -1.0, -0.5])
+        poss += torch.tensor([0.5, -1.0, -0.5], device=gs.device)
         vels = torch.rand_like(poss)
         cloth.set_position(poss)
         cloth.set_velocity(vels)

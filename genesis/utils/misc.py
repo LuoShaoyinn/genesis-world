@@ -16,13 +16,14 @@ from importlib import import_module
 from itertools import combinations
 from typing import Any, NoReturn, Optional, Sequence
 
-import cpuinfo
-import quadrants as qd
 import numpy as np
-import psutil
-import pyglet
 import torch
 
+import cpuinfo
+import psutil
+import pyglet
+
+import quadrants as qd
 
 import genesis as gs
 from genesis.typing import is_sequence
@@ -210,30 +211,114 @@ def get_device(backend: gs.constants.backend, device_idx: Optional[int] = None):
     return device, device_name, total_mem, backend
 
 
+def get_gpu_cores_per_unit() -> int:
+    """Return the number of compute cores per compute unit of the active GPU, -1 on the CPU backend.
+
+    NVIDIA packs 128 CUDA cores per streaming multiprocessor (SM) and AMD/ROCm 64 stream processors per compute unit
+    (CU); Apple Silicon 128 ALUs per GPU core. Other GPU backends (e.g. Vulkan) take the AMD MI350X as a baseline.
+    """
+    if gs.backend == gs.cpu:
+        return -1
+    # FIXME: quadrants should expose a query of the GPU core count and layout for every backend.
+    if torch.cuda.is_available():
+        return 64 if torch.version.hip else 128
+    if gs.backend == gs.metal:
+        return 128
+    return 64
+
+
 def get_gpu_core_count() -> int:
     """Return the number of GPU compute cores for the active device.
 
-    This is the env count above which one-thread-per-env already saturates the GPU, so cooperative or tiled kernels
-    stop being worthwhile. NVIDIA reports 128 CUDA cores per SM and AMD/ROCm 64 stream processors per CU; for backends
-    where the driver cannot be queried (Metal, or a GPU without a torch.cuda device) an upper-bound estimate is used.
+    This is the env count above which one-thread-per-env already saturates the GPU, so cooperative or tiled kernels stop
+    being worthwhile. Where the driver cannot be queried (Metal, or a GPU without a torch.cuda device) an upper-bound
+    estimate of the compute unit count is used: 40 GPU cores on Apple Silicon, the 256 CUs of an AMD MI350X for other
+    GPU backends (e.g. Vulkan). The CPU backend gets -1, so no GPU shares its compiled kernels.
     """
+    if gs.backend == gs.cpu:
+        return -1
+    cores_per_unit = get_gpu_cores_per_unit()
     if torch.cuda.is_available():
-        gpu_props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        cores_per_unit = 64 if torch.version.hip else 128
-        return gpu_props.multi_processor_count * cores_per_unit
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * cores_per_unit
     if gs.backend == gs.metal:
-        # Upper-bound estimate for Apple Silicon: 40 GPU cores * 128 ALUs.
-        return 5120
-    # Fallback for other GPU backends (e.g. Vulkan), using AMD MI350X (256 CUs * 64 cores) as a baseline.
-    return 16384
+        return 40 * cores_per_unit
+    # AMD MI350X: 256 compute units (https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html). For
+    # comparison, an RTX 6000 Blackwell has 188 SMs and an RTX 5090 170, of 128 cores each.
+    return 256 * cores_per_unit
 
 
-def fits_in_gpu_shared_memory(*dims: int) -> bool:
-    """Whether a dense ``gs.qd_float`` array of shape ``dims`` fits in one block's GPU shared memory."""
+def get_gpu_shared_tile_sizes(max_n_sizes: int) -> tuple[int, ...]:
+    """Return the ascending sizes s worth compiling for a shared tile of s x (s + 1) ``gs.qd_float`` on the active GPU.
+
+    The shared memory of a block only bounds how many blocks a compute unit runs at once. Each candidate is the largest
+    multiple of 8 (keeping the padded row stride odd) that runs a given count of resident one-warp blocks, as bounded by
+    the shared memory of a compute unit and of a block, the driver reservation per block and the warp slots.
+
+    At most max_n_sizes candidates are kept, so that the static values of a kernel stay a small fixed set: those
+    minimizing the mean drop in resident blocks that rounding a row count n up to the next kept size causes against its
+    tightest candidate, weighted by 1 / n so that every doubling of the size counts the same.
+
+    Where the compute unit cannot be queried (Metal, Vulkan), it is taken to hold the shared memory of one block, which
+    then bounds the resident blocks alone. A row count above the largest size has no shared tile.
+    """
     if gs.backend == gs.cpu:
         gs.raise_exception("CPU backend not supported by this method.")
     itemsize = 4 if gs.qd_float == qd.f32 else 8
-    return math.prod(dims) * itemsize <= qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
+    block_bytes = qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
+    unit_bytes, reserved_bytes, max_blocks = block_bytes, 0, block_bytes // (8 * 9 * itemsize)
+    if torch.cuda.is_available():
+        # CUDA and ROCm alike: a block of these tiles is one warp (wavefront), so the warp slots bound the resident
+        # blocks, and the driver reserves the shared memory of a compute unit beyond what one block may opt in to.
+        device_property = torch.cuda.get_device_properties(torch.cuda.current_device())
+        unit_bytes = device_property.shared_memory_per_multiprocessor
+        max_blocks = device_property.max_threads_per_multi_processor // device_property.warp_size
+        if not torch.version.hip:
+            reserved_bytes = max(unit_bytes - device_property.shared_memory_per_block_optin, 0)
+            # FIXME: torch exposes no cap on the resident blocks of a streaming multiprocessor, which NVIDIA sets per
+            # compute capability below the warp slots (see the CUDA C++ programming guide).
+            compute_capability = (device_property.major, device_property.minor)
+            if compute_capability in ((7, 5), (8, 6), (8, 7), (10, 7)):
+                max_blocks = min(max_blocks, 16)
+            elif compute_capability in ((8, 9), (11, 0)) or device_property.major == 12:
+                max_blocks = min(max_blocks, 24)
+            else:
+                max_blocks = min(max_blocks, 32)
+
+    # The largest count of resident blocks of each candidate size
+    resident_blocks: dict[int, int] = {}
+    for n_blocks in range(1, max_blocks + 1):
+        n_bytes = min(unit_bytes // n_blocks - reserved_bytes, block_bytes)
+        tile_size = int((math.sqrt(1.0 + 4.0 * n_bytes / itemsize) - 1.0) / 2.0) // 8 * 8
+        if tile_size >= 8:
+            resident_blocks[tile_size] = max(resident_blocks.get(tile_size, 0), n_blocks)
+    tile_sizes = sorted(resident_blocks)
+
+    # Selection ending on the largest size, by dynamic programming over the candidates: the row counts a kept size
+    # takes over from the kept size below it add their weighted drops, a row count dropping by its tightest candidate.
+    n_sizes = len(tile_sizes)
+    size_drops = []
+    for j in range(n_sizes):
+        size_drops.append([0.0] * (n_sizes + 1))
+        for i in range(-1, j):
+            row_start = tile_sizes[i] + 1 if i >= 0 else 1
+            drop = 0.0
+            for i_c in range(i + 1, j + 1):
+                rows = range(max(row_start, tile_sizes[i_c - 1] + 1 if i_c > 0 else 1), tile_sizes[i_c] + 1)
+                drop += sum(1.0 / n for n in rows) * resident_blocks[tile_sizes[i_c]] / resident_blocks[tile_sizes[j]]
+            size_drops[j][i + 1] = drop
+    total_drops = [size_drops[j][0] for j in range(n_sizes)]
+    kept_sizes_idx = [[j] for j in range(n_sizes)]
+    for _ in range(min(max_n_sizes, n_sizes) - 1):
+        total_drops_next = list(total_drops)
+        kept_sizes_idx_next = [list(kept) for kept in kept_sizes_idx]
+        for j in range(n_sizes):
+            for i in range(j):
+                drop = total_drops[i] + size_drops[j][i + 1]
+                if drop < total_drops_next[j]:
+                    total_drops_next[j] = drop
+                    kept_sizes_idx_next[j] = kept_sizes_idx[i] + [j]
+        total_drops, kept_sizes_idx = total_drops_next, kept_sizes_idx_next
+    return tuple(tile_sizes[j] for j in kept_sizes_idx[-1])
 
 
 def get_entry_point_name():
@@ -413,7 +498,11 @@ def to_gs_tensor(x, dtype: torch.dtype | None = None):
     elif isinstance(x, torch.Tensor):
         tensor = gs.Tensor(x)
     else:
-        tensor = gs.from_numpy(np.asarray(x))
+        x = np.asarray(x)
+        # See broadcast_tensor for arrays with negative strides
+        if any(stride < 0 for stride in x.strides):
+            x = x.copy()
+        tensor = gs.from_numpy(x)
     return tensor.to(dtype=dtype, device=gs.device)
 
 
@@ -427,16 +516,28 @@ def tensor_to_array(x: torch.Tensor, dtype: type[np.generic] | None = None) -> n
     return np.asarray(tensor_to_cpu(x), dtype=dtype)
 
 
-def data_to_array(data):
-    """Recursively move any GPU tensor nested in ``data`` to a CPU numpy array, preserving container structure."""
+def data_to_array(data, *, to_torch: bool = False, copy: bool | None = None):
+    """Recursively move every tensor and Quadrants array nested in a container to a CPU numpy array, keeping its layout.
+
+    With 'to_torch', each one becomes a torch tensor where it lives instead. With 'copy', the result shares no memory
+    with the tensor or Quadrants array it comes from. A numpy array is returned as it is. A named tuple, such as the
+    reading of a sensor with several outputs, becomes a dict mapping its field names to their values, which is the form
+    recorders label their data by.
+    """
     if isinstance(data, torch.Tensor):
-        return tensor_to_array(data)
+        if copy:
+            data = data.clone()
+        return data if to_torch else tensor_to_array(data)
+    if isinstance(data, (qd.Tensor, qd.Field, qd.Ndarray)):
+        return qd_to_torch(data, copy=copy) if to_torch else qd_to_numpy(data, copy=copy)
     if isinstance(data, np.ndarray):
         return data
+    if isinstance(data, tuple) and (data_asdict := getattr(data, "_asdict", None)) is not None:
+        return {k: data_to_array(v, to_torch=to_torch, copy=copy) for k, v in data_asdict().items()}
     if isinstance(data, Mapping):
-        return {k: data_to_array(v) for k, v in data.items()}
+        return {k: data_to_array(v, to_torch=to_torch, copy=copy) for k, v in data.items()}
     if is_sequence(data):
-        return type(data)(data_to_array(v) for v in data)
+        return type(data)(data_to_array(v, to_torch=to_torch, copy=copy) for v in data)
     return data
 
 
@@ -774,7 +875,7 @@ def qd_to_torch(
         # advanced masking, which would spare computation later on if expected from the user.
         if copy is False:
             gs.raise_exception("Specifying 'copy=False' is not supported by this method if 'gs.use_zerocopy=False'.")
-        tensor = _maybe_transpose(value.to_torch(), value, transpose)
+        tensor = _maybe_transpose(value.to_torch(device=gs.device), value, transpose)
         is_copy = True
     else:
         try:
@@ -786,7 +887,7 @@ def qd_to_torch(
             except (ValueError, RuntimeError, TypeError):
                 if copy is False:
                     raise
-                tensor = _maybe_transpose(value.to_torch(), value, transpose)
+                tensor = _maybe_transpose(value.to_torch(device=gs.device), value, transpose)
                 is_copy = True
             else:
                 value._tc = tc
@@ -937,11 +1038,15 @@ def sanitize_index(
             elif index[0] < 0 or index[-1] < 0:
                 index = tuple(index)
                 is_negative_wrap_required = True
-    elif isinstance(index, (list, tuple, torch.Tensor, np.ndarray)):
-        is_bool_mask = (isinstance(index, torch.Tensor) and index.dtype == torch.bool) or (
-            isinstance(index, np.ndarray) and np.issubdtype(index.dtype, np.bool_)
-        )
+    elif isinstance(index, (list, tuple, torch.Tensor)):
+        is_bool_mask = isinstance(index, torch.Tensor) and index.dtype == torch.bool
         is_negative_wrap_required = not is_bool_mask
+    elif isinstance(index, np.ndarray):
+        is_bool_mask = np.issubdtype(index.dtype, np.bool_)
+        is_negative_wrap_required = not is_bool_mask
+        # See broadcast_tensor for arrays with negative strides
+        if any(stride < 0 for stride in index.strides):
+            index = index.copy()
     else:
         gs.raise_exception(f"Expecting integer indices for `{name}`.")
 
@@ -1016,6 +1121,9 @@ def broadcast_tensor(
             )
         return torch.empty(expected_shape, dtype=dtype, device=gs.device)
 
+    # Torch refuses to wrap a numpy array with negative strides, such as a reversed view, so it is copied first
+    if isinstance(tensor, np.ndarray) and any(stride < 0 for stride in tensor.strides):
+        tensor = tensor.copy()
     tensor_ = torch.as_tensor(tensor, dtype=dtype, device=gs.device)
 
     tensor_shape = tensor_.shape
@@ -1136,6 +1244,9 @@ def assign_indexed_tensor(
     dim_names: tuple[str, ...] | list[str] | None = None,
 ) -> None:
     if isinstance(tensor, np.ndarray):
+        # See broadcast_tensor for arrays with negative strides
+        if isinstance(value, np.ndarray) and any(stride < 0 for stride in value.strides):
+            value = value.copy()
         value = torch.as_tensor(value)
     # A single value written over a selection of one axis has faster forms than advanced indexing, which stages an
     # index tensor and a scatter that dominate a write this small: the buffer is filled whole when every axis is taken

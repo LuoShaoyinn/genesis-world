@@ -205,7 +205,8 @@ def test_emissive_composites(base_plus_emissive_glb, show_viewer, renderer):
     "renderer_type",
     [RENDERER_TYPE.RASTERIZER, RENDERER_TYPE.BATCHRENDER_RASTERIZER, RENDERER_TYPE.BATCHRENDER_RAYTRACER],
 )
-@pytest.mark.parametrize("n_envs", [0, 4])
+# Debug mode is forced for the batched scene, whose rendered snapshots are sensitive to fast-math
+@pytest.mark.parametrize("n_envs", [0, pytest.param(4, marks=pytest.mark.debug(True))])
 def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, renderer_type, renderer):
     # Small discrepancies between different hardware due the different physics integration
     png_snapshot.extension._std_err_threshold = 1.2
@@ -1354,6 +1355,9 @@ def test_camera_gimbal_lock_singularity(renderer, show_viewer):
 
         prev_right = right
 
+        # The extrinsics follow the camera: the lookat point lies on the optical axis, at the distance of the camera
+        assert_allclose(cam.extrinsics @ (0.0, 0.0, 0.0, 1.0), (0.0, 0.0, np.linalg.norm(cam.pos), 1.0), tol=1e-6)
+
     # Move camera through singularity along x-axis: x=-1.5 to x=1.5 (singularity at x=0)
     prev_right = None
     for i in range(7):
@@ -1442,14 +1446,15 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     # The rendered environments hold an arm resting against the ground, whose contacts give the contact markers
     # something to draw, and an arm yawed a quarter turn and reaching sideways, so the two render as differently as the
     # arm's reach allows. The others hold resting arms of their own from a converged simulation.
-    franka.set_dofs_position(
-        [
-            [-2.717, -1.763, -2.217, -2.566, 0.226, 2.933, 1.307, 0.017, 0.017],
-            [1.728, -1.763, -2.157, -2.275, -0.327, 2.201, 1.833, 0.018, 0.018],
-            [1.57, 1.0, 0.0, -0.5, 0.0, 1.5, 0.0, 0.04, 0.04],
-            [-2.098, 1.763, -1.004, -2.421, -0.227, 2.850, -0.136, 0.020, 0.020],
-        ]
+    dofs_pos = np.array(
+        (
+            (-2.717, -1.763, -2.217, -2.566, 0.226, 2.933, 1.307, 0.017, 0.017),
+            (1.728, -1.763, -2.157, -2.275, -0.327, 2.201, 1.833, 0.018, 0.018),
+            (1.57, 1.0, 0.0, -0.5, 0.0, 1.5, 0.0, 0.04, 0.04),
+            (-2.098, 1.763, -1.004, -2.421, -0.227, 2.850, -0.136, 0.020, 0.020),
+        )
     )
+    franka.set_dofs_position(dofs_pos)
     scene.step()
 
     # Capture viewer screenshot when the interactive viewer is enabled
@@ -1462,6 +1467,17 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
 
         png_snapshot.extension._std_err_threshold = STD_ERR_THR
         assert rgb_array_to_png_bytes(viewer_rgb) == png_snapshot
+
+        # The interactive viewer shows a setter right away, without stepping
+        franka.set_dofs_position(np.roll(dofs_pos, 1, axis=0))
+        pyrender_viewer.on_draw()
+        viewer_rgb_set = pyrender_viewer._renderer.jit.read_color_buf(*pyrender_viewer._viewport_size, rgba=False)
+        scene.visualizer.update(force=True)
+        pyrender_viewer.on_draw()
+        viewer_rgb_forced = pyrender_viewer._renderer.jit.read_color_buf(*pyrender_viewer._viewport_size, rgba=False)
+        assert_equal(viewer_rgb_set, viewer_rgb_forced)
+        franka.set_dofs_position(dofs_pos)
+        scene.step()
 
     # Render both cameras
     rgb, *_ = cam.render(rgb=True)
@@ -1517,6 +1533,17 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     for env_rgb in (rgb, rgb_debug):
         env_diff = np.abs(env_rgb[0].astype(np.float32) - env_rgb[1].astype(np.float32))
         assert env_diff.mean() > 5.0, "Per-env renders are too similar — env isolation may be broken"
+
+    # The markers drawn for other contacts, then cleared by a reset that brings back the first state, never show again
+    franka.set_dofs_position(dofs_pos[::-1])
+    for _ in range(2):
+        scene.step()
+    cam_debug.render(rgb=True)
+    scene.reset()
+    franka.set_dofs_position(dofs_pos)
+    scene.step()
+    rgb_debug_reset, *_ = cam_debug.render(rgb=True)
+    assert_equal(rgb_debug_reset, rgb_debug)
 
 
 @pytest.mark.required

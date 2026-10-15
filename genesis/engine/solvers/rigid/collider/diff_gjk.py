@@ -7,15 +7,15 @@ from . import gjk as GJK, contact, epa
 
 @qd.func
 def func_gjk_contact(
-    i_ga,
-    i_gb,
-    i_b,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
     ga_pos: qd.types.vector(3),
     ga_quat: qd.types.vector(4),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
-    pos_tol,
-    normal_tol,
+    pos_tol: float,
+    normal_tol: float,
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -343,14 +343,14 @@ def func_gjk_contact(
 
 @qd.func
 def func_extended_epa(
-    i_ga,
-    i_gb,
-    i_b,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
     pos_a: qd.types.vector(3),
     quat_a: qd.types.vector(4),
     pos_b: qd.types.vector(3),
     quat_b: qd.types.vector(4),
-    max_iter,
+    max_iter: int,
     collider_state: array_class.ColliderState,
     gjk_state: array_class.GJKState,
     dyn_info: array_class.DynInfo,
@@ -368,7 +368,7 @@ def func_extended_epa(
     Therefore, we use this function to find such nearly-farthest boundary faces for differentiability.
     """
     tolerance = collider_info.gjk.tolerance[None]
-    nearest_i_f = gs.qd_int(-1)
+    i_f_nearest = gs.qd_int(-1)
 
     discrete = GJK.func_is_discrete_geoms(i_ga, i_gb, dyn_info)
     if discrete:
@@ -382,7 +382,7 @@ def func_extended_epa(
 
         # Find the polytope face with the smallest distance to the origin
         lower2 = collider_info.gjk.FLOAT_MAX_SQ[None]
-        nearest_i_f = -1
+        i_f_nearest = -1
 
         for i in range(gjk_state.polytope.nfaces_map[i_b]):
             i_f = gjk_state.polytope_faces_map[i_b, i]
@@ -392,14 +392,14 @@ def func_extended_epa(
             face_dist2 = gjk_state.polytope_faces.dist2[i_b, i_f]
             if face_dist2 < lower2:
                 lower2 = face_dist2
-                nearest_i_f = i_f
+                i_f_nearest = i_f
 
-        if nearest_i_f == -1:
+        if i_f_nearest == -1:
             break
 
         # Find a new support point w from the nearest face's normal
         lower = qd.sqrt(lower2)
-        dir = gjk_state.polytope_faces.normal[i_b, nearest_i_f]
+        dir = gjk_state.polytope_faces.normal[i_b, i_f_nearest]
         wi = epa.func_epa_support(
             i_ga,
             i_gb,
@@ -440,22 +440,24 @@ def func_extended_epa(
                     repeated = True
                     break
             if repeated:
-                nearest_i_f = -1
+                i_f_nearest = -1
                 break
 
         gjk_state.polytope.horizon_w[i_b] = w
 
         # Compute horizon
-        horizon_flag = epa.func_epa_horizon(i_b, nearest_i_f, gjk_state, collider_info)
+        horizon_flag = epa.func_epa_horizon(
+            i_b, i_f_nearest, wi, gjk_state, collider_info, rounding_eps=rigid_info.EPS[None]
+        )
 
         if horizon_flag:
             # There was an error in the horizon construction, so the horizon edge is not a closed loop.
-            nearest_i_f = -1
+            i_f_nearest = -1
             break
 
         if gjk_state.polytope.horizon_nedges[i_b] < 3:
             # Should not happen, because at least three edges should be in the horizon from one deleted face.
-            nearest_i_f = -1
+            i_f_nearest = -1
             break
 
         # Check if the memory space is enough for attaching new faces
@@ -463,7 +465,7 @@ def func_extended_epa(
         nedges = gjk_state.polytope.horizon_nedges[i_b]
         if nfaces + nedges >= collider_info.gjk.polytope_max_faces[None]:
             # If the polytope is full, we cannot insert new faces
-            nearest_i_f = -1
+            i_f_nearest = -1
             break
 
         # Attach the new faces
@@ -511,27 +513,27 @@ def func_extended_epa(
             gjk_state.polytope.nfaces_map[i_b] += 1
 
         if attach_flag != GJK.RETURN_CODE.SUCCESS:
-            nearest_i_f = -1
+            i_f_nearest = -1
             break
 
         # Clear the horizon data for the next iteration
         gjk_state.polytope.horizon_nedges[i_b] = 0
 
-        if (gjk_state.polytope.nfaces_map[i_b] == 0) or (nearest_i_f == -1):
+        if (gjk_state.polytope.nfaces_map[i_b] == 0) or (i_f_nearest == -1):
             # No face candidate left
-            nearest_i_f = -1
+            i_f_nearest = -1
             break
 
     if converged:
         # Remove the last vertex from the polytope, because it was added because of this boundary face
         gjk_state.polytope.nverts[i_b] -= 1
     else:
-        nearest_i_f = -1
+        i_f_nearest = -1
 
-    if nearest_i_f != -1:
+    if i_f_nearest != -1:
         # Nearest face found
-        dist2 = gjk_state.polytope_faces.dist2[i_b, nearest_i_f]
-        flag = epa.func_safe_epa_witness(i_ga, i_gb, i_b, nearest_i_f, gjk_state, collider_info)
+        dist2 = gjk_state.polytope_faces.dist2[i_b, i_f_nearest]
+        flag = epa.func_safe_epa_witness(i_ga, i_gb, i_b, i_f_nearest, gjk_state, collider_info)
         if flag == GJK.RETURN_CODE.SUCCESS:
             gjk_state.n_witness[i_b] = 1
             gjk_state.distance[i_b] = -qd.sqrt(dist2)
@@ -539,21 +541,21 @@ def func_extended_epa(
             # Failed to compute witness points, so the objects are not colliding
             gjk_state.n_witness[i_b] = 0
             gjk_state.distance[i_b] = 0.0
-            nearest_i_f = -1
+            i_f_nearest = -1
     else:
         # No face found, so the objects are not colliding
         gjk_state.n_witness[i_b] = 0
         gjk_state.distance[i_b] = 0.0
 
-    return nearest_i_f, k
+    return i_f_nearest, k
 
 
 @qd.func
 def func_add_diff_contact_input(
-    i_ga,
-    i_gb,
-    i_b,
-    i_f,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_f: int,
     pos_a: qd.types.vector(3),
     quat_a: qd.types.vector(4),
     pos_b: qd.types.vector(3),
@@ -631,13 +633,13 @@ def func_add_diff_contact_input(
         quat_a,
         pos_b,
         quat_b,
+        collider_state,
+        gjk_state,
+        dyn_info,
+        collider_info,
+        rigid_config,
+        collider_static_config,
         shrink_sphere=False,
-        collider_state=collider_state,
-        gjk_state=gjk_state,
-        dyn_info=dyn_info,
-        collider_info=collider_info,
-        rigid_config=rigid_config,
-        collider_static_config=collider_static_config,
     )
 
     gjk_state.diff_contact_input.local_pos1_a[i_b, n] = gjk_state.polytope_verts.local_obj1[i_b, i_v1]
@@ -654,9 +656,9 @@ def func_add_diff_contact_input(
 
 @qd.func
 def func_contact_orthogonals(
-    i_ga,
-    i_gb,
-    i_b,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
     normal: qd.types.vector(3),
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
@@ -717,11 +719,11 @@ def func_compute_minkowski_point(
 # --------------------------------------------------------------------------------------------
 @qd.func
 def func_differentiable_contact(
-    i_ga,
-    i_gb,
-    i_b,
-    i_c,
-    ref_penetration,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_c: int,
+    ref_penetration: float,
     dyn_state: array_class.DynState,
     diff_contact_input: array_class.DiffContactInput,
     collider_info: array_class.ColliderInfo,
@@ -831,9 +833,9 @@ def func_differentiable_contact(
 
 @qd.func
 def func_plane_contact_frame(
-    i_b,
-    i_ga,
-    i_gb,
+    i_b: int,
+    i_ga: int,
+    i_gb: int,
     dyn_state: array_class.DynState,
     dyn_info: array_class.DynInfo,
 ):
@@ -855,7 +857,12 @@ def func_plane_contact_frame(
 
 @qd.func
 def func_differentiable_sphere_contact(
-    i_ga, i_gb, i_b, dyn_state: array_class.DynState, dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
 ):
     """Differentiable sphere-sphere contact reconstruction.
 
@@ -889,10 +896,10 @@ def func_differentiable_sphere_contact(
 
 @qd.func
 def func_differentiable_plane_contact(
-    i_ga,
-    i_gb,
-    i_b,
-    i_c,
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_c: int,
     dyn_state: array_class.DynState,
     diff_contact_input: array_class.DiffContactInput,
     dyn_info: array_class.DynInfo,
@@ -907,7 +914,7 @@ def func_differentiable_plane_contact(
 
     [i_ga] is the plane geom and [i_gb] the convex geom. [core_local] (box vertex / sphere center / capsule nearest
     endpoint, in the convex geom's local frame) is the pose-independent witness stored by
-    kernel_fill_diff_contact_input_analytic; [radius] and the plane direction come from the geoms info. Gradients flow to
+    func_fill_diff_contact_input_analytic; [radius] and the plane direction come from the geoms info. Gradients flow to
     both geom poses through the geoms state pos / quat. For a sphere, [core_local] is the local origin, so the
     orientation gradient is zero, matching the rotation-invariant forward contact.
     """
@@ -928,7 +935,7 @@ def func_differentiable_plane_contact(
 
 
 @qd.func
-def func_plane_normal(v1, v2, v3):
+def func_plane_normal(v1: qd.types.vector(3), v2: qd.types.vector(3), v3: qd.types.vector(3)):
     """
     Compute the normal of the plane defined by three points. The length of the normal corresponds to the two times the
     area of the triangle.
@@ -940,7 +947,9 @@ def func_plane_normal(v1, v2, v3):
 
 
 @qd.func
-def func_project_origin_to_plane(v1, v2, v3, normal):
+def func_project_origin_to_plane(
+    v1: qd.types.vector(3), v2: qd.types.vector(3), v3: qd.types.vector(3), normal: qd.types.vector(3)
+):
     """
     Project the origin onto the plane defined by a point on the plane and its normal.
 
@@ -955,7 +964,13 @@ def func_project_origin_to_plane(v1, v2, v3, normal):
 
 
 @qd.func
-def func_triangle_affine_coords(v1, v2, v3, normal, point):
+def func_triangle_affine_coords(
+    v1: qd.types.vector(3),
+    v2: qd.types.vector(3),
+    v3: qd.types.vector(3),
+    normal: qd.types.vector(3),
+    point: qd.types.vector(3),
+):
     """
     Compute the affine coordinates of the point with respect to the triangle.
 

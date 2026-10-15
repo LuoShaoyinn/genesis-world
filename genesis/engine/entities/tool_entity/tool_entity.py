@@ -128,10 +128,10 @@ class ToolEntity(Entity):
         if self._sim.requires_grad:
             if ckpt_name not in self._ckpt:
                 self._ckpt[ckpt_name] = {
-                    "pos": torch.zeros((self._sim._B, 3), dtype=gs.tc_float),
-                    "quat": torch.zeros((self._sim._B, 4), dtype=gs.tc_float),
-                    "vel": torch.zeros((self._sim._B, 3), dtype=gs.tc_float),
-                    "ang": torch.zeros((self._sim._B, 3), dtype=gs.tc_float),
+                    "pos": torch.zeros((self._sim._B, 3), dtype=gs.tc_float, device=gs.device),
+                    "quat": torch.zeros((self._sim._B, 4), dtype=gs.tc_float, device=gs.device),
+                    "vel": torch.zeros((self._sim._B, 3), dtype=gs.tc_float, device=gs.device),
+                    "ang": torch.zeros((self._sim._B, 3), dtype=gs.tc_float, device=gs.device),
                     "_tgt_buffer": dict(),
                 }
 

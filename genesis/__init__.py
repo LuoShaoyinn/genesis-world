@@ -1,13 +1,13 @@
+import atexit
 import io
+import logging as _logging
 import os
 import sys
-import atexit
-import logging as _logging
 import traceback
 import weakref
+from contextlib import redirect_stdout
 from typing import Callable
 from warnings import warn
-from contextlib import redirect_stdout
 
 # Import quadrants while collecting its output without printing directly
 _qd_outputs = io.StringIO()
@@ -27,8 +27,8 @@ import numpy as np
 
 from .constants import backend as _gs_backend
 from .logging import Logger
+from .utils import get_device, redirect_libc_stderr, set_random_seed
 from .version import __version__
-from .utils import redirect_libc_stderr, set_random_seed, get_device
 
 
 _IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
@@ -43,7 +43,6 @@ if _IS_OLD_TORCH:
 _initialized: bool = False
 _scene_registry: list[weakref.ReferenceType["Scene"]] = []
 _module_registry: set[tuple[Callable[[], None], Callable[[], None]]] = set()
-_theme: str | None = None
 logger: Logger | None = None
 device: torch.device | None = None
 backend: _gs_backend | None = None
@@ -66,7 +65,7 @@ def init(
     theme="dark",
     logger_verbose_time=False,
     performance_mode=False,
-    use_deterministic_algorithms=False,
+    use_deterministic_algorithms=None,
 ):
     global _initialized
     if _initialized:
@@ -75,35 +74,15 @@ def init(
     # Make sure everything is properly destroyed, just in case initialization failed previously
     destroy()
 
-    # Update theme if valid
-    global _theme
-    if theme not in ("dark", "light", "dumb"):
-        raise_exception(f"Unsupported theme: ~~<{theme}>~~")
-    _theme = theme
-
     # Make sure that specified arch and precision are supported
     if precision not in ("32", "64"):
-        raise_exception(f"Unsupported precision type: ~~<{precision}>~~")
+        raise_exception(f"Unsupported precision type: ~<{precision}>~")
 
-    # Initialize the logger and print greeting message
+    # Initialize the logger
     global logger
     if logging_level is None:
         logging_level = _logging.DEBUG if debug else _logging.INFO
-    logger = Logger(logging_level, logger_verbose_time)
-
-    try:
-        columns, _lines = os.get_terminal_size()
-    except OSError:
-        columns = 80
-    wave_width = (columns - logger.INFO_length - 11) // 2
-    if wave_width % 2 == 0:
-        wave_width -= 1
-    wave_width = max(0, min(38, wave_width))
-    bar_width = wave_width * 2 + 9
-    wave = ("┈┉" * wave_width)[:wave_width]
-    logger.info(f"~<╭{'─' * (bar_width)}╮>~")
-    logger.info(f"~<│{wave}>~ ~~~~<Genesis>~~~~ ~<{wave}│>~")
-    logger.info(f"~<╰{'─' * (bar_width)}╯>~")
+    logger = Logger(logging_level, logger_verbose_time, theme)
 
     # Get device and backend
     global device
@@ -120,12 +99,12 @@ def init(
         try:
             device, device_name, total_mem, _backend = get_device(_backend)
             if backend == _gs_backend.gpu and _backend == _gs_backend.cpu:
-                logger.warning(f"Backend ~~<{backend}>~~ not available on this machine. Falling back to CPU.")
+                logger.warning(f"Backend ~<{backend}>~ not available on this machine. Falling back to CPU.")
             backend = _backend
             break
         except GenesisException as e:
             if not backend_candidates:
-                raise_exception_from(f"Backend ~~<{_backend}>~~ not available on this machine.", e)
+                raise_exception_from(f"Backend ~<{_backend}>~ not available on this machine.", e)
     globals()["backend"] = backend
 
     # Fallback to Torch CPU device if requested
@@ -164,7 +143,10 @@ def init(
     use_zerocopy = bool(_use_zerocopy)
 
     # Reproducing a rollout means settling the runtime-measured choices the simulation would otherwise keep revisiting
-    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying, hence opt-in.
+    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying. If None, it is
+    # resolved from the array mode: disabled in performance mode (static arrays), enabled otherwise.
+    if use_deterministic_algorithms is None:
+        use_deterministic_algorithms = _use_ndarray
     globals()["use_deterministic_algorithms"] = use_deterministic_algorithms
     globals()["debug"] = debug
 
@@ -212,10 +194,6 @@ def init(
     qd_ivec2 = qd.types.vector(2, qd_int)
     qd_ivec3 = qd.types.vector(3, qd_int)
     qd_ivec4 = qd.types.vector(4, qd_int)
-
-    # Update torch default dtype and device, just in case
-    torch.set_default_device(device)
-    torch.set_default_dtype(tc_float)
 
     # Define smallest float that is considered non-zero
     global EPS
@@ -292,10 +270,6 @@ def init(
     # Disable debug checks for quadrants
     qd.lang._template_mapper.__builtins__["__debug__"] = qd_debug
 
-    logger.info(
-        f"Running on ~~<[{device_name}]>~~ with backend ~~<{backend}>~~. Device memory: ~~<{total_mem:.2f}>~~ GB."
-    )
-
     for qd_output in _qd_outputs.getvalue().splitlines():
         logger.debug(qd_output)
     _qd_outputs.truncate(0)
@@ -328,19 +302,7 @@ def init(
             "runtime performance: https://pytorch.org/get-started/locally/"
         )
 
-    msg_options = ", ".join(
-        f"{name}: ~~<{val}>~~"
-        for name, val in (
-            ("🔖 version", __version__),
-            ("🎨 theme", theme),
-            ("🌱 seed", seed),
-            ("🐛 debug", bool(debug)),
-            ("📏 precision", precision),
-            ("🔥 performance", bool(performance_mode)),
-            ("💬 verbose", _logging.getLevelName(logger.level)),
-        )
-    )
-    logger.info(f"🚀 Genesis initialized. {msg_options}")
+    logger.banner(device_name, backend, total_mem, seed, debug, precision, performance_mode)
 
     if _use_zerocopy is None:
         logger.warning(
@@ -381,7 +343,7 @@ def destroy():
     # Display any buffered error message if logger is configured
     global logger
     if logger:
-        logger.info("💤 Exiting Genesis and caching compiled kernels...")
+        logger.shutdown()
 
     # Destroy all scenes. A weakref that no longer resolves means the scene was already garbage-collected (and its
     # resources released), so there is nothing left to destroy - skip it rather than asserting.
@@ -418,8 +380,7 @@ def destroy():
     logger = None
 
     # Clear global state
-    global _theme, device, backend, EPS
-    _theme = None
+    global device, backend, EPS
     device = None
     backend = None
     EPS = None

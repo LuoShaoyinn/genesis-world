@@ -1825,11 +1825,12 @@ class RigidEntity(KinematicEntity):
 
     def _load_model(self):
         self._equalities = gs.List()
-        # MJCF and USD express in-model collision filtering (MJCF '<contact><exclude>', USD CollisionGroup /
-        # FilteredPairsAPI) through synthesized contype/conaffinity bitmasks. Those masks are only consistent within
+        # MJCF, URDF and USD express in-model collision filtering (MJCF '<contact><exclude>', URDF
+        # '<disable_collisions>', USD CollisionGroup / FilteredPairsAPI) through synthesized bitmasks.
+        # Those masks are only consistent within
         # the entity: applied across entities, they would spuriously disable collision against geoms whose default
         # masks happen not to overlap (e.g. the ground plane).
-        self._is_local_collision_mask = isinstance(self._morph, (gs.morphs.MJCF, gs.morphs.USD))
+        self._is_local_collision_mask = isinstance(self._morph, (gs.morphs.MJCF, gs.morphs.URDF, gs.morphs.USD))
 
         # Imported here since the couplers import the rigid entity package
         from genesis.engine.couplers import IPCCoupler

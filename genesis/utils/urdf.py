@@ -14,7 +14,60 @@ from genesis.ext import urdfpy
 
 from . import geom as gu
 from . import mesh as mu
+from .collision import solve_contype_conaffinity
 from .misc import get_assets_dir
+
+
+def apply_collision_exclusions(morph, l_infos, links_g_infos):
+    """Apply SRDF-style ``disable_collisions`` elements embedded in a URDF as entity-local collision masks.
+
+    This is a Genesis URDF extension. Referenced links must survive fixed-link merging (use ``links_to_keep``
+    for fixed links). Parsing happens after the MuJoCo pass, which otherwise replaces the collision masks.
+    """
+    if morph.is_format(XACRO_FORMAT):
+        root = ET.fromstring(xacro.process_file(morph.file, mappings=dict(morph.xacro_args)).toxml())
+    elif isinstance(morph.file, (str, Path)):
+        try:
+            root = ET.fromstring(morph.file)
+        except (ET.ParseError, TypeError):
+            root = ET.parse(os.path.join(get_assets_dir(), morph.file)).getroot()
+    else:
+        root = ET.fromstring(morph.file.other_xml or "<extra/>")
+    exclusions = root.findall("disable_collisions")
+    if not exclusions:
+        return
+
+    geoms_by_link = {
+        l_info["name"]: [g_info for g_info in g_infos if g_info["contype"] or g_info["conaffinity"]]
+        for l_info, g_infos in zip(l_infos, links_g_infos)
+    }
+    geoms = [g_info for g_infos in geoms_by_link.values() for g_info in g_infos]
+    geom_indices = {id(g_info): i for i, g_info in enumerate(geoms)}
+    invalid_pairs = {
+        frozenset((i, j))
+        for i, a in enumerate(geoms)
+        for j, b in enumerate(geoms)
+        if i < j and not ((a["contype"] & b["conaffinity"]) | (b["contype"] & a["conaffinity"]))
+    }
+    for exclusion in exclusions:
+        a, b = exclusion.get("link1"), exclusion.get("link2")
+        if a not in geoms_by_link or b not in geoms_by_link or a == b:
+            gs.raise_exception(
+                f"Invalid URDF collision exclusion ({a!r}, {b!r}). Use two distinct retained link names; "
+                "add fixed links to 'links_to_keep' if needed."
+            )
+        invalid_pairs.update(
+            frozenset((geom_indices[id(ga)], geom_indices[id(gb)]))
+            for ga in geoms_by_link[a]
+            for gb in geoms_by_link[b]
+        )
+    if not geoms:
+        return
+    masks = solve_contype_conaffinity(len(geoms), invalid_pairs)
+    if masks is None:
+        gs.raise_exception("URDF collision exclusions cannot be represented by 31-bit collision masks.")
+    for g_info, (contype, conaffinity) in zip(geoms, masks):
+        g_info["contype"], g_info["conaffinity"] = contype, conaffinity
 
 
 def get_robot_name(file_path):

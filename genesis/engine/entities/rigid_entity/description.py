@@ -899,6 +899,8 @@ class KinematicEntityDescription(EntityDescription):
                     "Falling back to legacy URDF parser. Default values of physics properties may be off:\n"
                     + str(e).replace("\n", " - ")
                 )
+            if isinstance(morph, gs.morphs.URDF):
+                uu.apply_collision_exclusions(morph, l_infos, links_g_infos)
         elif isinstance(morph, gs.morphs.USD):
             # Imported here since USD support is optional and its bindings load with the package
             from genesis.utils.usd import parse_usd_rigid_entity
@@ -1441,7 +1443,14 @@ class KinematicEntityDescription(EntityDescription):
 
             # The estimate comes from the collision geometry of the link when it has any, and from its visual
             # geometry otherwise. A link with neither contributes nothing, so only the asset's values remain.
-            dynamics_hint = compose_inertial_from_g_infos(cg_infos or vg_infos, rho)
+            # Visual-only links may deliberately carry open rendering meshes. With authored mass and inertia,
+            # their volume estimate is unused: do not close those meshes merely to check the authored inertial.
+            # Collision geometry still supplies the usual consistency checks, and incomplete inertials still
+            # fall back to visual geometry (including when recompute_inertia discarded the authored values).
+            if cg_infos or explicit_mass is None or explicit_inertia is None:
+                dynamics_hint = compose_inertial_from_g_infos(cg_infos or vg_infos, rho)
+            else:
+                dynamics_hint = InertialProperties(0.0, np.zeros(3), np.zeros((3, 3)))
         return LinkInertialInfo(props, is_mass_explicit, dynamics_hint)
 
     def _align_link(self, l_info, j_infos, cg_infos, vg_infos, morph, resolution: Resolution):

@@ -18,6 +18,108 @@ from ..utils.assets import get_hf_dataset
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("inertial_source", ["authored", "mass_only", "geometry_only", "recomputed"])
+def test_visual_only_open_mesh_inertial(tmp_path, monkeypatch, caplog, inertial_source, tol):
+    import trimesh
+
+    from genesis.engine.mesh import Mesh
+
+    # An open visual mesh is valid for rendering, but needs its hull when its volume supplies missing dynamics.
+    mesh = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+    mesh.update_faces(np.arange(len(mesh.faces)) != 0)
+    mesh.export(tmp_path / "open.obj")
+    mass = 0 if inertial_source == "geometry_only" else 2
+    inertia = 0 if inertial_source in ("mass_only", "geometry_only") else 0.02
+    urdf = tmp_path / "visual_only.urdf"
+    urdf.write_text(
+        '<robot name="visual_only"><link name="body">'
+        f'<inertial><origin xyz="0 0 0"/><mass value="{mass}"/>'
+        f'<inertia ixx="{inertia}" iyy="{inertia}" izz="{inertia}" ixy="0" ixz="0" iyz="0"/></inertial>'
+        '<visual><geometry><mesh filename="open.obj"/></geometry></visual>'
+        "</link></robot>"
+    )
+    if inertial_source == "authored":
+
+        def unused_visual_inertial(mesh):
+            pytest.fail("A complete authored inertial should not require the visual mesh's volume")
+
+        monkeypatch.setattr(Mesh, "inertial", property(unused_visual_inertial))
+
+    scene = gs.Scene(show_viewer=False)
+    with caplog.at_level("WARNING"):
+        entity = scene.add_entity(
+            gs.morphs.URDF(file=urdf, align=False, recompute_inertia=inertial_source == "recomputed"),
+            material=gs.materials.Rigid(rho=1500.0),
+        )
+    desc = entity.base_link.desc
+    estimated_mass = 1500.0 * 0.2**3
+    expected_mass = estimated_mass if inertial_source in ("geometry_only", "recomputed") else 2.0
+    expected_inertia = expected_mass * 0.2**2 / 6.0 if inertial_source != "authored" else 0.02
+    assert_allclose(desc.mass, expected_mass, tol=tol)
+    assert_allclose(desc.inertial_pos, 0.0, tol=tol)
+    assert_allclose(desc.inertia, np.eye(3) * expected_inertia, tol=tol)
+    warnings = [record for record in caplog.records if "Mesh is not watertight" in record.getMessage()]
+    assert bool(warnings) == (inertial_source != "authored")
+
+
+@pytest.mark.required
+def test_urdf_explicit_collision_exclusions(tmp_path):
+    root = ET.Element("robot", name="excluded_pairs")
+    for i, name in enumerate(("base", "middle", "tip")):
+        link = ET.SubElement(root, "link", name=name)
+        for _ in range(2 if name == "tip" else 1):
+            collision = ET.SubElement(link, "collision")
+            geometry = ET.SubElement(collision, "geometry")
+            ET.SubElement(geometry, "box", size="0.1 0.1 0.1")
+        if i:
+            joint = ET.SubElement(root, "joint", name=f"joint_{i}", type="continuous")
+            ET.SubElement(joint, "parent", link="base" if i == 1 else "middle")
+            ET.SubElement(joint, "child", link=name)
+            ET.SubElement(joint, "origin", xyz="0.3 0 0")
+            ET.SubElement(joint, "axis", xyz="0 0 1")
+    ET.SubElement(root, "disable_collisions", link1="base", link2="tip")
+    urdf = tmp_path / "excluded.urdf"
+    ET.ElementTree(root).write(urdf)
+    # With both automatic filters off, only the explicit exclusion can disable these pairs.
+    scene = gs.Scene(
+        rigid_options=gs.options.RigidOptions(enable_neutral_collision=True, enable_adjacent_collision=True),
+        show_viewer=False,
+    )
+    plane = scene.add_entity(gs.morphs.Plane())
+    robots = [scene.add_entity(gs.morphs.URDF(file=urdf, align=False, pos=(0, i, 1))) for i in range(2)]
+    scene.build()
+    matrix = scene.rigid_solver.collider._compute_collision_pair_idx()[1]
+
+    def eligible(a, b):
+        return matrix[min(a.idx, b.idx), max(a.idx, b.idx)] >= 0
+
+    for robot in robots:
+        base = robot.get_link("base").geoms[0]
+        middle = robot.get_link("middle").geoms[0]
+        for tip in robot.get_link("tip").geoms:
+            assert not eligible(base, tip)
+            assert eligible(middle, tip)
+        assert eligible(base, middle)
+        for geom in robot.geoms:
+            assert eligible(plane.geoms[0], geom)
+    # Synthesized masks must not leak across independently loaded copies of the robot.
+    for a in robots[0].geoms:
+        for b in robots[1].geoms:
+            assert eligible(a, b)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("link1, link2", [("base", "missing"), ("base", "base"), ("base", None)])
+def test_urdf_invalid_collision_exclusion(link1, link2):
+    exclusion = ET.Element("disable_collisions", link1=link1)
+    if link2 is not None:
+        exclusion.set("link2", link2)
+    morph = gs.morphs.URDF(file=f'<robot name="invalid">{ET.tostring(exclusion, encoding="unicode")}</robot>')
+    with pytest.raises(gs.GenesisException, match="Invalid URDF collision exclusion"):
+        uu.apply_collision_exclusions(morph, [{"name": "base"}], [[]])
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("model_name", ["depth_first_tree_mjcf", "depth_first_tree_urdf"])
 def test_depth_first_link_ordering(xml_path, model_name, show_viewer):
     # Links must be parsed depth-first so every subtree - hence every free body's DOFs - occupies a contiguous index

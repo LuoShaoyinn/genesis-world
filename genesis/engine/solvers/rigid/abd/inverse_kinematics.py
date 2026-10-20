@@ -490,10 +490,14 @@ def func_inverse_kinematics(
                         i_d = targets.dofs_idx[i_d_]
                         for i_error in qd.static(range(3)):
                             ik_state.jacobian_stacked[i_ee * 6 + i_error, i_d_, i_b] = (
-                                ik_state.jacobian[i_error, i_d, i_b] * targets.pos_mask[i_error]
+                                ik_state.jacobian[i_error, i_d, i_b]
+                                * targets.pos_mask[i_error]
+                                * targets.link_pos_mask[i_ee]
                             )
                             ik_state.jacobian_stacked[i_ee * 6 + i_error + 3, i_d_, i_b] = (
-                                ik_state.jacobian[i_error + 3, i_d, i_b] * targets.rot_mask[i_error]
+                                ik_state.jacobian[i_error + 3, i_d, i_b]
+                                * targets.rot_mask[i_error]
+                                * targets.link_rot_mask[i_ee]
                             )
 
                 lu.mat_transpose(ik_state.jacobian_stacked, ik_state.jacobian_stacked_t, n_error_dims, n_dofs, i_b)

@@ -319,6 +319,46 @@ def test_joint_get_anchor_pos_and_axis(n_envs):
     assert_allclose(anchor_axis, expected_axis[joint.idx], tol=gs.EPS)
 
 
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_inverse_kinematics_omitted_orientation_targets(show_viewer, explicit_none):
+    scene = gs.Scene(show_viewer=show_viewer)
+    robot = scene.add_entity(gs.morphs.Box(pos=(0., 0., .2), size=(.1, .1, .1), fixed=False))
+    scene.build(n_envs=1)
+    initial = robot.get_qpos().clone()
+    origin = robot.get_pos().clone()
+    point = origin.new_tensor((.05, 0., 0.))
+    rotated = origin.new_tensor((.05*np.cos(.4), 0., -.05*np.sin(.4)))
+    _, error = robot.inverse_kinematics_multilink(
+        links=[robot.links[0], robot.links[0]], poss=[origin, origin+rotated],
+        quats=[None, None] if explicit_none else None,
+        local_points=[point.new_zeros(3), point], init_qpos=initial,
+        dofs_idx_local=range(6), max_samples=1, max_solver_iters=100,
+        damping=.01, pos_tol=1e-5, return_error=True)
+    assert float(error[..., :3].norm(dim=-1).max()) < 2e-5
+    assert_equal(robot.get_qpos(), initial)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_inverse_kinematics_omitted_position_targets(show_viewer, explicit_none):
+    scene = gs.Scene(show_viewer=show_viewer)
+    robot = scene.add_entity(gs.morphs.Box(pos=(0., 0., .2), size=(.1, .1, .1), fixed=False))
+    scene.build(n_envs=1)
+    initial = robot.get_qpos().clone()
+    point = initial.new_tensor((1., 0., 0.))
+    quat = initial.new_tensor([[np.cos(.2), 0., np.sin(.2), 0.]])
+    _, error = robot.inverse_kinematics_multilink(
+        links=[robot.links[0], robot.links[0]], poss=[None, None] if explicit_none else None,
+        quats=[quat, quat], local_points=[point, -point], init_qpos=initial,
+        dofs_idx_local=range(6), max_samples=1, max_solver_iters=3,
+        damping=.01, rot_tol=1e-5, return_error=True)
+    assert float(error[..., 3:].norm(dim=-1).max()) < 2e-5
+    assert_equal(robot.get_qpos(), initial)
+
+
 @pytest.mark.slow("gpu")  # gpu ~250s
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])

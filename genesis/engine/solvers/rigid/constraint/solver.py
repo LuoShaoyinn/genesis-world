@@ -2004,16 +2004,21 @@ def func_equality_weld(
         _sort_relevant_dofs_descending(n_con, i_b, con_n_dofs, constraint_state, rigid_config)
 
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel, pos_error[i])
+        diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
         if is_soft:
             dt = rigid_info.substep_dt[None]
-            # Convert physical stiffness/damping to the acceleration gains used
-            # by the equality solver. Keep this per environment and on device.
-            kp = soft_params[0] * invweight[0]
-            kd = soft_params[1] * invweight[0]
-            strength = kp * dt * dt + kd * dt
-            imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
-            aref = -kd * jac_qvel - kp * pos_error[i]
-        diag = qd.max(invweight[0] * (1 - imp) / imp, EPS)
+            # Implicit Euler for F = -k*x_next - c*v_next, with
+            # x_next = x + dt*v_next and v_next = v + dt*x_ddot:
+            # x_ddot + F / (dt*c + dt^2*k)
+            #     = -(k*x + (c + dt*k)*v) / (dt*c + dt^2*k).
+            # J*M^-1*J^T already contains the articulated inverse mass.
+            # Scaling aref by invweight again makes static extension depend
+            # on mass, damping, and substep size instead of just F/k.
+            stiffness = soft_params[0]
+            damping = soft_params[1]
+            compliance_denom = qd.max(dt * (damping + dt * stiffness), EPS)
+            diag = 1.0 / compliance_denom
+            aref = -(stiffness * pos_error[i] + (damping + dt * stiffness) * jac_qvel) / compliance_denom
 
         constraint_state.diag[n_con, i_b] = diag
         constraint_state.aref[n_con, i_b] = aref - jdotv[i]

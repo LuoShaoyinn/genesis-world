@@ -317,6 +317,52 @@ def test_masked_soft_weld_valve_changes():
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("substeps", (5, 10, 20))
+@pytest.mark.parametrize("damping", (5.0, 40.0))
+def test_soft_weld_physical_linear_compliance(substeps, damping):
+    """Static extension is F/k; dynamics match an implicit spring for both masses."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=substeps, gravity=(0, 0, 0)),
+        rigid_options=gs.options.RigidOptions(batch_links_info=True),
+        show_viewer=False,
+    )
+    ground = scene.add_entity(gs.morphs.Plane())
+    body = scene.add_entity(gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0, 0, 0.05)))
+    scene.build(n_envs=2)
+    masses = np.array((0.05, 0.2))
+    loads = np.array((1.0, 5.0))
+    body.set_mass(torch.tensor(masses, device=gs.device, dtype=gs.tc_float))
+    initial = body.get_pos().clone()
+    solver = scene.sim.rigid_solver
+    pair = body.base_link.idx, ground.base_link.idx
+    solver.apply_soft_weld_masked(
+        *pair, torch.ones(2, device=gs.device, dtype=torch.bool),
+        torch.zeros(2, device=gs.device, dtype=torch.bool),
+        linear_stiffness=2400.0, linear_damping=damping,
+        angular_stiffness=0.016, angular_damping=0.000125,
+        max_force=10.0, max_torque=0.1,
+        anchor_local=(0, 0, 0), project_other_anchor_z=0.05,
+    )
+    force = torch.zeros((2, 1, 3), device=gs.device, dtype=gs.tc_float)
+    force[:, 0, 0] = torch.tensor(loads, device=gs.device, dtype=gs.tc_float)
+    expected_x, expected_v = np.zeros(2), np.zeros(2)
+    dt = 0.01 / substeps
+    for step in range(150):
+        body.apply_links_external_wrench(force=force)
+        scene.step()
+        for _ in range(substeps):
+            expected_v = (masses * expected_v + dt * (loads - 2400.0 * expected_x)) / (
+                masses + dt * damping + dt * dt * 2400.0
+            )
+            expected_x += dt * expected_v
+        if step < 10 or step == 149:
+            displacement = tensor_to_array((body.get_pos() - initial)[:, 0])
+            np.testing.assert_allclose(displacement, expected_x, atol=2e-6, rtol=0.002)
+    np.testing.assert_allclose(displacement, loads / 2400.0, atol=2e-6, rtol=0.002)
+    assert_equal(solver.get_soft_weld_pair_status(*pair)["active"], [True, True])
+
+
+@pytest.mark.required
 def test_dynamic_soft_weld_spring_response():
     scene = gs.Scene(sim_options=gs.options.SimOptions(dt=0.01, substeps=2), show_viewer=False)
     anchor = scene.add_entity(gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.5), fixed=True))

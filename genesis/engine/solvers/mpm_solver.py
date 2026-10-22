@@ -13,7 +13,7 @@ from genesis.engine.entities import MPMEntity
 from genesis.engine.materials import MPM
 from genesis.engine.states.solvers import MPMSolverState
 from genesis.options.solvers import MPMOptions
-from genesis.utils.misc import DeprecationError, qd_to_torch
+from genesis.utils.misc import DeprecationError, assert_contiguous, qd_to_torch
 
 from .base_solver import GravityMixin, Solver, TimeBasedMixin
 
@@ -224,9 +224,6 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
                 gs.raise_exception(
                     "CPIC is not supported in differentiable mode yet. Submit a feature request if you need it."
                 )
-
-            if self._enable_CPIC and self.sim.rigid_solver.is_active and self.sim.rigid_solver.n_geoms:
-                self.sim.rigid_solver.collider._sdf.activate()
 
             self.init_particle_fields()
             self.init_grid_fields()
@@ -577,7 +574,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
-            self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
+            self.sim.coupler.rigid_solver.collider.sdf.sdf_info,
             self.sim.coupler.rigid_solver.collider.collider_config,
         )
 
@@ -588,7 +585,7 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
             self.sim.coupler.rigid_solver.dyn_info.geoms,
             self.sim.coupler.rigid_solver.dyn_state.links,
             self.sim.coupler.rigid_solver.rigid_info,
-            self.sim.coupler.rigid_solver.collider._sdf._sdf_info,
+            self.sim.coupler.rigid_solver.collider.sdf.sdf_info,
             self.sim.coupler.rigid_solver.collider.collider_config,
         )
         self.svd_grad(f)
@@ -714,23 +711,23 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
     def add_grad_from_state(self, state):
         if self.is_active:
             if state.pos.grad is not None:
-                state.pos.assert_contiguous()
+                assert_contiguous(state.pos)
                 self.add_grad_from_pos(self._sim.cur_substep_local, state.pos.grad)
 
             if state.vel.grad is not None:
-                state.vel.assert_contiguous()
+                assert_contiguous(state.vel)
                 self.add_grad_from_vel(self._sim.cur_substep_local, state.vel.grad)
 
             if state.C.grad is not None:
-                state.C.assert_contiguous()
+                assert_contiguous(state.C)
                 self.add_grad_from_C(self._sim.cur_substep_local, state.C.grad)
 
             if state.F.grad is not None:
-                state.F.assert_contiguous()
+                assert_contiguous(state.F)
                 self.add_grad_from_F(self._sim.cur_substep_local, state.F.grad)
 
             if state.Jp.grad is not None:
-                state.Jp.assert_contiguous()
+                assert_contiguous(state.Jp)
                 self.add_grad_from_Jp(self._sim.cur_substep_local, state.Jp.grad)
 
     @qd.kernel
@@ -1229,6 +1226,13 @@ class MPMSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_built:
             return self._n_particles
         return sum(entity.n_particles for entity in self._entities)
+
+    @property
+    def n_vvert_supports(self):
+        """
+        Number of particles supporting each visual vertex.
+        """
+        return self._n_vvert_supports
 
     @property
     def n_vverts(self):

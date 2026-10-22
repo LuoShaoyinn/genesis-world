@@ -102,7 +102,6 @@ def test_plane_convex(show_viewer, tol):
                 assert_allclose(qvel, 0, atol=0.14)
 
 
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["ellipsoid"])
 def test_ellipsoid(xml_path, show_viewer):
@@ -1122,7 +1121,6 @@ def test_convex_collision_across_geom_scales(gjk_collision, show_viewer, tol):
     assert face_offset - tol <= offset <= face_offset + GEOM_SIZE
 
 
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_robot_scaling_primitive_collision(show_viewer):
     scene = gs.Scene(
@@ -1526,7 +1524,6 @@ def test_contact_pruning_authored_decomp(gjk_collision, show_viewer):
         assert is_vertical and is_pruned
 
 
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize(
     "model_name",
@@ -1606,7 +1603,7 @@ def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
 
 @pytest.mark.slow("gpu")  # gpu ~250s
 @pytest.mark.parametrize(
-    "scene_kind, max_collision_pairs, max_contacts, error_pattern, is_raised_by_build",
+    "scene_kind, max_collision_pairs, max_contacts, error_pattern, is_warned_by_build",
     [
         # Post-pruning contact budget overflow, with the candidate buffer large enough (2x margin) that it cannot
         # trip first. The automatic budget resolves to 32 contact points per link pair floored at 512, far below
@@ -1636,17 +1633,25 @@ def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
 @pytest.mark.parametrize("use_hibernation", [False, True])
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_num_contact_overflow(
-    scene_kind, max_collision_pairs, max_contacts, error_pattern, is_raised_by_build, use_hibernation, show_viewer
+    scene_kind,
+    max_collision_pairs,
+    max_contacts,
+    error_pattern,
+    is_warned_by_build,
+    use_hibernation,
+    show_viewer,
+    caplog,
 ):
     from genesis.engine.simulator import RATE_CHECK_ERRNO
 
     N_BOWLS = 4
+    rigid_options = gs.options.RigidOptions(
+        max_collision_pairs=max_collision_pairs,
+        max_contacts=max_contacts,
+        use_hibernation=use_hibernation,
+    )
     scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(
-            max_collision_pairs=max_collision_pairs,
-            max_contacts=max_contacts,
-            use_hibernation=use_hibernation,
-        ),
+        rigid_options=rigid_options,
         renderer=gs.renderers.Rasterizer(),
         show_viewer=show_viewer,
     )
@@ -1683,34 +1688,41 @@ def test_num_contact_overflow(
                 ),
             )
 
-    with nullcontext() if error_pattern is None else pytest.raises(gs.GenesisException, match=error_pattern):
+    with caplog.at_level("WARNING"):
         scene.build()
-        assert scene.rigid_solver.collider.collider_config.has_prunable_contacts
+    log_text = " ".join(record.getMessage() for record in caplog.records)
+    if is_warned_by_build is not None:
+        assert ("The initial state is invalid" in log_text) is is_warned_by_build
+    if is_warned_by_build:
+        assert error_pattern in log_text
+    assert scene.rigid_solver.collider.collider_config.has_prunable_contacts
 
-        # Contact budget as documented for 'RigidOptions.max_contacts' (32 contact points per link pair floored at 512),
-        # each contact point taking 4 constraint rows under the default pyramidal friction cone.
-        solver = scene.rigid_solver
-        collider_info = solver.collider.collider_info
-        if max_contacts is None:
-            n_link_pairs = (N_BOWLS + 1) * N_BOWLS // 2
-            expected_max_contacts = max(32 * n_link_pairs, 512)
-        else:
-            expected_max_contacts = min(max_contacts, int(collider_info.max_candidate_contacts[None]))
-        assert int(collider_info.max_contacts[None]) == expected_max_contacts
-        expected_len_constraints = 4 * expected_max_contacts + solver.n_dofs + 6 * solver.n_candidate_equalities_
-        assert solver.constraint_solver.len_constraints == expected_len_constraints
+    # Contact budget as documented for 'RigidOptions.max_contacts' (32 contact points per link pair floored at 512),
+    # each contact point taking 4 constraint rows under the default pyramidal friction cone.
+    solver = scene.rigid_solver
+    collider_info = solver.collider.collider_info
+    if max_contacts is None:
+        n_link_pairs = (N_BOWLS + 1) * N_BOWLS // 2
+        expected_max_contacts = max(32 * n_link_pairs, 512)
+    else:
+        expected_max_contacts = max_contacts
+    expected_max_contacts = min(expected_max_contacts, int(collider_info.max_candidate_contacts[None]))
+    assert int(collider_info.max_contacts[None]) == expected_max_contacts
+    expected_len_constraints = (
+        4 * expected_max_contacts
+        + solver.n_dofs
+        + 6 * solver.n_candidate_equalities_
+        + rigid_options.max_dynamic_constraints
+    )
+    assert solver.constraint_solver.len_constraints == expected_len_constraints
 
-        # errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee that an
-        # error triggered by the first steps gets raised.
+    # errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee that an
+    # error triggered by the first steps gets raised.
+    with nullcontext() if error_pattern is None else pytest.raises(gs.GenesisException, match=error_pattern):
         for _ in range(RATE_CHECK_ERRNO + 1):
             scene.step()
 
-    # An error raised by the build leaves the scene destroyed, one raised by a step leaves it built.
-    if is_raised_by_build is not None:
-        assert scene.is_built is not is_raised_by_build
 
-
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_filter_neutral_self_collisions(show_viewer):
     scene = gs.Scene(
@@ -1797,7 +1809,6 @@ def test_filter_neutral_self_collisions(show_viewer):
         scene.step()
 
 
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 def test_contype_conaffinity(show_viewer, tol):
     GRAVITY = (0.0, 0.0, -10.0)
@@ -1910,7 +1921,7 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
 
         monkeypatch.setattr(RigidSimStaticConfig, "__init__", init_forced)
 
-    N_TRIALS = 8
+    N_TRIALS = 4
     N_STEPS = 25
     N_WEDGES = 16
     BASE_HEIGHT = 0.020

@@ -11,6 +11,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 import genesis.utils.sdf as sdf
+import genesis.utils.simt as su
 
 from . import capsule_contact, diff_gjk, gjk, mpr
 from .box_contact import func_box_box_contact, func_plane_box_contact, func_sphere_box_contact
@@ -22,6 +23,7 @@ from .contact import (
     func_compute_geom_pair_scale,
     func_compute_mc_tolerance,
     func_contact_orthogonals,
+    func_reserve_contacts,
     func_rotate_frame,
     func_set_contact,
 )
@@ -72,11 +74,14 @@ def func_add_polytope_vertex_contacts_sdf(
     i_gb: int,
     i_b: int,
     i_pair: int,
+    tid: int,
     ga_pos: qd.types.vector(3),
     ga_quat: qd.types.vector(4),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
     tolerance: float,
+    n_prev: int,
+    contacts_slot,
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -85,7 +90,8 @@ def func_add_polytope_vertex_contacts_sdf(
     collider_info: array_class.ColliderInfo,
     rigid_config: qd.template(),
     collider_static_config: qd.template(),
-    seeded: qd.template(),
+    block_dim: qd.template(),
+    seeded: bool,
     errno: qd.Tensor,
 ):
     # Emit up to n_max contacts at the deepest spatially-diverse vertices of A penetrating (or near-touching) B's
@@ -97,8 +103,13 @@ def func_add_polytope_vertex_contacts_sdf(
     # patch and not arbitrary body verts that would starve the solver of normal-force capacity. The margin is sized to
     # B's smallest SDF cell so verts within one cell of the surface still register a contact even when the kernel pen
     # reads <= 0; the synthetic pen tapers smoothly across the band to avoid a discontinuity that would drive a settled
-    # body into a limit-cycle oscillation.
+    # body into a limit-cycle oscillation. The pair's first n_prev contacts sit at the buffer slots contacts_slot lists,
+    # and the count and slots of its contacts once this scan emitted its own are returned. The block_dim lanes of a
+    # block detect the pair together, lane tid of the block being this thread, every lane returning the same result.
+    # The per-pair buffers (kept verts, visited minima, contact slots) are spread over the lanes (see
+    # su.qd_lane_vector_get), which keeps a block_dim-th of each in every lane instead of a full copy in local memory.
     n_max = qd.static(collider_static_config.n_contacts_per_nonconvex_pair if rigid_config.enable_multi_contact else 1)
+    N_SLOTS = qd.static((n_max + block_dim - 1) // block_dim)
     EPS = rigid_info.EPS[None]
     gb_cell = collider_info.sdf.geoms_info.sdf_cell_size[i_gb]
     margin = qd.min(qd.min(gb_cell[0], gb_cell[1]), gb_cell[2])
@@ -131,17 +142,9 @@ def func_add_polytope_vertex_contacts_sdf(
         can_use_sd_reject = not sdf.sdf_func_is_outside_sdf_grid(i_gb, pos_sdf, collider_info.sdf)
     sd_center = sdf.sdf_func_world_local(i_gb, center_a_world, gb_pos, gb_quat, dyn_info.geoms, collider_info.sdf)
 
-    # Contacts already emitted for this pair by the first scan, recovered from the buffer where the pair's contacts
-    # sit contiguously on top: the repeated-contact check and the shared pair budget below cover both scans. The
-    # count and buffer top are snapshotted for seeding, since the emission below grows both.
-    n_added = 0
-    i_contact_top = collider_state.n_contacts[i_b]
-    if qd.static(seeded):
-        while (
-            n_added < i_contact_top and collider_state.contact_data.pair_idx[i_contact_top - 1 - n_added, i_b] == i_pair
-        ):
-            n_added = n_added + 1
-    n_prev = n_added
+    # The pairs of an env are detected in parallel, so the contacts of the pair's first scan are found through their
+    # slots: the repeated-contact check and the shared pair budget below cover both scans.
+    n_added = n_prev
     if (not can_use_sd_reject) or sd_center <= rbound_a:
         # Pass 1: select the n_max deepest spatially-diverse vertices of A by grid SDF pen. The buffer keeps verts at
         # least `diversity_radius` apart in world space: a candidate close to an existing entry replaces that entry
@@ -165,12 +168,29 @@ def func_add_polytope_vertex_contacts_sdf(
             if d_sq_b > rbound_b_sq:
                 rbound_b_sq = d_sq_b
         center_b_world = gu.qd_transform_by_trans_quat(b_center_local, gb_pos, gb_quat)
-        top_iv = qd.Vector.zero(gs.qd_int, n_max)
-        top_pen = qd.Vector.zero(gs.qd_float, n_max)
-        for k in range(n_max):
-            top_pen[k] = -gs.qd_float(1e30)
-            top_iv[k] = -1
-        if qd.static(not seeded):
+        top_iv = qd.Vector.zero(gs.qd_int, N_SLOTS)
+        top_pen = qd.Vector.zero(gs.qd_float, N_SLOTS)
+        for i_k in qd.static(range(N_SLOTS)):
+            top_pen[i_k] = -gs.qd_float(1e30)
+            top_iv[i_k] = -1
+        # Both passes walk groups of candidate verts of A (all the columns of cells as one group for the full scan, a
+        # 1-ring per seed for the verification) and pick the group and the vert in runtime branches, so that the SDF
+        # query and the insertion below are inlined once. This trades some runtime for compile time: the per-vert
+        # branches on 'seeded' make the scan slower than two dedicated loops, each with its own copy of the query and
+        # the insertion.
+        n_cells_per_axis = qd.static(8)
+        cell_min = qd.Vector.zero(gs.qd_int, 3)
+        cell_max = qd.Vector.zero(gs.qd_int, 3)
+        n_columns = 0
+        n_groups = 0
+        # The full scan keeps the verts within one SDF cell of B's surface. The verification only keeps UNAMBIGUOUS
+        # penetrations: the first scan already supplies the near-surface approach band from the other side, and
+        # duplicating it here with grid-noise-level pens and grid-smoothed normals disturbs tuned interfaces (it
+        # decouples the pitch of a threaded nut-bolt pair and injects residual jitter into a settled pile). A
+        # quarter-cell floor keeps grid noise out while a genuine wall crossing (at least half a wall thickness deep)
+        # clears it long before locking.
+        band = margin
+        if not seeded:
             # Pull B's world AABB back into A's local frame (its exact enclosing box, padded to absorb the
             # rounding of the two transform paths) and walk only the spatial cells of A overlapping it: a vert
             # outside B's AABB contributes nothing, so far cells are skipped wholesale, without per-vertex work.
@@ -183,7 +203,6 @@ def func_add_polytope_vertex_contacts_sdf(
             box_min = box_center - box_half_size
             box_max = box_center + box_half_size
             box_pad = 1e-6 * (1.0 + box_min.norm() + box_max.norm())
-            n_cells_per_axis = 8
             spatial_origin = collider_info.verts_spatial_grid.geoms_origin[i_ga]
             spatial_inv_cell_size = collider_info.verts_spatial_grid.geoms_inv_cell_size[i_ga]
             cell_min = qd.floor((box_min - box_pad - spatial_origin) * spatial_inv_cell_size, gs.qd_int)
@@ -195,72 +214,84 @@ def func_add_polytope_vertex_contacts_sdf(
             if (cell_max >= 0).all() and (cell_min <= n_cells_per_axis - 1).all():
                 cell_min = qd.max(cell_min, 0)
                 cell_max = qd.min(cell_max, n_cells_per_axis - 1)
-                for i_cx in range(cell_min[0], cell_max[0] + 1):
-                    for i_cy in range(cell_min[1], cell_max[1] + 1):
-                        # Cells along z are contiguous in the cell-range layout, so the whole z-run is one vert range.
-                        i_cell = (
-                            i_ga * (n_cells_per_axis**3 + 1)
-                            + (i_cx * n_cells_per_axis + i_cy) * n_cells_per_axis
-                            + cell_min[2]
-                        )
-                        for i_sv in range(
-                            collider_info.verts_spatial_grid.cells_vert_start[i_cell],
-                            collider_info.verts_spatial_grid.cells_vert_start[i_cell + cell_max[2] - cell_min[2] + 1],
-                        ):
-                            vertex_pos = gu.qd_transform_by_trans_quat(
-                                collider_info.verts_spatial_grid.verts_pos[i_sv], ga_pos, ga_quat
-                            )
-                            if func_point_in_geom_aabb(i_gb, i_b, vertex_pos, 0.0, dyn_state):
-                                is_in_band, sd_v = sdf.sdf_func_world_local_banded(
-                                    i_gb, vertex_pos, gb_pos, gb_quat, margin, dyn_info, collider_info
-                                )
-                                pen_v = -sd_v
-                                if is_in_band:
-                                    i_v = collider_info.verts_spatial_grid.verts_idx[i_sv]
-                                    close_idx = -1
-                                    for k in range(n_max):
-                                        if close_idx < 0 and top_iv[k] >= 0:
-                                            other_pos = gu.qd_transform_by_trans_quat(
-                                                dyn_info.verts.init_pos[top_iv[k]], ga_pos, ga_quat
-                                            )
-                                            if (vertex_pos - other_pos).norm() < diversity_radius:
-                                                close_idx = k
-                                    if close_idx >= 0:
-                                        if pen_v > top_pen[close_idx]:
-                                            top_pen[close_idx] = pen_v
-                                            top_iv[close_idx] = i_v
-                                    else:
-                                        weakest_idx = 0
-                                        for k in range(1, n_max):
-                                            if top_pen[k] < top_pen[weakest_idx]:
-                                                weakest_idx = k
-                                        if pen_v > top_pen[weakest_idx]:
-                                            top_pen[weakest_idx] = pen_v
-                                            top_iv[weakest_idx] = i_v
+                # One column per xy cell: cells along z are contiguous in the cell-range layout, so the whole z-run is
+                # one vert range.
+                n_columns = (cell_max[0] - cell_min[0] + 1) * (cell_max[1] - cell_min[1] + 1)
         else:
             # Seeded verification: what the pair's first scan cannot see is a feature of A (rim, edge) crossing one
             # of B's faces BETWEEN B's verts; any such feature lies in B's near-surface band, connected on A's vertex
             # graph to a local SDF minimum. So instead of scanning every A vert, hill-climb down B's SDF from each
             # first-scan contact plus the image of B's center (covers the zero-contact crossing, e.g. a thin blade
-            # fully through a plate), and consider only the minimum and its 1-ring. The early stop is a convergence
-            # dedup: seeds of the same patch resolve to an already-visited closest vert or climb into a known
-            # minimum, so only the first seed of each basin pays for a climb. Cost is O(basins * climb * ring),
-            # affordable for every pair including world-anchored meshes with huge vert counts.
-            seen_verts = qd.Vector.zero(gs.qd_int, n_max)
-            n_seen = 0
-            for i_seed in range(n_max + 1):
-                i_v_min = -1
-                if i_seed == 0:
+            # fully through a plate), and consider only the minimum and its 1-ring, one group per seed. The early stop
+            # is a convergence dedup: seeds of the same patch resolve to an already-visited closest vert or climb into
+            # a known minimum, so only the first seed of each basin pays for a climb. Cost is O(basins * climb * ring),
+            # affordable for every pair including world-anchored meshes with huge vert counts. Only B's center and the
+            # n_prev contacts of the first scan seed a group.
+            n_groups = n_prev + 1
+            band = -0.25 * margin
+        seen_verts = qd.Vector.zero(gs.qd_int, N_SLOTS)
+        n_seen = 0
+        weakest_idx = 0
+        # The vert ranges of the columns of cells are read by the lanes at once, each holding a block_dim-th of them
+        # (see su.qd_lane_vector_get). A column holds a few verts only, so with several lanes the full scan walks the
+        # verts of all the columns as one sequence in column order, a batch of verts spanning as many columns as it
+        # takes to fill the lanes of the block. A single lane walks the columns one group after the other.
+        N_COLUMN_SLOTS = qd.static((n_cells_per_axis**2 + block_dim - 1) // block_dim)
+        columns_vert_range = qd.Matrix.zero(gs.qd_int, N_COLUMN_SLOTS, 2)
+        n_cells_y = cell_max[1] - cell_min[1] + 1
+        n_scan_verts = 0
+        if not seeded:
+            cells_stride = qd.Vector([n_cells_per_axis**2, n_cells_per_axis, 1])
+            for i_k in range(N_COLUMN_SLOTS):
+                i_column = i_k * block_dim + tid
+                if i_column < n_columns:
+                    cell = cell_min + qd.Vector([i_column // n_cells_y, i_column % n_cells_y, 0])
+                    i_cell = i_ga * (n_cells_per_axis**3 + 1) + cell.dot(cells_stride)
+                    i_cell_end = i_cell + cell_max[2] - cell_min[2] + 1
+                    column_vert_range = qd.Vector(
+                        [collider_info.verts_spatial_grid.cells_vert_start[i] for i in qd.static((i_cell, i_cell_end))]
+                    )
+                    su.qd_lane_local_set(columns_vert_range, i_k, column_vert_range, block_dim)
+                    n_scan_verts = n_scan_verts + column_vert_range[1] - column_vert_range[0]
+            n_groups = n_columns
+            if qd.static(block_dim > 1):
+                n_scan_verts = su.qd_block_sum(n_scan_verts)
+                n_groups = qd.min(n_columns, 1)
+        # Most columns are empty, so the batches jump from one non-empty column to the next through a ballot of the
+        # lanes per row of columns.
+        lanes_column_left = qd.Vector.zero(qd.u32, N_COLUMN_SLOTS)
+        if qd.static(block_dim > 1):
+            for i_k in qd.static(range(N_COLUMN_SLOTS)):
+                column_vert_range = su.qd_lane_local_get(columns_vert_range, i_k, block_dim)
+                lanes_column_left[i_k] = su.qd_block_ballot(
+                    i_k * block_dim + tid < n_columns and column_vert_range[1] > column_vert_range[0]
+                )
+        # The start and count of the verts left in the column the batches of the full scan walk
+        column_vert_start = 0
+        n_column_verts_left = 0
+        for i_group in range(n_groups):
+            i_v_min = -1
+            i_c_start = 0
+            i_c_end = 0
+            if not seeded:
+                if qd.static(block_dim > 1):
+                    i_c_end = n_scan_verts
+                else:
+                    column_vert_range = su.qd_lane_slot_read(columns_vert_range, i_group, block_dim)
+                    i_c_start = column_vert_range[0]
+                    i_c_end = column_vert_range[1]
+            else:
+                if i_group == 0:
                     i_v_min = sdf.sdf_func_find_closest_vert(
                         i_ga, i_b, center_b_world, dyn_state, dyn_info, collider_info
                     )
-                elif i_seed <= n_prev:
-                    seed_pos = collider_state.contact_data.pos[i_contact_top - i_seed, i_b]
+                elif i_group <= n_prev:
+                    i_c_seed = su.qd_lane_slot_read(contacts_slot, n_prev - i_group, block_dim)
+                    seed_pos = collider_state.contact_data.pos[i_c_seed, i_b]
                     i_v_min = sdf.sdf_func_find_closest_vert(i_ga, i_b, seed_pos, dyn_state, dyn_info, collider_info)
                 if i_v_min >= 0:
-                    for k in range(n_max):
-                        if k < n_seen and seen_verts[k] == i_v_min:
-                            i_v_min = -1
+                    if su.qd_is_lane_slot_seen(seen_verts, n_seen, i_v_min, tid, block_dim):
+                        i_v_min = -1
                 if i_v_min >= 0:
                     i_v_start = i_v_min
                     pos_min = gu.qd_transform_by_trans_quat(dyn_info.verts.init_pos[i_v_min], ga_pos, ga_quat)
@@ -268,17 +299,28 @@ def func_add_polytope_vertex_contacts_sdf(
                     i_v_cur = -1
                     while i_v_cur != i_v_min:
                         i_v_cur = i_v_min
-                        for i_neighbor_ in range(
-                            collider_info.vert_neighbor_start[i_v_cur],
-                            collider_info.vert_neighbor_start[i_v_cur] + collider_info.vert_n_neighbors[i_v_cur],
-                        ):
-                            i_neighbor = collider_info.vert_neighbors[i_neighbor_]
-                            pos_neighbor = gu.qd_transform_by_trans_quat(
-                                dyn_info.verts.init_pos[i_neighbor], ga_pos, ga_quat
-                            )
-                            sd_neighbor = sdf.sdf_func_world_local(
-                                i_gb, pos_neighbor, gb_pos, gb_quat, dyn_info.geoms, collider_info.sdf
-                            )
+                        i_n_start = collider_info.vert_neighbor_start[i_v_cur]
+                        n_neighbors = collider_info.vert_n_neighbors[i_v_cur]
+                        # The lanes evaluate a block_dim of neighbors at once, the block keeping the lowest SD and,
+                        # among equal ones, the first neighbor in order, which is the one the serial walk keeps. A
+                        # lane without neighbor holds the current minimum, which never displaces it.
+                        for i_chunk_ in range((n_neighbors + block_dim - 1) // block_dim):
+                            i_n_ = i_chunk_ * block_dim + tid
+                            i_neighbor = -1
+                            sd_neighbor = sd_min
+                            if i_n_ < n_neighbors:
+                                i_neighbor = collider_info.vert_neighbors[i_n_start + i_n_]
+                                pos_neighbor = gu.qd_transform_by_trans_quat(
+                                    dyn_info.verts.init_pos[i_neighbor], ga_pos, ga_quat
+                                )
+                                sd_neighbor = sdf.sdf_func_world_local(
+                                    i_gb, pos_neighbor, gb_pos, gb_quat, dyn_info.geoms, collider_info.sdf
+                                )
+                            if qd.static(block_dim > 1):
+                                sd_best = su.qd_block_min(sd_neighbor)
+                                i_lane = qd.math.ffs(su.qd_block_ballot(sd_neighbor == sd_best)) - 1
+                                i_neighbor = su.qd_block_shuffle(i_neighbor, i_lane)
+                                sd_neighbor = sd_best
                             # Strict decrease guarantees termination: values strictly descend over a finite vertex
                             # set, so no vertex can be revisited even on numerically flat plateaus.
                             if sd_neighbor < sd_min:
@@ -286,55 +328,134 @@ def func_add_polytope_vertex_contacts_sdf(
                                 sd_min = sd_neighbor
                     # The final minimum is checked against the basins found so far BEFORE this seed's own start is
                     # recorded, so a seed that starts at the minimum still emits.
-                    for k in range(n_max):
-                        if k < n_seen and seen_verts[k] == i_v_min:
-                            i_v_min = -1
+                    if su.qd_is_lane_slot_seen(seen_verts, n_seen, i_v_min, tid, block_dim):
+                        i_v_min = -1
                     if n_seen < n_max:
-                        seen_verts[n_seen] = i_v_start
+                        su.qd_lane_slot_write(seen_verts, n_seen, i_v_start, tid, block_dim)
                         n_seen = n_seen + 1
                     if i_v_min >= 0 and i_v_min != i_v_start and n_seen < n_max:
-                        seen_verts[n_seen] = i_v_min
+                        su.qd_lane_slot_write(seen_verts, n_seen, i_v_min, tid, block_dim)
                         n_seen = n_seen + 1
                 if i_v_min >= 0:
-                    # Candidates are the minimum itself and its 1-ring (the leading index selects the minimum).
-                    # Unlike the full scan, the verification only emits UNAMBIGUOUS penetrations: the first scan
-                    # already supplies the near-surface approach band from the other side, and duplicating it here
-                    # with grid-noise-level pens and grid-smoothed normals disturbs tuned interfaces (it decouples
-                    # the pitch of a threaded nut-bolt pair and injects residual jitter into a settled pile). A
-                    # quarter-cell floor keeps grid noise out while a genuine wall crossing (at least half a wall
-                    # thickness deep) clears it long before locking.
-                    for i_c in range(
-                        collider_info.vert_neighbor_start[i_v_min] - 1,
-                        collider_info.vert_neighbor_start[i_v_min] + collider_info.vert_n_neighbors[i_v_min],
-                    ):
-                        i_v = i_v_min
-                        if i_c >= collider_info.vert_neighbor_start[i_v_min]:
+                    # The leading index of the range selects the minimum itself, the others its 1-ring.
+                    i_c_start = collider_info.vert_neighbor_start[i_v_min] - 1
+                    i_c_end = collider_info.vert_neighbor_start[i_v_min] + collider_info.vert_n_neighbors[i_v_min]
+            # The lanes split the vert range in batches of block_dim verts, each lane running the gate and the SDF query
+            # of one vert of the batch. The verts kept for insertion are then inserted one at a time in vert order,
+            # every lane updating its own copy of the buffer alike, so the buffer is the one the serial scan selects.
+            for i_batch in range((i_c_end - i_c_start + block_dim - 1) // block_dim):
+                # Read by every lane ahead of the per-vert branches, which only some lanes enter
+                pen_weakest = su.qd_lane_slot_read(top_pen, weakest_idx, block_dim)
+                i_c = i_c_start + i_batch * block_dim + tid
+                is_vert = i_c < i_c_end
+                if qd.static(block_dim > 1):
+                    if not seeded:
+                        # The lanes take the next verts of the columns in order, from the column the last batch stopped in.
+                        i_c = -1
+                        n_lanes_filled = 0
+                        for i_fill_ in range(n_columns):
+                            if n_lanes_filled == block_dim:
+                                break
+                            if n_column_verts_left == 0:
+                                i_column = su.qd_lane_mask_pop_first(lanes_column_left, n_columns, block_dim)
+                                if i_column == n_columns:
+                                    break
+                                column_vert_range = su.qd_lane_slot_read(columns_vert_range, i_column, block_dim)
+                                column_vert_start = column_vert_range[0]
+                                n_column_verts_left = column_vert_range[1] - column_vert_range[0]
+                            n_taken = qd.min(n_column_verts_left, block_dim - n_lanes_filled)
+                            if tid >= n_lanes_filled and tid < n_lanes_filled + n_taken:
+                                i_c = column_vert_start + tid - n_lanes_filled
+                            n_lanes_filled = n_lanes_filled + n_taken
+                            column_vert_start = column_vert_start + n_taken
+                            n_column_verts_left = n_column_verts_left - n_taken
+                        is_vert = i_c >= 0
+                i_v = i_v_min
+                vertex_pos = qd.Vector.zero(gs.qd_float, 3)
+                pen_v = gs.qd_float(0.0)
+                is_inserted = False
+                if is_vert:
+                    vertex_local = qd.Vector.zero(gs.qd_float, 3)
+                    if not seeded:
+                        i_v = collider_info.verts_spatial_grid.verts_idx[i_c]
+                        vertex_local = collider_info.verts_spatial_grid.verts_pos[i_c]
+                    else:
+                        if i_c > i_c_start:
                             i_v = collider_info.vert_neighbors[i_c]
-                        vertex_pos = gu.qd_transform_by_trans_quat(dyn_info.verts.init_pos[i_v], ga_pos, ga_quat)
-                        pen_v = -sdf.sdf_func_world_local(
-                            i_gb, vertex_pos, gb_pos, gb_quat, dyn_info.geoms, collider_info.sdf
+                        vertex_local = dyn_info.verts.init_pos[i_v]
+                    vertex_pos = gu.qd_transform_by_trans_quat(vertex_local, ga_pos, ga_quat)
+                    is_candidate = True
+                    if not seeded:
+                        is_candidate = func_point_in_geom_aabb(i_gb, i_b, vertex_pos, 0.0, dyn_state)
+                    if is_candidate:
+                        is_in_band, sd_v = sdf.sdf_func_world_local_banded(
+                            i_gb, vertex_pos, gb_pos, gb_quat, band, dyn_info, collider_info
                         )
-                        if pen_v > 0.25 * margin:
-                            close_idx = -1
-                            for k in range(n_max):
-                                if close_idx < 0 and top_iv[k] >= 0:
+                        pen_v = -sd_v
+                        # A vert no deeper than the shallowest kept one (at weakest_idx, the first of minimal pen, an
+                        # empty slot being the shallowest) can neither replace a close kept vert nor displace the
+                        # weakest, which spares the insertion for most verts of a dense mesh once the buffer is full.
+                        # Insertions only ever deepen the buffer, so a vert failing this test at the start of its batch
+                        # fails it at its turn as well.
+                        is_inserted = is_in_band and pen_v > pen_weakest
+                # The lanes holding a vert to insert, taken in lane order, which is vert order
+                n_inserted = qd.cast(is_inserted, gs.qd_int)
+                lanes_inserted = qd.u32(0)
+                if qd.static(block_dim > 1):
+                    lanes_inserted = su.qd_block_ballot(is_inserted)
+                    n_inserted = qd.cast(qd.math.popcnt(lanes_inserted), gs.qd_int)
+                for i_rank in range(n_inserted):
+                    i_v_new = i_v
+                    pos_new = vertex_pos
+                    pen_new = pen_v
+                    if qd.static(block_dim > 1):
+                        i_lane = qd.math.ffs(lanes_inserted) - 1
+                        lanes_inserted = lanes_inserted & (lanes_inserted - 1)
+                        i_v_new = su.qd_block_shuffle(i_v, i_lane)
+                        pen_new = su.qd_block_shuffle(pen_v, i_lane)
+                        for j in qd.static(range(3)):
+                            pos_new[j] = su.qd_block_shuffle(vertex_pos[j], i_lane)
+                    if pen_new > su.qd_lane_slot_read(top_pen, weakest_idx, block_dim):
+                        # Each lane tests the kept verts it holds, the block keeping the first one closer than the
+                        # diversity radius.
+                        i_close = n_max
+                        for i_k in range(N_SLOTS):
+                            k = i_k * block_dim + tid
+                            if k < n_max:
+                                i_v_kept = su.qd_lane_local_get(top_iv, i_k, block_dim)
+                                if i_v_kept >= 0:
                                     other_pos = gu.qd_transform_by_trans_quat(
-                                        dyn_info.verts.init_pos[top_iv[k]], ga_pos, ga_quat
+                                        dyn_info.verts.init_pos[i_v_kept], ga_pos, ga_quat
                                     )
-                                    if (vertex_pos - other_pos).norm() < diversity_radius:
-                                        close_idx = k
-                            if close_idx >= 0:
-                                if pen_v > top_pen[close_idx]:
-                                    top_pen[close_idx] = pen_v
-                                    top_iv[close_idx] = i_v
-                            else:
-                                weakest_idx = 0
-                                for k in range(1, n_max):
-                                    if top_pen[k] < top_pen[weakest_idx]:
+                                    if (pos_new - other_pos).norm() < diversity_radius:
+                                        i_close = k
+                                        break
+                        if qd.static(block_dim > 1):
+                            i_close = su.qd_lane_slot_min(i_close, n_max, N_SLOTS, block_dim)
+                        i_put = weakest_idx
+                        if i_close < n_max:
+                            i_put = -1
+                            if pen_new > su.qd_lane_slot_read(top_pen, i_close, block_dim):
+                                i_put = i_close
+                        if i_put >= 0:
+                            su.qd_lane_slot_write(top_pen, i_put, pen_new, tid, block_dim)
+                            su.qd_lane_slot_write(top_iv, i_put, i_v_new, tid, block_dim)
+                            # Each lane finds the first slot of minimal pen among the slots it holds, the block keeping
+                            # the lowest slot holding the minimum.
+                            pen_min = su.qd_lane_slot_read(top_pen, weakest_idx, block_dim)
+                            weakest_idx = n_max
+                            for i_k in range(N_SLOTS):
+                                k = i_k * block_dim + tid
+                                if k < n_max:
+                                    pen_k = su.qd_lane_local_get(top_pen, i_k, block_dim)
+                                    if weakest_idx == n_max or pen_k < pen_min:
+                                        pen_min = pen_k
                                         weakest_idx = k
-                                if pen_v > top_pen[weakest_idx]:
-                                    top_pen[weakest_idx] = pen_v
-                                    top_iv[weakest_idx] = i_v
+                            if qd.static(block_dim > 1):
+                                pen_min_block = su.qd_block_min(pen_min)
+                                weakest_idx = su.qd_lane_slot_min(
+                                    weakest_idx if pen_min <= pen_min_block else n_max, n_max, N_SLOTS, block_dim
+                                )
 
         # Pass 2: emit contacts at the selected vertices. Reference normal is the grid SDF gradient sampled at A's
         # center, which gives a stable per-patch normal whenever A is small relative to B's features. Per-vertex
@@ -343,9 +464,24 @@ def func_add_polytope_vertex_contacts_sdf(
         # that opposes the reference indicates the vertex is closer to B's OPPOSITE surface across a thin feature,
         # i.e. A has partially tunneled through; using its raw grad would push A further through, so we fall back
         # to the reference direction.
-        grad_center = sdf.sdf_func_grad_world_local(
-            i_gb, center_a_world, gb_pos, gb_quat, dyn_info.geoms, rigid_info, collider_info.sdf, collider_static_config
-        )
+        # The pair-level normal and depth below only serve the kept verts, so a single lane skips them for a scan that
+        # kept none, where the lanes of a block run them at no gain. The buffer fills from its first slot, the weakest
+        # slot being the first empty one, so it holds a vert if that one does.
+        is_vert_kept = True
+        if qd.static(block_dim == 1):
+            is_vert_kept = top_iv[0] >= 0
+        grad_center = qd.Vector.zero(gs.qd_float, 3)
+        if is_vert_kept:
+            grad_center = sdf.sdf_func_grad_world_local(
+                i_gb,
+                center_a_world,
+                gb_pos,
+                gb_quat,
+                dyn_info.geoms,
+                rigid_info,
+                collider_info.sdf,
+                collider_static_config,
+            )
         normal_center = gu.qd_normalize(grad_center, EPS)
         # When two comparably-sized bodies meet "across" each other (the crossed-thin-rod regime: A's center sits within
         # one A-bounding-radius of B's surface, with both bodies of similar bounding-sphere size), the grid SDF gradient
@@ -356,7 +492,7 @@ def func_add_polytope_vertex_contacts_sdf(
         # the FINAL normal rather than letting per-vertex grad override it. The size-ratio gate keeps the existing
         # behavior for one-big-one-small pairs where the SDF grad at A's center is reliable and the closing-direction
         # line is wrong (sphere on a large floor mesh).
-        is_closing_regime = qd.abs(sd_center) < rbound_a and rbound_a_sq > 0.25 * rbound_b_sq
+        is_closing_regime = is_vert_kept and qd.abs(sd_center) < rbound_a and rbound_a_sq > 0.25 * rbound_b_sq
         approach_depth_pair = gs.qd_float(0.0)
         closing_normal = qd.Vector.zero(gs.qd_float, 3)
         # Set when A wraps around B so that B passes through A along the center-to-center axis. There the SDF gradient
@@ -450,11 +586,15 @@ def func_add_polytope_vertex_contacts_sdf(
                         approach_depth_pair = depth_a + depth_b - seg_len
             else:
                 is_closing_regime = False
-        for k in range(n_max):
-            if top_iv[k] >= 0:
-                i_v = top_iv[k]
+        # The normal and the penetration of every kept vert depend on that vert alone, so each lane works out those of
+        # the slots it holds (see su.qd_lane_vector_get), and the contacts are then emitted one slot after the other.
+        emit_pen = qd.Vector.zero(gs.qd_float, N_SLOTS)
+        emit_normal = qd.Matrix.zero(gs.qd_float, N_SLOTS, 3)
+        for i_k in range(N_SLOTS):
+            i_v = su.qd_lane_local_get(top_iv, i_k, block_dim)
+            pen_v = su.qd_lane_local_get(top_pen, i_k, block_dim)
+            if i_k * block_dim + tid < n_max and i_v >= 0:
                 vertex_pos = gu.qd_transform_by_trans_quat(dyn_info.verts.init_pos[i_v], ga_pos, ga_quat)
-                pen_v = top_pen[k]
                 grad_v = sdf.sdf_func_grad_world_local(
                     i_gb,
                     vertex_pos,
@@ -474,7 +614,6 @@ def func_add_polytope_vertex_contacts_sdf(
                 # - Clean (|grad| > 0.9): trust the kernel pen.
                 grad_norm = grad_v.norm()
                 pen_emit = gs.qd_float(0.0)
-                contact_pos_v = vertex_pos
                 if grad_norm < 0.5:
                     if pen_v > 0.0:
                         pen_emit = qd.min(pen_v, margin)
@@ -522,11 +661,50 @@ def func_add_polytope_vertex_contacts_sdf(
                 # the actual overlap rather than just the radial gap.
                 if is_closing_regime and pen_v > 0.0 and approach_depth_pair > pen_emit:
                     pen_emit = approach_depth_pair
+                su.qd_lane_local_set(emit_pen, i_k, pen_emit, block_dim)
+                su.qd_lane_local_set(emit_normal, i_k, normal_v, block_dim)
+        # Most slots are left empty by the scan, so on GPU the emission only visits the occupied ones, taken in slot
+        # order from a ballot of the lanes per row of slots.
+        n_emit_slots = n_max
+        lanes_occupied = qd.Vector.zero(qd.u32, N_SLOTS)
+        if qd.static(block_dim > 1):
+            n_emit_slots = 0
+            for i_k in qd.static(range(N_SLOTS)):
+                lanes_occupied[i_k] = su.qd_block_ballot(
+                    i_k * block_dim + tid < n_max and su.qd_lane_local_get(top_iv, i_k, block_dim) >= 0
+                )
+                n_emit_slots = n_emit_slots + qd.cast(qd.math.popcnt(lanes_occupied[i_k]), gs.qd_int)
+        # Where the scan cannot reach the pair budget, on GPU its contacts are decided first, each lane keeping the
+        # positions of the slots it holds for the repeated-contact check, then written at once from a single reservation
+        # of the contact buffer, one lane per contact. At the budget, a contact may displace an earlier one, so they are
+        # written one after the other.
+        is_batched = False
+        if qd.static(block_dim > 1):
+            is_batched = n_added + n_emit_slots <= n_max
+        lanes_emitted = qd.Vector.zero(qd.u32, N_SLOTS)
+        emit_pos = qd.Matrix.zero(gs.qd_float, N_SLOTS, 3)
+        for i_emit in range(n_emit_slots):
+            k = i_emit
+            if qd.static(block_dim > 1):
+                k = su.qd_lane_mask_pop_first(lanes_occupied, n_max, block_dim)
+            i_v = su.qd_lane_slot_read(top_iv, k, block_dim)
+            if i_v >= 0:
+                pen_emit = su.qd_lane_slot_read(emit_pen, k, block_dim)
+                normal_v = su.qd_lane_slot_read(emit_normal, k, block_dim)
+                contact_pos_v = gu.qd_transform_by_trans_quat(dyn_info.verts.init_pos[i_v], ga_pos, ga_quat)
+                # Each lane tests the contacts of the pair whose slots it holds, the block combining the answers
                 is_repeated = False
-                for j in range(n_added):
-                    idx_prev = collider_state.n_contacts[i_b] - 1 - j
-                    if (contact_pos_v - collider_state.contact_data.pos[idx_prev, i_b]).norm() < tolerance:
-                        is_repeated = True
+                for i_k in range(N_SLOTS):
+                    if i_k * block_dim + tid < n_added:
+                        idx_prev = su.qd_lane_local_get(contacts_slot, i_k, block_dim)
+                        if (contact_pos_v - collider_state.contact_data.pos[idx_prev, i_b]).norm() < tolerance:
+                            is_repeated = True
+                if qd.static(block_dim > 1):
+                    for i_k in qd.static(range(N_SLOTS)):
+                        if (lanes_emitted[i_k] >> qd.u32(tid)) & qd.u32(1) != 0:
+                            if (contact_pos_v - emit_pos[i_k, :]).norm() < tolerance:
+                                is_repeated = True
+                    is_repeated = su.qd_block_any(is_repeated)
                 if not is_repeated and pen_emit > 0.0:
                     # Snap the contact position onto A's smooth surface when A is a smooth primitive
                     # (SPHERE/ELLIPSOID/CAPSULE). The tessellation vertex sits an O(tessellation chord error) inboard
@@ -545,41 +723,49 @@ def func_add_polytope_vertex_contacts_sdf(
                         dyn_info,
                         rigid_config,
                     )
-                    if n_added < n_max:
-                        func_add_contact(
-                            i_ga,
-                            i_gb,
-                            i_b,
-                            i_pair,
-                            normal_v,
-                            contact_pos_v,
-                            pen_emit,
-                            dyn_state,
-                            collider_state,
-                            dyn_info,
-                            rigid_info,
-                            collider_info,
-                            use_atomic=False,
-                            errno=errno,
-                        )
-                        n_added = n_added + 1
+                    if is_batched:
+                        su.qd_lane_slot_write(emit_pos, k, contact_pos_v, tid, block_dim)
+                        for i_k in qd.static(range(N_SLOTS)):
+                            if k // block_dim == i_k:
+                                lanes_emitted[i_k] = lanes_emitted[i_k] | (qd.u32(1) << qd.u32(k % block_dim))
                     else:
-                        # The pair budget is shared between the two scans: at the cap, a new contact may only
-                        # displace the pair's least-penetrating one, keeping the n_max deepest.
-                        weakest_idx = -1
-                        weakest_pen = pen_emit
-                        for j in range(n_max):
-                            if j < n_added:
-                                idx_prev = collider_state.n_contacts[i_b] - 1 - j
-                                if collider_state.contact_data.penetration[idx_prev, i_b] < weakest_pen:
-                                    weakest_pen = collider_state.contact_data.penetration[idx_prev, i_b]
-                                    weakest_idx = idx_prev
-                        if weakest_idx >= 0:
+                        # The first lane writes the contacts of the block, whose slots every lane reads back. A new
+                        # contact takes a fresh slot of the buffer, and the contact it displaces at the cap otherwise,
+                        # both written by the same call.
+                        i_c = -1
+                        if n_added < n_max:
+                            if tid == 0:
+                                i_c = func_reserve_contacts(
+                                    i_b,
+                                    n_contacts=1,
+                                    collider_state=collider_state,
+                                    collider_info=collider_info,
+                                    use_atomic=qd.static(rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL),
+                                    errno=errno,
+                                )
+                                if i_c >= collider_info.max_candidate_contacts[None]:
+                                    i_c = -1
+                            if qd.static(block_dim > 1):
+                                i_c = su.qd_block_shuffle(i_c, 0)
+                            if i_c >= 0:
+                                su.qd_lane_slot_write(contacts_slot, n_added, i_c, tid, block_dim)
+                                n_added = n_added + 1
+                        else:
+                            # The pair budget is shared between the two scans: at the cap, a new contact may only
+                            # displace the pair's least-penetrating one, keeping the n_max deepest.
+                            weakest_pen = pen_emit
+                            for j in range(n_max):
+                                if j < n_added:
+                                    idx_prev = su.qd_lane_slot_read(contacts_slot, n_added - 1 - j, block_dim)
+                                    if collider_state.contact_data.penetration[idx_prev, i_b] < weakest_pen:
+                                        weakest_pen = collider_state.contact_data.penetration[idx_prev, i_b]
+                                        i_c = idx_prev
+                        if i_c >= 0 and tid == 0:
                             func_set_contact(
                                 i_ga,
                                 i_gb,
                                 i_b,
-                                weakest_idx,
+                                i_c,
                                 i_pair,
                                 normal_v,
                                 contact_pos_v,
@@ -591,6 +777,61 @@ def func_add_polytope_vertex_contacts_sdf(
                                 collider_info,
                                 errno,
                             )
+                        # Every lane reads the contact back, for the repeated-contact check and the seeds.
+                        if qd.static(block_dim > 1):
+                            qd.simt.block.sync()
+        if is_batched:
+            n_emitted = 0
+            for i_k in qd.static(range(N_SLOTS)):
+                n_emitted = n_emitted + qd.cast(qd.math.popcnt(lanes_emitted[i_k]), gs.qd_int)
+            if n_emitted > 0:
+                i_c_base = 0
+                if tid == 0:
+                    i_c_base = func_reserve_contacts(
+                        i_b,
+                        n_emitted,
+                        collider_state,
+                        collider_info,
+                        use_atomic=qd.static(rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL),
+                        errno=errno,
+                    )
+                i_c_base = su.qd_block_shuffle(i_c_base, 0)
+                max_contacts = collider_info.max_candidate_contacts[None]
+                # The contacts take the reserved slots in the order of the slots of their verts
+                n_emitted_before = 0
+                for i_k in range(N_SLOTS):
+                    lanes = su.qd_lane_local_get(lanes_emitted, i_k, block_dim)
+                    if (lanes >> qd.u32(tid)) & qd.u32(1) != 0:
+                        i_c = i_c_base + n_emitted_before
+                        i_c = i_c + qd.cast(qd.math.popcnt(lanes & ((qd.u32(1) << qd.u32(tid)) - qd.u32(1))), gs.qd_int)
+                        if i_c < max_contacts:
+                            func_set_contact(
+                                i_ga,
+                                i_gb,
+                                i_b,
+                                i_c,
+                                i_pair,
+                                su.qd_lane_local_get(emit_normal, i_k, block_dim),
+                                su.qd_lane_local_get(emit_pos, i_k, block_dim),
+                                su.qd_lane_local_get(emit_pen, i_k, block_dim),
+                                dyn_state,
+                                collider_state,
+                                dyn_info,
+                                rigid_info,
+                                collider_info,
+                                errno,
+                            )
+                    n_emitted_before = n_emitted_before + qd.cast(qd.math.popcnt(lanes), gs.qd_int)
+                n_stored = qd.max(qd.min(max_contacts - i_c_base, n_emitted), 0)
+                for i_k in qd.static(range(N_SLOTS)):
+                    i_added = i_k * block_dim + tid
+                    if i_added >= n_added and i_added < n_added + n_stored:
+                        contacts_slot[i_k] = i_c_base + i_added - n_added
+                n_added = n_added + n_stored
+                # Every lane reads the contacts back in the next scan of the pair, for its seeds and repeated contacts.
+                if qd.static(block_dim > 1):
+                    qd.simt.block.sync()
+    return n_added, contacts_slot
 
 
 @qd.func
@@ -990,7 +1231,7 @@ def func_add_polytope_vertex_contacts_sdf_shell(
                 dyn_info,
                 rigid_info,
                 collider_info,
-                use_atomic=False,
+                use_atomic=qd.static(rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL),
                 errno=errno,
             )
 
@@ -1371,8 +1612,9 @@ def func_contact_mpr_terrain(
                 if i_detection > 0 and not face_face_0:
                     break
                 if i_detection > 0:
-                    axis = (2 * (i_detection % 2) - 1) * axis_0 + (1 - 2 * ((i_detection // 2) % 2)) * axis_1
-                    qrot = gu.qd_rotvec_to_quat(collider_info.mc_perturbation[None] * axis, EPS)
+                    axis = axis_0 if i_detection < 3 else axis_1
+                    angle_sign = 2 * (i_detection % 2) - 1
+                    qrot = gu.qd_rotvec_to_quat(angle_sign * collider_info.mc_perturbation[None] * axis, EPS)
                     ga_pos_curr, ga_quat_curr = func_rotate_frame(ga_pos, ga_quat, contact_pos_0, qrot)
                     ga_pos_tf, ga_quat_tf = gu.qd_transform_pos_quat_by_trans_quat(
                         ga_pos_curr - gb_pos, ga_quat_curr, qd.Vector.zero(gs.qd_float, 3), gu.qd_inv_quat(gb_quat)
@@ -1582,8 +1824,14 @@ def func_recompute_perturbed_contact(
     # qrot is applied to geom A and its inverse to geom B
     R = gu.qd_quat_to_R(qrot, EPS)
     R_inv = R.transpose()
-    witness_a = R_inv @ ((contact_pos - 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
-    witness_b = R @ ((contact_pos + 0.5 * penetration * normal) - contact_pos_0) + contact_pos_0
+    witness_a = contact_pos - 0.5 * penetration * normal
+    witness_b = contact_pos + 0.5 * penetration * normal
+    if used_gjk:
+        # The polytope face normal can differ from the witness separation, so recover each material point directly
+        witness_a = gjk_state.witness.point_obj1[i_scratch, 0]
+        witness_b = gjk_state.witness.point_obj2[i_scratch, 0]
+    witness_a = R_inv @ (witness_a - contact_pos_0) + contact_pos_0
+    witness_b = R @ (witness_b - contact_pos_0) + contact_pos_0
 
     # Geom A lies on the positive side of the normal, so that the depth at the witness of geom A is the height of the
     # surface of geom B above it, and the depth at the witness of geom B its height above the surface of geom A
@@ -1614,15 +1862,43 @@ def func_recompute_perturbed_contact(
         # MPR leave the portal unwritten.
         has_supports = True
         for i_v in qd.static(range(3)):
-            support_a = mpr_state.simplex_support.v1[i_v + 1, i_scratch]
-            support_b = mpr_state.simplex_support.v2[i_v + 1, i_scratch]
+            support_a = qd.Vector.zero(gs.qd_float, 3)
+            support_b = qd.Vector.zero(gs.qd_float, 3)
             if used_gjk:
                 i_f = gjk_state.nearest_face[i_scratch]
                 i_pv = gjk_state.polytope_faces.verts_idx[i_scratch, i_f][i_v]
-                support_a = gjk_state.polytope_verts.obj1[i_scratch, i_pv]
-                support_b = gjk_state.polytope_verts.obj2[i_scratch, i_pv]
-            supports_a[i_v, :] = R_inv @ (support_a - contact_pos_0) + contact_pos_0
-            supports_b[i_v, :] = R @ (support_b - contact_pos_0) + contact_pos_0
+                # Boxes, meshes and spheres provide native local supports. Other supports are stored in world space.
+                geom_type_a = dyn_info.geoms.type[i_ga]
+                geom_type_b = dyn_info.geoms.type[i_gb]
+                if (
+                    geom_type_a == gs.GEOM_TYPE.BOX
+                    or geom_type_a == gs.GEOM_TYPE.MESH
+                    or geom_type_a == gs.GEOM_TYPE.SPHERE
+                ):
+                    support_a = gu.qd_transform_by_trans_quat(
+                        gjk_state.polytope_verts.local_obj1[i_scratch, i_pv], ga_pos_original, ga_quat_original
+                    )
+                else:
+                    support_a = gjk_state.polytope_verts.obj1[i_scratch, i_pv]
+                    support_a = R_inv @ (support_a - contact_pos_0) + contact_pos_0
+                if (
+                    geom_type_b == gs.GEOM_TYPE.BOX
+                    or geom_type_b == gs.GEOM_TYPE.MESH
+                    or geom_type_b == gs.GEOM_TYPE.SPHERE
+                ):
+                    support_b = gu.qd_transform_by_trans_quat(
+                        gjk_state.polytope_verts.local_obj2[i_scratch, i_pv], gb_pos_original, gb_quat_original
+                    )
+                else:
+                    support_b = gjk_state.polytope_verts.obj2[i_scratch, i_pv]
+                    support_b = R @ (support_b - contact_pos_0) + contact_pos_0
+            else:
+                support_a = mpr_state.simplex_support.v1[i_v + 1, i_scratch]
+                support_b = mpr_state.simplex_support.v2[i_v + 1, i_scratch]
+                support_a = R_inv @ (support_a - contact_pos_0) + contact_pos_0
+                support_b = R @ (support_b - contact_pos_0) + contact_pos_0
+            supports_a[i_v, :] = support_a
+            supports_b[i_v, :] = support_b
 
         # The support points of a geom that line up along the normal of contact 0 span a vertex or an edge of it, whose
         # two farthest points are the ends of the edge, rows 2 * i_g of 'ends' for geom i_g
@@ -1737,7 +2013,9 @@ def func_recompute_perturbed_contact(
                                     contact_pos = witness + (0.5 if qd.static(i_g == 0) else -0.5) * bound * normal_0
                                     has_depth_estimate = True
 
-    if not has_depth_estimate:
+    # Available support triangles define the unperturbed normal below. Un-rotating the detection normal instead mixes
+    # lateral witness separation into depth when the detection combines different support features.
+    if not has_depth_estimate and not has_supports:
         # The un-rotated perturbed normal is the normal of the tangent plane of the other geom at its witness, against
         # which the anchor witness measures its depth. A plane tilted beyond the relative rotation of both geoms belongs
         # to another face, along which this depth is ill-conditioned, so that the separation of both witnesses stays.
@@ -1752,10 +2030,8 @@ def func_recompute_perturbed_contact(
                 contact_pos = witness_b - 0.5 * depth * normal_0
             has_depth_estimate = True
 
-    # Without any of the estimates above, the separation of both witnesses along the normal of contact 0 carries none
-    # of the depth: the detection resolved another face of the Minkowski difference, another patch. The contact keeps
-    # the normal of that face and the depth along it on the unperturbed geoms. The support points span the face, whose
-    # normal is exact up to rounding, and the normal of the detection stands in for a face too thin to be oriented.
+    # When the projected support triangles miss the witnesses, their Minkowski normal measures the separation on the
+    # unperturbed geoms. The detection normal stands in for a support triangle too thin to be oriented.
     contact_normal = normal_0
     if not has_depth_estimate:
         contact_normal = normal
@@ -1905,6 +2181,7 @@ def func_contact_overlap_axes(
     ga_quat: qd.types.vector(4),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
+    axes: qd.types.matrix(4, 3),
     collider_state: array_class.ColliderState,
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
@@ -1927,10 +2204,8 @@ def func_contact_overlap_axes(
     targets the four that carry the most area together with the corner of contact 0, which needs no detection, so that
     the contacts of the pair are as many corners of the patch.
 
-    Returns the rotation axis of each detection, scaled to multiply the perturbation magnitude. A detection left without
-    corner to target gets a zero axis and is skipped. A degenerate overlap, of no area, keeps for every detection the
-    default combination of 'axis_0' and 'axis_1', so that a contact without patch is perturbed as it would be without
-    any aim at all.
+    Returns the unit rotation axes and the merge distance. Targets within that distance of contact 0 or an earlier
+    target receive a zero axis. Degenerate overlaps retain the default axes and the geom-scale merge distance.
     """
     EPS = rigid_info.EPS[None]
     # Support points that coincide up to the rounding of their world coordinates and of contact 0 they are taken from,
@@ -1990,6 +2265,13 @@ def func_contact_overlap_axes(
                             if distance_min < 0.0 or distance < distance_min:
                                 distance_min = distance
                                 i_e_refine = j_e
+                    # Both directed seed edges span the same segment. Contact 0 selects the side to refine first
+                    if polygons_size[i_g_refine] == 2 and edges_settled[i_g_refine] == 0:
+                        i_k0 = 8 * i_g_refine
+                        edge_x = polygons[i_k0 + 1, 0] - polygons[i_k0, 0]
+                        edge_y = polygons[i_k0 + 1, 1] - polygons[i_k0, 1]
+                        side = edge_y * polygons[i_k0, 0] - edge_x * polygons[i_k0, 1]
+                        i_e_refine = 0 if side <= 0.0 else 1
                     i_g, i_e = i_g_refine, i_e_refine
                     n_points = polygons_size[i_g]
                     i_k0 = 8 * i_g + i_e
@@ -2002,7 +2284,7 @@ def func_contact_overlap_axes(
             if is_query:
                 is_b = i_g == 1
                 # The relative perturbation sets the sampling angle so curved surfaces are sampled near the contact.
-                direction = 2.0 * qd.sqrt(2.0) * collider_info.mc_perturbation[None] * (
+                direction = 2.0 * collider_info.mc_perturbation[None] * (
                     direction_x * axis_0 + direction_y * axis_1
                 ) + (normal if is_b else -normal)
                 support_offset = (
@@ -2375,21 +2657,26 @@ def func_contact_overlap_axes(
                     i_k3_best = (i_k_start + i_k3_best_) % n_overlap
                     targets = qd.Vector([i_k0, i_k1_best, i_k2, i_k3_best], dt=gs.qd_int)
 
-    # A tilt by 'mc_perturbation' about a unit axis deepens the overlap by twice this angle per unit length, both geoms
-    # rotating in opposite directions, and an aimed axis keeps the magnitude of the default one it replaces, so that
-    # every detection tilts by the same angle however sharp its corner. A corner at contact 0, the pivot of every tilt,
-    # has its contact already and no tilt deepens it.
-    axes = qd.Matrix.zero(gs.qd_float, 4, 3)
+    # Area divided by perimeter scales with the narrow width of a patch, protecting thin overlaps from merging
+    overlap_merge_tolerance = collider_info.mc_tolerance[None] * geom_pair_scale
+    if not is_overlap_degenerate:
+        overlap_merge_tolerance = qd.min(overlap_merge_tolerance, 0.005 * qd.abs(overlap_area) / overlap_perimeter)
+    target_tolerance = qd.max(EPS * geom_pair_scale, overlap_merge_tolerance)
+    # Unit axes keep the perturbation angle independent of the selected target corner
     for i_t in qd.static(range(4)):
-        # The default axis combines both plane axes, since an axis aligned with a principal axis of inertia of the
-        # geometry is more sensitive to ill-conditioning
-        axis = (2 * ((i_t + 1) % 2) - 1) * axis_0 + (1 - 2 * (((i_t + 1) // 2) % 2)) * axis_1
+        axis = qd.Vector([axes[i_t, 0], axes[i_t, 1], axes[i_t, 2]])
         if not is_overlap_degenerate:
-            axis_norm = axis.norm()
             axis = qd.Vector.zero(gs.qd_float, 3)
             i_k = targets[i_t]
             if i_t < n_overlap:
-                if overlap[i_k, 0] ** 2 + overlap[i_k, 1] ** 2 > (EPS * geom_pair_scale) ** 2:
+                is_target_distinct = overlap[i_k, 0] ** 2 + overlap[i_k, 1] ** 2 > target_tolerance**2
+                for j_t in range(i_t):
+                    j_k = targets[j_t]
+                    axis_kept = qd.Vector([axes[j_t, 0], axes[j_t, 1], axes[j_t, 2]])
+                    gap = qd.Vector([overlap[i_k, 0] - overlap[j_k, 0], overlap[i_k, 1] - overlap[j_k, 1]])
+                    if axis_kept.norm_sqr() > 0.0 and gap.norm_sqr() <= target_tolerance**2:
+                        is_target_distinct = False
+                if is_target_distinct:
                     i_k_prev = (i_k + n_overlap - 1) % n_overlap
                     normal_prev = qd.Vector([edges_normal[i_k_prev, 0], edges_normal[i_k_prev, 1]]).normalized(EPS)
                     normal_next = qd.Vector([edges_normal[i_k, 0], edges_normal[i_k, 1]]).normalized(EPS)
@@ -2400,7 +2687,7 @@ def func_contact_overlap_axes(
                     # whole tilt, while flat faces deepen along the middle of the cone.
                     side_prev = (normal_next - normal_next.dot(normal_prev) * normal_prev).normalized(EPS)
                     side_next = (normal_prev - normal_prev.dot(normal_next) * normal_next).normalized(EPS)
-                    gain = 2.0 * collider_info.mc_perturbation[None] * axis_norm
+                    gain = 2.0 * collider_info.mc_perturbation[None]
                     margin_prev, margin_next = side_prev.dot(slope), side_next.dot(slope)
                     deepening_direction = side_prev
                     if margin_next + gain <= margin_prev + gain * side_prev.dot(side_next):
@@ -2417,10 +2704,12 @@ def func_contact_overlap_axes(
                         deepening_direction = ratio * direction_along + qd.sqrt(qd.max(1.0 - ratio**2, 0.0)) * (
                             direction_across
                         )
-                    axis = normal.cross(axis_norm * (deepening_direction[0] * axis_0 + deepening_direction[1] * axis_1))
+                    axis = gu.qd_normalize(
+                        normal.cross(deepening_direction[0] * axis_0 + deepening_direction[1] * axis_1), EPS
+                    )
         for i_3 in qd.static(range(3)):
             axes[i_t, i_3] = axis[i_3]
-    return axes
+    return axes, overlap_merge_tolerance
 
 
 @qd.func
@@ -2842,26 +3131,30 @@ def func_convex_convex_contact(
                             i_ga, i_gb, i_b, normal, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config
                         )
                         if qd.static(not rigid_config.enable_mujoco_compatibility):
-                            overlap_axes = func_contact_overlap_axes(
-                                i_ga,
-                                i_gb,
-                                i_b,
-                                normal,
-                                contact_pos,
-                                axis_0,
-                                axis_1,
-                                ga_pos_original,
-                                ga_quat_original,
-                                gb_pos_original,
-                                gb_quat_original,
-                                collider_state,
-                                dyn_info,
-                                rigid_info,
-                                collider_info,
-                                rigid_config,
-                                collider_static_config,
-                                geom_pair_scale,
-                            )
+                            overlap_axes = qd.Matrix.rows([axis_0, -axis_0, axis_1, -axis_1])
+                            if dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.PLANE:
+                                overlap_axes, overlap_merge_tolerance = func_contact_overlap_axes(
+                                    i_ga,
+                                    i_gb,
+                                    i_b,
+                                    normal,
+                                    contact_pos,
+                                    axis_0,
+                                    axis_1,
+                                    ga_pos_original,
+                                    ga_quat_original,
+                                    gb_pos_original,
+                                    gb_quat_original,
+                                    overlap_axes,
+                                    collider_state,
+                                    dyn_info,
+                                    rigid_info,
+                                    collider_info,
+                                    rigid_config,
+                                    collider_static_config,
+                                    geom_pair_scale,
+                                )
+                                tolerance = qd.min(tolerance, overlap_merge_tolerance)
                         n_con = 1
 
                     if qd.static(
@@ -2921,7 +3214,16 @@ def func_convex_convex_contact(
                     if not is_contact_duplicate:
                         idx_prev = collider_state.n_contacts[i_b] - 1 - i_c
                         contact_pos_kept = collider_state.contact_data.pos[idx_prev, i_b]
-                        if (contact_pos - contact_pos_kept).norm() < tolerance:
+                        # See the merge distance and precision floor in _func_multicontact_accept
+                        merge_tolerance = tolerance
+                        if qd.static(
+                            collider_static_config.ccd_algorithm
+                            not in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
+                        ):
+                            merge_tolerance = qd.sqrt(EPS) * geom_pair_scale
+                            merge_tolerance += EPS * (contact_pos.norm() + contact_pos_kept.norm())
+                            merge_tolerance = qd.max(merge_tolerance, tolerance)
+                        if (contact_pos - contact_pos_kept).norm() < merge_tolerance:
                             is_contact_duplicate = True
                             if qd.static(
                                 collider_static_config.ccd_algorithm
@@ -3104,6 +3406,8 @@ def _func_multicontact_detect(
     i_work: int,
     i_det_start: int,
     i_det_end: int,
+    overlap_axes: qd.types.matrix(4, 3),
+    overlap_merge_tolerance: float,
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -3162,6 +3466,8 @@ def _func_multicontact_detect(
 
     geom_pair_scale = func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB, dyn_info)
     tolerance = func_compute_mc_tolerance(i_ga, i_gb, geoms_init_AABB, dyn_info, collider_info, rigid_config)
+    if overlap_merge_tolerance > 0.0:
+        tolerance = qd.min(tolerance, overlap_merge_tolerance)
     normal_cos_tol = qd.cos(2.0 * collider_info.mc_perturbation[None])
 
     contact0_normal = collider_state.narrowphase_work_queues.mpr_normal[i_work, 0]
@@ -3178,7 +3484,6 @@ def _func_multicontact_detect(
     axis_0 = qd.Vector.zero(gs.qd_float, 3)
     axis_1 = qd.Vector.zero(gs.qd_float, 3)
     is_axes_computed = False
-    overlap_axes = qd.Matrix.zero(gs.qd_float, 4, 3)
     for i_det in range(i_det_start, i_det_end):
         # A zero axis skips the detection: see func_contact_overlap_axes
         has_target_corner = True
@@ -3207,10 +3512,6 @@ def _func_multicontact_detect(
                     axis_0, axis_1 = func_contact_orthogonals(
                         i_ga, i_gb, i_b, contact0_normal, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config
                     )
-                elif qd.static(rigid_config.enable_multi_contact):
-                    # Aimed in the stage before the perturbed detections (see func_narrowphase_multicontact). The axes
-                    # exist with multi-contact only (see get_narrowphase_work_queues).
-                    overlap_axes = collider_state.narrowphase_work_queues.aim_axes[i_work]
                 is_axes_computed = True
             # Declared ahead of the branches that assign them, as quadrants scoping requires.
             qrot = qd.Vector.zero(gs.qd_float, 4)
@@ -3418,6 +3719,8 @@ def _func_multicontact_detect(
                     normal_local,
                     penetration_local,
                     collider_static_config,
+                    geom_pair_scale,
+                    EPS,
                 )
                 if is_contact_kept:
                     for i_3 in qd.static(range(3)):
@@ -3481,6 +3784,8 @@ def _func_multicontact_accept(
     normal_local,
     penetration_local,
     collider_static_config: qd.template(),
+    geom_pair_scale: float,
+    EPS: float,
 ):
     """Decide whether a candidate contact of a pair is kept, given the contacts of the pair kept so far.
 
@@ -3507,7 +3812,16 @@ def _func_multicontact_accept(
                 contact_pos_kept = qd.Vector(
                     [contact_pos_local[i_c, 0], contact_pos_local[i_c, 1], contact_pos_local[i_c, 2]], dt=gs.qd_float
                 )
-                if (contact_pos - contact_pos_kept).norm() < tolerance:
+                merge_tolerance = tolerance
+                if qd.static(
+                    collider_static_config.ccd_algorithm not in (CCD_ALGORITHM_CODE.MJ_MPR, CCD_ALGORITHM_CODE.MJ_GJK)
+                ):
+                    # Surface reconstruction collapses edges below EPS * geom_pair_scale**2 in squared length.
+                    # Keep that feature resolution and world-position rounding as a floor on the patch merge distance
+                    merge_tolerance = qd.sqrt(EPS) * geom_pair_scale
+                    merge_tolerance += EPS * (contact_pos.norm() + contact_pos_kept.norm())
+                    merge_tolerance = qd.max(merge_tolerance, tolerance)
+                if (contact_pos - contact_pos_kept).norm() < merge_tolerance:
                     is_contact_duplicate = True
                     if qd.static(
                         collider_static_config.ccd_algorithm
@@ -3580,6 +3894,7 @@ def _func_multicontact_write(
 @qd.func
 def _func_multicontact_gather(
     i_work: int,
+    overlap_merge_tolerance: float,
     geoms_init_AABB: array_class.GeomsInitAABB,
     dyn_state: array_class.DynState,
     collider_state: array_class.ColliderState,
@@ -3601,6 +3916,10 @@ def _func_multicontact_gather(
     i_pair = collider_state.narrowphase_work_queues.mpr_i_pair[i_work]
 
     tolerance = func_compute_mc_tolerance(i_ga, i_gb, geoms_init_AABB, dyn_info, collider_info, rigid_config)
+    if overlap_merge_tolerance > 0.0:
+        tolerance = qd.min(tolerance, overlap_merge_tolerance)
+    EPS = rigid_info.EPS[None]
+    geom_pair_scale = func_compute_geom_pair_scale(i_ga, i_gb, geoms_init_AABB, dyn_info)
     normal_cos_tol = qd.cos(2.0 * collider_info.mc_perturbation[None])
 
     n_con = gs.qd_int(0)
@@ -3624,6 +3943,8 @@ def _func_multicontact_gather(
                 normal_local,
                 penetration_local,
                 collider_static_config,
+                geom_pair_scale,
+                EPS,
             )
             if is_contact_kept:
                 for i_3 in qd.static(range(3)):
@@ -3675,8 +3996,8 @@ def func_narrowphase_multicontact(
     detection, which read contact 0 and nothing of one another. A queue long enough to saturate the GPU keeps one unit
     per pair, since the split then adds work without adding lanes, and so does the contact patch, which gathers the
     contacts of a pair in its unit. A block claims as many pairs at once as it has units, which keeps the units of a
-    pair in the same block. Every stage is a single call site, so that the detection pipeline and the outline are
-    compiled once.
+    pair in the same block. Its first unit accepts the contacts after all detections finish. Axes and merge distances
+    stay in shared memory until acceptance. Every stage has one call site so the detection and outline compile once.
     """
     N_PERTURBATIONS = qd.static(4)
     BLOCK_DIM = qd.static(32)
@@ -3684,27 +4005,42 @@ def func_narrowphase_multicontact(
     for i_tid in range(collider_static_config.gpu_cores):
         i_lane = i_tid % BLOCK_DIM
         sh_work_start = qd.simt.block.SharedArray((1,), gs.qd_int)
+        sh_aim_axes = qd.simt.block.SharedArray((BLOCK_DIM, 4, 3), gs.qd_float)
+        sh_n_aims = qd.simt.block.SharedArray((BLOCK_DIM,), gs.qd_int)
+        sh_merge_tolerance = qd.simt.block.SharedArray((BLOCK_DIM,), gs.qd_float)
         n_queue = collider_state.narrowphase_work_queues.mpr_queue_size[0]
         n_units = 1
         if qd.static(not gjk_static_config.enable_contact_patch):
             if N_PERTURBATIONS * n_queue <= collider_static_config.gpu_cores:
                 n_units = N_PERTURBATIONS
         n_works_per_claim = BLOCK_DIM // n_units
-        for _claim in range(n_queue + 1):
-            # FIXME: quadrants#925 - every lane of the block issues the claim atomic, the other lanes adding 0, instead
-            # of one atomic per block.
-            i_claim = qd.atomic_add(
-                collider_state.narrowphase_work_queues.mpr_work_counter[0], n_works_per_claim if i_lane == 0 else 0
-            )
-            if i_lane == 0:
-                sh_work_start[0] = i_claim
-            qd.simt.block.sync()
-            i_work = sh_work_start[0] + i_lane // n_units
-            is_exhausted = sh_work_start[0] >= n_queue
-            qd.simt.block.sync()
-            if is_exhausted:
+        for i_claim_ in range(n_queue + 1):
+            # A block takes its first works by its rank and the next ones from the shared counter, offset past the
+            # works taken by rank, so that the blocks a short queue leaves idle exit without an atomic on the counter,
+            # which every block of the launch would otherwise hit at once.
+            i_work_start = (i_tid // BLOCK_DIM) * n_works_per_claim
+            if i_claim_ > 0:
+                # FIXME: quadrants#925 - every lane of the block issues the claim atomic, the other lanes adding 0,
+                # instead of one atomic per block.
+                i_claim = qd.atomic_add(
+                    collider_state.narrowphase_work_queues.mpr_work_counter[0], n_works_per_claim if i_lane == 0 else 0
+                )
+                if i_lane == 0:
+                    n_blocks = (collider_static_config.gpu_cores + BLOCK_DIM - 1) // BLOCK_DIM
+                    sh_work_start[0] = n_blocks * n_works_per_claim + i_claim
+                qd.simt.block.sync()
+                i_work_start = sh_work_start[0]
+                qd.simt.block.sync()
+            i_work = i_work_start + i_lane // n_units
+            if i_work_start >= n_queue:
                 break
             i_unit = i_lane % n_units
+            if i_work < n_queue and i_unit == 0:
+                sh_n_aims[i_lane // n_units] = N_PERTURBATIONS
+                sh_merge_tolerance[i_lane // n_units] = 0.0
+                if qd.static(not gjk_static_config.enable_contact_patch):
+                    for i_s in range(1, N_PERTURBATIONS + 1):
+                        collider_state.narrowphase_work_queues.mpr_contact_status[i_work, i_s] = MULTICONTACT_SLOT.EMPTY
             for i_stage in range(3):
                 contact0_status = MULTICONTACT_ENTRY.DONE
                 if i_work < n_queue:
@@ -3726,26 +4062,42 @@ def func_narrowphase_multicontact(
                             axis_0, axis_1 = func_contact_orthogonals(
                                 i_ga, i_gb, i_b, normal, geoms_init_AABB, dyn_state, dyn_info, rigid_info, rigid_config
                             )
-                            collider_state.narrowphase_work_queues.aim_axes[i_work] = func_contact_overlap_axes(
-                                i_ga,
-                                i_gb,
-                                i_b,
-                                normal,
-                                contact_pos,
-                                axis_0,
-                                axis_1,
-                                dyn_state.geoms.pos[i_ga, i_b],
-                                dyn_state.geoms.quat[i_ga, i_b],
-                                dyn_state.geoms.pos[i_gb, i_b],
-                                dyn_state.geoms.quat[i_gb, i_b],
-                                collider_state,
-                                dyn_info,
-                                rigid_info,
-                                collider_info,
-                                rigid_config,
-                                collider_static_config,
-                                geom_pair_scale,
-                            )
+                            overlap_axes = qd.Matrix.rows([axis_0, -axis_0, axis_1, -axis_1])
+                            if dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.PLANE:
+                                overlap_axes, overlap_merge_tolerance = func_contact_overlap_axes(
+                                    i_ga,
+                                    i_gb,
+                                    i_b,
+                                    normal,
+                                    contact_pos,
+                                    axis_0,
+                                    axis_1,
+                                    dyn_state.geoms.pos[i_ga, i_b],
+                                    dyn_state.geoms.quat[i_ga, i_b],
+                                    dyn_state.geoms.pos[i_gb, i_b],
+                                    dyn_state.geoms.quat[i_gb, i_b],
+                                    overlap_axes,
+                                    collider_state,
+                                    dyn_info,
+                                    rigid_info,
+                                    collider_info,
+                                    rigid_config,
+                                    collider_static_config,
+                                    geom_pair_scale,
+                                )
+                                sh_merge_tolerance[i_lane // n_units] = overlap_merge_tolerance
+                            # Compact valid aims so inactive lanes can skip the detection call entirely
+                            n_aims = 0
+                            for i_t in range(N_PERTURBATIONS):
+                                axis = qd.Vector([overlap_axes[i_t, 0], overlap_axes[i_t, 1], overlap_axes[i_t, 2]])
+                                if axis.norm_sqr() > 0.0:
+                                    for i_3 in qd.static(range(3)):
+                                        sh_aim_axes[i_lane // n_units, n_aims, i_3] = axis[i_3]
+                                    n_aims += 1
+                            sh_n_aims[i_lane // n_units] = n_aims
+                            for i_t in range(n_aims, N_PERTURBATIONS):
+                                for i_3 in qd.static(range(3)):
+                                    sh_aim_axes[i_lane // n_units, i_t, i_3] = 0.0
                 else:
                     # The first stage stores contact 0, which marks the slot of the MPR seed and detects the contact the
                     # GJK pairs left to it. The last one runs the perturbed detections of the unit, all of them on a
@@ -3769,12 +4121,27 @@ def func_narrowphase_multicontact(
                             else:
                                 i_det_start = i_unit + 1
                                 i_det_end = i_unit + 2 if n_units > 1 else N_PERTURBATIONS + 1
+                    if i_stage == 2 and i_work < n_queue:
+                        i_det_end = qd.min(i_det_end, sh_n_aims[i_lane // n_units] + 1)
                     if i_det_start < i_det_end:
+                        overlap_merge_tolerance = gs.qd_float(0.0)
+                        if i_stage == 2:
+                            overlap_merge_tolerance = sh_merge_tolerance[i_lane // n_units]
+                        overlap_axes = qd.Matrix.zero(gs.qd_float, 4, 3)
+                        if qd.static(
+                            rigid_config.enable_multi_contact and not rigid_config.enable_mujoco_compatibility
+                        ):
+                            if i_stage == 2 and is_contact0_known:
+                                for i_t in qd.static(range(4)):
+                                    for i_3 in qd.static(range(3)):
+                                        overlap_axes[i_t, i_3] = sh_aim_axes[i_lane // n_units, i_t, i_3]
                         _func_multicontact_detect(
                             i_tid,
                             i_work,
                             i_det_start,
                             i_det_end,
+                            overlap_axes,
+                            overlap_merge_tolerance,
                             geoms_init_AABB,
                             dyn_state,
                             collider_state,
@@ -3793,29 +4160,21 @@ def func_narrowphase_multicontact(
                 qd.simt.grid.mem_fence()
                 qd.simt.block.sync()
 
-    # The top-level loops of a kernel run in order, so the gather reads every slot the units wrote and the counter
-    # reset costs no launch of its own
-    if qd.static(not gjk_static_config.enable_contact_patch):
-        for _ in range(1):
-            collider_state.narrowphase_work_queues.mpr_work_counter[0] = 0
-
-        for i_tid in range(collider_static_config.gpu_cores):
-            for _iter in range(collider_static_config.gpu_cores_per_unit):
-                i_work = qd.atomic_add(collider_state.narrowphase_work_queues.mpr_work_counter[0], 1)
-                if i_work >= collider_state.narrowphase_work_queues.mpr_queue_size[0]:
-                    break
-                _func_multicontact_gather(
-                    i_work,
-                    geoms_init_AABB,
-                    dyn_state,
-                    collider_state,
-                    dyn_info,
-                    rigid_info,
-                    collider_info,
-                    rigid_config,
-                    collider_static_config,
-                    errno,
-                )
+            if qd.static(not gjk_static_config.enable_contact_patch):
+                if i_work < n_queue and i_unit == 0:
+                    _func_multicontact_gather(
+                        i_work,
+                        sh_merge_tolerance[i_lane // n_units],
+                        geoms_init_AABB,
+                        dyn_state,
+                        collider_state,
+                        dyn_info,
+                        rigid_info,
+                        collider_info,
+                        rigid_config,
+                        collider_static_config,
+                        errno,
+                    )
 
 
 @qd.func
@@ -3868,6 +4227,7 @@ def func_narrowphase_contact0(
         collider_state.narrowphase_work_queues.mpr_queue_size[0] = 0
         collider_state.narrowphase_work_queues.mpr_work_counter[0] = 0
 
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     for flat_idx in range(_grid_size):
         i_b = flat_idx // n_chunks
         chunk = flat_idx % n_chunks
@@ -4431,14 +4791,35 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
 ):
     EPS = rigid_info.EPS[None]
 
-    _B = collider_state.active_buffer.shape[1]
-    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
-    for i_b in range(_B):
-        for i_pair in range(qd.min(collider_state.n_broad_pairs[i_b], collider_state.broad_collision_pairs.shape[0])):
-            i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
-            i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
-
-            if qd.static(collider_static_config.has_nonconvex_nonterrain):
+    if qd.static(collider_static_config.has_nonconvex_nonterrain):
+        n_max = qd.static(
+            collider_static_config.n_contacts_per_nonconvex_pair if rigid_config.enable_multi_contact else 1
+        )
+        # The pairs of an env are split over chunks, every pair detected by one block whose lanes split its work. Pair
+        # costs span orders of magnitude, so the chunks outnumber the blocks the GPU holds at once 8 times, capped by
+        # the pairs an env can hold, a block done early taking the next one. They run chunk by chunk over the envs,
+        # which keeps the loaded chunks of envs with few pairs side by side.
+        is_coop = qd.static(rigid_config.backend != gs.cpu and rigid_config.para_level >= gs.PARA_LEVEL.PARTIAL)
+        BLOCK_DIM = qd.static(32 if is_coop else 1)
+        _B = collider_state.active_buffer.shape[1]
+        max_broad_pairs = collider_state.broad_collision_pairs.shape[0]
+        n_chunks = qd.max(
+            qd.min((8 * collider_static_config.gpu_cores // BLOCK_DIM + _B - 1) // _B, max_broad_pairs), 1
+        )
+        qd.loop_config(
+            name="narrowphase_nonconvex",
+            serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL,
+            block_dim=qd.static(BLOCK_DIM if is_coop else None),
+        )
+        for i_flat in range(_B * n_chunks * BLOCK_DIM):
+            tid = i_flat % BLOCK_DIM
+            i_b_chunk = i_flat // BLOCK_DIM
+            i_b = i_b_chunk % _B
+            i_chunk = i_b_chunk // _B
+            n_pairs = qd.min(collider_state.n_broad_pairs[i_b], max_broad_pairs)
+            for i_pair in range(i_chunk * n_pairs // n_chunks, (i_chunk + 1) * n_pairs // n_chunks):
+                i_ga = collider_state.broad_collision_pairs[i_pair, i_b][0]
+                i_gb = collider_state.broad_collision_pairs[i_pair, i_b][1]
                 if (
                     not (dyn_info.geoms.is_convex[i_ga] and dyn_info.geoms.is_convex[i_gb])
                     and dyn_info.geoms.type[i_gb] != gs.GEOM_TYPE.TERRAIN
@@ -4512,7 +4893,7 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
                         and sd_center_ab >= 0.0
                     ):
                         is_shell_pair = True
-                    if is_shell_pair:
+                    if is_shell_pair and tid == 0:
                         func_add_polytope_vertex_contacts_sdf_shell(
                             i_ga,
                             i_gb,
@@ -4533,43 +4914,33 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
                             collider_static_config,
                             errno,
                         )
-                    else:
-                        func_add_polytope_vertex_contacts_sdf(
-                            i_ga,
-                            i_gb,
-                            i_b,
-                            i_pair,
-                            ga_pos,
-                            ga_quat,
-                            gb_pos,
-                            gb_quat,
-                            tolerance,
-                            geoms_init_AABB,
-                            dyn_state,
-                            collider_state,
-                            dyn_info,
-                            rigid_info,
-                            collider_info,
-                            rigid_config,
-                            collider_static_config,
-                            seeded=False,
-                            errno=errno,
-                        )
+                    elif not is_shell_pair:
                         # Swapped-role verification: A's vertex scan cannot see a feature of B crossing one of A's
                         # faces BETWEEN A's verts, so B's verts are checked against A's SDF as well - as a seeded
                         # local search rather than a full scan. Skipped only for PLANE (its handful of far-flung
                         # verts carry no contact information).
-                        if dyn_info.geoms.type[i_gb] != gs.GEOM_TYPE.PLANE:
-                            func_add_polytope_vertex_contacts_sdf(
-                                i_gb,
-                                i_ga,
+                        n_scans = 1 if dyn_info.geoms.type[i_gb] == gs.GEOM_TYPE.PLANE else 2
+                        n_added = 0
+                        contacts_slot = qd.Vector.zero(gs.qd_int, (n_max + BLOCK_DIM - 1) // BLOCK_DIM)
+                        for i_scan in range(n_scans):
+                            i_g1, i_g2 = i_ga, i_gb
+                            g1_pos, g1_quat, g2_pos, g2_quat = ga_pos, ga_quat, gb_pos, gb_quat
+                            if i_scan > 0:
+                                i_g1, i_g2 = i_gb, i_ga
+                                g1_pos, g1_quat, g2_pos, g2_quat = gb_pos, gb_quat, ga_pos, ga_quat
+                            n_added, contacts_slot = func_add_polytope_vertex_contacts_sdf(
+                                i_g1,
+                                i_g2,
                                 i_b,
                                 i_pair,
-                                gb_pos,
-                                gb_quat,
-                                ga_pos,
-                                ga_quat,
+                                tid,
+                                g1_pos,
+                                g1_quat,
+                                g2_pos,
+                                g2_quat,
                                 tolerance,
+                                n_added,
+                                contacts_slot,
                                 geoms_init_AABB,
                                 dyn_state,
                                 collider_state,
@@ -4578,6 +4949,7 @@ def func_narrow_phase_nonconvex_vs_nonterrain(
                                 collider_info,
                                 rigid_config,
                                 collider_static_config,
-                                seeded=True,
+                                block_dim=BLOCK_DIM,
+                                seeded=i_scan > 0,
                                 errno=errno,
                             )

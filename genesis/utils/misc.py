@@ -9,8 +9,8 @@ import numbers
 import os
 import random
 import sys
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import field
 from importlib import import_module
 from itertools import combinations
@@ -114,6 +114,25 @@ class redirect_libc_stderr:
         os.close(self.original_stderr_fileno)
         self.stderr_fileno = None
         self.original_stderr_fileno = None
+
+
+@contextmanager
+def set_environ(environ: Mapping[str, str]):
+    """Set environment variables for the duration of the context, then restore them to their previous state.
+
+    Only the variables in 'environ' are touched: those previously unset are removed on exit, the others get back their
+    previous value.
+    """
+    environ_prev = {name: os.environ.get(name) for name in environ}
+    os.environ.update(environ)
+    try:
+        yield
+    finally:
+        for name, value in environ_prev.items():
+            if value is None:
+                del os.environ[name]
+            else:
+                os.environ[name] = value
 
 
 def assert_initialized(cls):
@@ -252,7 +271,8 @@ def get_gpu_shared_tile_sizes(max_n_sizes: int) -> tuple[int, ...]:
 
     The shared memory of a block only bounds how many blocks a compute unit runs at once. Each candidate is the largest
     multiple of 8 (keeping the padded row stride odd) that runs a given count of resident one-warp blocks, as bounded by
-    the shared memory of a compute unit and of a block, the driver reservation per block and the warp slots.
+    the shared memory of a compute unit and of a block, the driver reservation and allocation granularity per block and
+    the warp slots.
 
     At most max_n_sizes candidates are kept, so that the static values of a kernel stay a small fixed set: those
     minimizing the mean drop in resident blocks that rounding a row count n up to the next kept size causes against its
@@ -264,15 +284,26 @@ def get_gpu_shared_tile_sizes(max_n_sizes: int) -> tuple[int, ...]:
     if gs.backend == gs.cpu:
         gs.raise_exception("CPU backend not supported by this method.")
     itemsize = 4 if gs.qd_float == qd.f32 else 8
+    # FIXME: quadrants#976 - the shared memory of a block is a 64 KiB lower bound on AMDGPU, which caps the tiles of
+    # CDNA4 (gfx950) below what its 160 KiB per block holds.
     block_bytes = qd.lang.impl.get_max_shared_memory_bytes(is_lowerbound_ok=True)
-    unit_bytes, reserved_bytes, max_blocks = block_bytes, 0, block_bytes // (8 * 9 * itemsize)
+    unit_bytes, reserved_bytes, granule_bytes, max_blocks = block_bytes, 0, 1, block_bytes // (8 * 9 * itemsize)
     if torch.cuda.is_available():
-        # CUDA and ROCm alike: a block of these tiles is one warp (wavefront), so the warp slots bound the resident
-        # blocks, and the driver reserves the shared memory of a compute unit beyond what one block may opt in to.
+        # CUDA and ROCm alike: a block of these tiles is one warp (wavefront), whose slots bound the resident blocks.
         device_property = torch.cuda.get_device_properties(torch.cuda.current_device())
         unit_bytes = device_property.shared_memory_per_multiprocessor
         max_blocks = device_property.max_threads_per_multi_processor // device_property.warp_size
-        if not torch.version.hip:
+        if torch.version.hip:
+            # FIXME: torch exposes no allocation granularity of the local data share (LDS), which AMD sets per
+            # instruction set (see the LLVM AMDGPU usage guide), a block taking its shared memory in whole granules.
+            if device_property.gcnArchName.startswith("gfx950"):
+                granule_bytes = 1280
+            elif device_property.gcnArchName.startswith("gfx125"):
+                granule_bytes = 2048
+            else:
+                granule_bytes = 512
+        else:
+            # The driver reserves the shared memory of a compute unit beyond what one block may opt in to.
             reserved_bytes = max(unit_bytes - device_property.shared_memory_per_block_optin, 0)
             # FIXME: torch exposes no cap on the resident blocks of a streaming multiprocessor, which NVIDIA sets per
             # compute capability below the warp slots (see the CUDA C++ programming guide).
@@ -287,8 +318,8 @@ def get_gpu_shared_tile_sizes(max_n_sizes: int) -> tuple[int, ...]:
     # The largest count of resident blocks of each candidate size
     resident_blocks: dict[int, int] = {}
     for n_blocks in range(1, max_blocks + 1):
-        n_bytes = min(unit_bytes // n_blocks - reserved_bytes, block_bytes)
-        tile_size = int((math.sqrt(1.0 + 4.0 * n_bytes / itemsize) - 1.0) / 2.0) // 8 * 8
+        n_bytes = (min(unit_bytes // n_blocks - reserved_bytes, block_bytes) // granule_bytes) * granule_bytes
+        tile_size = (int((math.sqrt(1.0 + 4.0 * n_bytes / itemsize) - 1.0) / 2.0) // 8) * 8
         if tile_size >= 8:
             resident_blocks[tile_size] = max(resident_blocks.get(tile_size, 0), n_blocks)
     tile_sizes = sorted(resident_blocks)
@@ -348,129 +379,6 @@ def get_assets_dir():
     return os.path.join(get_src_dir(), "assets")
 
 
-def get_cache_dir():
-    cache_dir = os.environ.get("GS_CACHE_FILE_PATH")
-    if cache_dir is not None:
-        return cache_dir
-    root_cache_dir = None
-    if sys.platform == "linux":
-        root_cache_dir = os.environ.get("XDG_CACHE_HOME")
-    if root_cache_dir is None:
-        root_cache_dir = os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(root_cache_dir, "genesis")
-
-
-def get_gsd_cache_dir():
-    return os.path.join(get_cache_dir(), "gsd")
-
-
-def get_gnd_cache_dir():
-    return os.path.join(get_cache_dir(), "terrain")
-
-
-def get_cvx_cache_dir():
-    return os.path.join(get_cache_dir(), "cvx")
-
-
-def get_ptc_cache_dir():
-    return os.path.join(get_cache_dir(), "ptc")
-
-
-def get_fps_pc_cache_dir():
-    return os.path.join(get_cache_dir(), "fps_pc")
-
-
-def get_tet_cache_dir():
-    return os.path.join(get_cache_dir(), "tet")
-
-
-def get_gel_cache_dir():
-    return os.path.join(get_cache_dir(), "gel")
-
-
-def get_remesh_cache_dir():
-    return os.path.join(get_cache_dir(), "rm")
-
-
-def get_wt_cache_dir():
-    return os.path.join(get_cache_dir(), "wt")
-
-
-def get_wth_cache_dir():
-    return os.path.join(get_cache_dir(), "wth")
-
-
-def get_exr_cache_dir():
-    return os.path.join(get_cache_dir(), "exr")
-
-
-def get_usd_cache_dir():
-    return os.path.join(get_cache_dir(), "usd")
-
-
-_CLEARABLE_CACHES: list[Callable[[], None]] = []
-
-
-def register_cache_clear(cache_clear: Callable[[], None]) -> None:
-    """Register a callback that drops a module-level cache, invoked by clear_caches on genesis teardown.
-
-    Pass the cache's own clearing method, e.g. the cache_clear of a functools.lru_cache or the clear of a manual dict
-    cache. This lets module-level asset caches (parsed meshes, baked textures, ...) release the large arrays they hold
-    for destroyed scenes without the teardown path having to know about each one.
-    """
-    _CLEARABLE_CACHES.append(cache_clear)
-
-
-def clear_caches() -> None:
-    """Drop every cache registered through register_cache_clear."""
-    for cache_clear in _CLEARABLE_CACHES:
-        cache_clear()
-
-
-class SizeCappedCache:
-    """An LRU cache bounded by the total byte footprint of its values rather than by their count.
-
-    Each value is stored together with an explicit size in bytes; once the running total exceeds max_bytes the
-    least-recently-used entries are evicted until it fits again (the most-recent entry is always kept). This suits
-    caching a handful of large, scene-independent arrays - such as processed collision geometry - where the number of
-    distinct entries is a poor proxy for the memory actually held. An optional max_entries also caps the entry count,
-    so values whose reported size is small or zero (e.g. flat-color textures) cannot accumulate without bound. It
-    registers itself with register_cache_clear so it is dropped together with the other asset caches on genesis
-    teardown.
-    """
-
-    def __init__(self, max_bytes: int, max_entries: "int | None" = None) -> None:
-        self._max_bytes = max_bytes
-        self._max_entries = max_entries
-        self._store: "OrderedDict[Any, tuple[Any, int]]" = OrderedDict()
-        self._total_bytes = 0
-        register_cache_clear(self.clear)
-
-    def get(self, key: Any) -> Any:
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        self._store.move_to_end(key)
-        return entry[0]
-
-    def put(self, key: Any, value: Any, n_bytes: int) -> None:
-        previous = self._store.pop(key, None)
-        if previous is not None:
-            self._total_bytes -= previous[1]
-        self._store[key] = (value, n_bytes)
-        self._total_bytes += n_bytes
-        while len(self._store) > 1 and (
-            self._total_bytes > self._max_bytes
-            or (self._max_entries is not None and len(self._store) > self._max_entries)
-        ):
-            _, (_, evicted_bytes) = self._store.popitem(last=False)
-            self._total_bytes -= evicted_bytes
-
-    def clear(self) -> None:
-        self._store.clear()
-        self._total_bytes = 0
-
-
 def geometric_mean(a, b):
     """Geometric mean of two non-negative values: sqrt(a * b)."""
     if a < 0 or b < 0:
@@ -487,16 +395,14 @@ def harmonic_mean(a, b):
     return 2 * (a * b) / (a + b)
 
 
-def assert_gs_tensor(x):
-    if not isinstance(x, gs.Tensor):
-        gs.raise_exception("Only accepts genesis.Tensor.")
+def assert_contiguous(tensor: torch.Tensor):
+    if not tensor.is_contiguous():
+        gs.raise_exception("Tensor not contiguous.")
 
 
 def to_gs_tensor(x, dtype: torch.dtype | None = None):
-    if isinstance(x, gs.Tensor):
+    if isinstance(x, torch.Tensor):
         tensor = x
-    elif isinstance(x, torch.Tensor):
-        tensor = gs.Tensor(x)
     else:
         x = np.asarray(x)
         # See broadcast_tensor for arrays with negative strides

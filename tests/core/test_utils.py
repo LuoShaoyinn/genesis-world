@@ -114,7 +114,6 @@ def polar(A, pure_rotation: bool, side, tol):
     return gu.polar(A, pure_rotation=pure_rotation, side=side)
 
 
-@pytest.mark.slow  # ~200s
 @pytest.mark.required
 @pytest.mark.parametrize("batch_shape", [(10, 40, 25), ()])
 def test_geom_quadrants_vs_tensor_consistency(batch_shape):
@@ -426,6 +425,55 @@ def test_compose_inertial_properties():
     assert_allclose(combined_mass, expected_mass, tol=TOL)
     assert_allclose(combined_com, expected_com, tol=TOL)
     assert_allclose(combined_inertia, expected_inertia, tol=TOL)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu])
+def test_mesh_inertial_properties():
+    EXTENTS = (1.0, 2.0, 3.0)
+    VOLUME = math.prod(EXTENTS)
+    INERTIA = VOLUME / 12.0 * np.diag(np.sum(np.square(EXTENTS)) - np.square(EXTENTS))
+
+    # A box wound inward has a negative volume, and a box missing a side is closed by its convex hull
+    box = trimesh.creation.box(extents=EXTENTS)
+    box_inverted = box.copy()
+    box_inverted.invert()
+    box_open = trimesh.Trimesh(vertices=box.vertices, faces=box.faces[box.face_normals[:, 0] > -0.5], process=False)
+    for tmesh, volume in ((box, VOLUME), (box_inverted, -VOLUME), (box_open, None)):
+        mesh = gs.Mesh.from_trimesh(tmesh)
+        if volume is not None:
+            assert_allclose(mesh.volume, volume, tol=TOL)
+        mass, com, inertia = mesh.inertial
+        assert_allclose(mass, VOLUME, tol=TOL)
+        assert_allclose(com, 0.0, tol=TOL)
+        assert_allclose(inertia, INERTIA, tol=TOL)
+
+    # A flat mesh encloses no volume, so it carries no inertia
+    quad = trimesh.Trimesh(
+        vertices=(
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        faces=(
+            (0, 1, 2),
+            (0, 2, 3),
+        ),
+        process=False,
+    )
+    mesh = gs.Mesh.from_trimesh(quad)
+    assert_allclose(mesh.volume, 0.0, tol=TOL)
+    mass, com, inertia = mesh.inertial
+    assert_equal(mass, 0.0)
+    assert_equal(com, 0.0)
+    assert_equal(inertia, 0.0)
+
+    # A small mesh far from the origin encloses the same volume as at the origin
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=0.01)
+    sphere_far = sphere.copy()
+    sphere_far.apply_translation((1000.0, 1000.0, 1000.0))
+    assert_allclose(gs.Mesh.from_trimesh(sphere_far).volume, gs.Mesh.from_trimesh(sphere).volume, tol=TOL)
 
 
 @pytest.mark.required
@@ -873,7 +921,7 @@ def test_genuine_interpenetration(show_viewer):
                     gu.inv_transform_by_trans_quat(
                         tensor_to_array(geom.get_verts(), dtype=np.float64), links_pos0[link.idx], links_quat0[link.idx]
                     ),
-                    geom.get_trimesh().faces.astype(np.int64),
+                    geom.trimesh.faces.astype(np.int64),
                 )
                 for link in entity.links
                 for geom in link.geoms
@@ -1019,6 +1067,7 @@ def test_gpu_shared_tile_sizes(device_backend, precision, largest_size, max_n_si
             shared_memory_per_multiprocessor=65536,
             max_threads_per_multi_processor=2048,
             warp_size=32,
+            gcnArchName="gfx1100",
         )
     else:
         device_property = SimpleNamespace(

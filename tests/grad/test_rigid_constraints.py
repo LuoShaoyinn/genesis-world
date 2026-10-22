@@ -96,8 +96,14 @@ def test_joint_limit_grad_matches_fd(grad_slider_limit, precision, show_viewer):
     )
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("model_name", ["grad_slider_limit", "grad_cartpole", "grad_hopper"])
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "grad_slider_limit",
+        pytest.param("grad_cartpole", marks=pytest.mark.required),
+        pytest.param("grad_hopper", marks=pytest.mark.required),
+    ],
+)
 @pytest.mark.debug(False)
 def test_per_step_force_into_limit_grad_matches_fd(model_name, request, precision, show_viewer):
     # Per-step control-force adjoint driving a joint into its limit, across three topologies. A constant force over
@@ -204,6 +210,8 @@ def test_equality_grad_matches_fd(model_name, n_rows, request, precision, show_v
     pair.scene_fd.step()
     cs = pair.scene_fd.rigid_solver.constraint_solver.constraint_state
     assert (qd_to_torch(cs.n_constraints_equality) == n_rows).all()
+    with pytest.raises(gs.GenesisException, match="Screw constraints are not supported yet"):
+        pair.scene_ana.rigid_solver.add_screw_constraint(0, 1, axis=(0.0, 0.0, 1.0), pitch=0.0)
 
     # Large initial velocities: the anchor velocity-product bias entering aref is quadratic in velocity, so its
     # adjoint contribution only clears the fp64 tolerance band when the joints spin fast.

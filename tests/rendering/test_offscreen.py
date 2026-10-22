@@ -1243,7 +1243,6 @@ def test_context_isolation(renderer_type):
     )
 
 
-@pytest.mark.slow  # ~250s
 @pytest.mark.required
 @pytest.mark.parametrize("n_envs", [0, 2])
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
@@ -1502,6 +1501,23 @@ def test_rasterizer_env_separate(renderer, png_snapshot, show_viewer, force_show
     # First env kept same pose — render should match; second env uses top-down view — render must differ
     assert np.abs(rgb_after[0].astype(np.float32) - rgb_before[0].astype(np.float32)).mean() < 1.0
     assert np.abs(rgb_after[1].astype(np.float32) - rgb_before[1].astype(np.float32)).mean() > 5.0
+
+    # Setting the pose of the second rendered environment alone gives the same views
+    cam.set_pose(
+        pos=(3.5, 0.0, 2.5),
+        lookat=(0.0, 0.0, 0.5),
+        up=(0.0, 0.0, 1.0),
+    )
+    cam.set_pose(
+        pos=(0.0, 0.0, 4.0),
+        lookat=(0.0, 0.0, 0.0),
+        up=(0.0, 1.0, 0.0),
+        envs_idx=RENDERED_ENVS[1],
+    )
+    rgb_env, *_ = cam.render(rgb=True)
+    assert_equal(rgb_env, rgb_after)
+    with pytest.raises(gs.GenesisException):
+        cam.set_pose(pos=(0.0, 0.0, 4.0), envs_idx=0)
 
     # Restore original camera pose for snapshot comparisons
     cam.set_pose(

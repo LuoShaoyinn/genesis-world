@@ -3500,6 +3500,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         anchor_pos=None,
         anchor_local=None,
         project_other_anchor_z=None,
+        align_to_world_plane=False,
+        anchor_quat=(1.0, 0.0, 0.0, 0.0),
         envs_idx=None,
     ):
         """Add or re-arm a breakable six-DoF weld at the current relative pose.
@@ -3508,8 +3510,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         ``angular_stiffness`` is in N m/rad and ``angular_damping`` in
         N m s/rad. The linear coefficients use an implicit spring-damper
         discretization; an isolated static load gives extension
-        ``force / linear_stiffness``. Rotational constraint scaling and solver
-        convergence can affect the actual reaction torque.
+        ``force / linear_stiffness``. Angular coefficients use the same
+        implicit compliance with quaternion-row scaling corrected for the
+        small-angle physical stiffness/damping. Finite-angle restoring torque
+        follows the quaternion error (``stiffness * sin(angle)`` for pure tilt).
         ``max_force`` (N) and ``max_torque`` (N m) are per-world-axis limits.
         ``anchor_pos`` is the shared attachment point in world coordinates at
         creation time. If omitted, the lower-index link's origin is used.
@@ -3517,6 +3521,12 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         coordinates, allowing a different world anchor per environment.
         ``project_other_anchor_z`` places the other link's anchor at the same
         world x/y and the specified world z, e.g. on a ground plane.
+        ``align_to_world_plane=True`` saves the nearest yaw-only orientation
+        of the cup frame with +Z along world +Z, rather than its initial tilt.
+        ``anchor_quat`` is the cup frame's local WXYZ orientation in
+        ``link1_idx``. Both anchor and target orientation are captured once
+        and then follow the other link; use a fixed link for a world plane.
+        This requires ``anchor_local`` and ``project_other_anchor_z``.
         An exceeded limit breaks that environment's weld for the next physics
         substep. The same call re-arms a broken pair and captures its new pose.
         """
@@ -3532,6 +3542,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             anchor_pos=anchor_pos,
             anchor_local=anchor_local,
             project_other_anchor_z=project_other_anchor_z,
+            align_to_world_plane=align_to_world_plane,
+            anchor_quat=anchor_quat,
             envs_idx=envs_idx,
         )
 

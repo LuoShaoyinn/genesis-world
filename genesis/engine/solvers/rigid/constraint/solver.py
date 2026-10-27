@@ -37,6 +37,14 @@ from . import linesearch
 from . import noslip as constraint_noslip
 
 
+def _soft_weld_anchor_quat(anchor_quat):
+    """Normalize the attachment frame's WXYZ orientation in the cup link."""
+    quat = np.asarray(anchor_quat, dtype=float)
+    if quat.shape != (4,) or not np.isfinite(quat).all() or np.linalg.norm(quat) < 1.0e-12:
+        raise ValueError("anchor_quat must be a finite nonzero WXYZ quaternion")
+    return tuple(map(float, quat / np.linalg.norm(quat)))
+
+
 class SoftWeldRequest:
     """A weld request whose success is known after the next physics step."""
 
@@ -538,8 +546,17 @@ class ConstraintSolver:
         self, link1_idx, link2_idx, engage_mask, release_mask, *,
         linear_stiffness, linear_damping, angular_stiffness, angular_damping,
         max_force, max_torque, anchor_local, project_other_anchor_z, gain_scale=None,
+        align_to_world_plane=False, anchor_quat=(1.0, 0.0, 0.0, 0.0),
     ):
-        """Apply valve changes on device; projection height is scalar or one GPU value per environment."""
+        """Apply valve changes on device, optionally capturing a horizontal attachment frame.
+
+        Projection height is scalar or one GPU value per environment. With
+        ``align_to_world_plane``, the cup frame is link orientation times
+        ``anchor_quat`` (local WXYZ). Its nearest yaw-only orientation is saved
+        on engagement, so existing tilt immediately creates a restoring torque.
+        Both the projected anchor and orientation remain fixed on the other link.
+        """
+        anchor_quat = _soft_weld_anchor_quat(anchor_quat)
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
         if link1_idx == link2_idx or min(link1_idx, link2_idx) < 0 or max(link1_idx, link2_idx) >= self._solver.n_links:
             raise ValueError("Soft-weld links must be two distinct valid indices")
@@ -576,6 +593,7 @@ class ConstraintSolver:
             linear_stiffness, linear_damping, angular_stiffness, angular_damping,
             max_force, max_torque, local_anchor_on_second,
             *map(float, anchor_local), project_other_anchor_z,
+            int(align_to_world_plane), *anchor_quat,
             self._solver.dyn_state, self.constraint_state, self._solver.dyn_info,
             self._solver.rigid_info, self._solver.rigid_config, self._solver._errno,
         )
@@ -652,17 +670,23 @@ class ConstraintSolver:
         anchor_pos=None,
         anchor_local=None,
         project_other_anchor_z=None,
+        align_to_world_plane=False,
+        anchor_quat=(1.0, 0.0, 0.0, 0.0),
         envs_idx=None,
     ):
         """Attach two links with a compliant six-row weld.
 
-        Stiffness and damping are acceleration-level gains in s^-2 and s^-1.
+        Linear stiffness/damping are in N/m and N s/m. Angular coefficients
+        are the small-angle stiffness/damping in N m/rad and N m s/rad.
         The limits apply per world axis to the force and direct torque at the
         attachment, in N and N m respectively.
         Exceeding either limit breaks the weld for the next physics substep.
         """
         if self._solver._requires_grad:
             raise RuntimeError("Dynamic soft-weld breakage is not supported with differentiable simulation")
+        anchor_quat = _soft_weld_anchor_quat(anchor_quat)
+        if align_to_world_plane and (anchor_local is None or project_other_anchor_z is None):
+            raise ValueError("Plane alignment requires anchor_local and project_other_anchor_z")
         local_anchor_on_second = int(anchor_local is not None and int(link1_idx) > int(link2_idx))
         link1_idx, link2_idx = sorted((int(link1_idx), int(link2_idx)))
         if link1_idx < 0 or link2_idx >= self._solver.n_links or link1_idx == link2_idx:
@@ -707,6 +731,7 @@ class ConstraintSolver:
             *(anchor_local if anchor_local is not None else (0.0, 0.0, 0.0)),
             int(project_other_anchor_z is not None),
             float(project_other_anchor_z if project_other_anchor_z is not None else 0.0),
+            int(align_to_world_plane), *anchor_quat,
             envs_idx,
             self._solver.dyn_state,
             self.constraint_state,
@@ -2206,15 +2231,19 @@ def func_equality_weld(
     for i_con_ in qd.static(range(3)):
         i_con = i_con_ + n_con
         imp, aref = gu.imp_aref(sol_params, -pos_imp, jac_qvel[i_con_], rot_error[i_con_])
+        diag = qd.max(invweight[1] * (1.0 - imp) / imp, EPS)
         if is_soft:
             dt = rigid_info.substep_dt[None]
-            kp = soft_params[2] * invweight[1]
-            kd = soft_params[3] * invweight[1]
-            strength = kp * dt * dt + kd * dt
-            imp = qd.max(strength / (1.0 + strength), gs.qd_float(1.0e-6))
-            aref = -kd * jac_qvel[i_con_] - kp * rot_error[i_con_]
-        diag = qd.max(invweight[1] * (1.0 - imp) / imp, EPS)
-
+            # Quaternion-vector error and its Jacobian are both half the
+            # rotation vector near rest. Four times the physical coefficients
+            # gives torque = -k*angle - c*angular_velocity at small angles.
+            # Use the same implicit compliance as translation; multiplying by
+            # invweight and then softening again makes torque vanish with dt.
+            stiffness = 4.0 * soft_params[2]
+            damping = 4.0 * soft_params[3]
+            compliance_denom = qd.max(dt * (damping + dt * stiffness), EPS)
+            diag = 1.0 / compliance_denom
+            aref = -(stiffness * rot_error[i_con_] + (damping + dt * stiffness) * jac_qvel[i_con_]) / compliance_denom
         constraint_state.diag[i_con, i_b] = diag
         constraint_state.aref[i_con, i_b] = (
             aref - 0.5 * (t1[i_con_ + 1] + t2[i_con_ + 1] + t3[i_con_ + 1]) * torquescale
@@ -2709,6 +2738,36 @@ def func_init_weld_record(
     )
 
 
+@qd.func
+def func_align_weld_to_world_plane(
+    i_e, i_b, cup_link, anchor_quat,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+):
+    """Save the nearest horizontal cup frame, including its local frame offset."""
+    cup_quat = gu.qd_quat_mul(dyn_state.links.quat[cup_link, i_b], anchor_quat)
+    rotation = gu.qd_quat_to_R(cup_quat, rigid_info.EPS[None])
+    # Minimize ||Rz(yaw) - Rcup||_F: fit both projected horizontal axes.
+    yaw_x = rotation[0, 0] + rotation[1, 1]
+    yaw_y = rotation[1, 0] - rotation[0, 1]
+    # At an exactly upside-down cup the closest yaw is nonunique. Choose
+    # projected +X deterministically instead of relying on atan2(0, 0).
+    if yaw_x * yaw_x + yaw_y * yaw_y < 1.0e-12:
+        yaw_x = rotation[0, 0]
+        yaw_y = rotation[1, 0]
+    half_yaw = 0.5 * qd.atan2(yaw_y, yaw_x)
+    plane_quat = gs.qd_vec4([qd.cos(half_yaw), 0.0, 0.0, qd.sin(half_yaw)])
+    target_link_quat = gu.qd_quat_mul(plane_quat, gu.qd_inv_quat(anchor_quat))
+    link1_idx = dyn_info.equalities.eq_obj1id[i_e, i_b]
+    link2_idx = dyn_info.equalities.eq_obj2id[i_e, i_b]
+    relpose = gu.qd_quat_mul(gu.qd_inv_quat(target_link_quat), dyn_state.links.quat[link2_idx, i_b])
+    if cup_link == link2_idx:
+        relpose = gu.qd_quat_mul(gu.qd_inv_quat(dyn_state.links.quat[link1_idx, i_b]), target_link_quat)
+    for axis in qd.static(range(4)):
+        dyn_info.equalities.eq_data[i_e, i_b][axis + 6] = relpose[axis]
+
+
 @qd.kernel(fastcache=True)
 def kernel_add_dynamic_constraint(
     link1_idx: int,
@@ -2788,6 +2847,11 @@ def kernel_apply_soft_weld_masked(
     local_y: qd.f32,
     local_z: qd.f32,
     other_anchor_z: qd.types.ndarray(),
+    align_to_world_plane: qd.i32,
+    anchor_qw: qd.f32,
+    anchor_qx: qd.f32,
+    anchor_qy: qd.f32,
+    anchor_qz: qd.f32,
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo,
@@ -2872,6 +2936,11 @@ def kernel_apply_soft_weld_masked(
                     for i_axis in qd.static(range(3)):
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    if align_to_world_plane:
+                        func_align_weld_to_world_plane(
+                            i_e, i_b, cup_link, gs.qd_vec4([anchor_qw, anchor_qx, anchor_qy, anchor_qz]),
+                            dyn_state, dyn_info, rigid_info,
+                        )
                     scale = gain_scale[i_b]
                     damping_scale = qd.sqrt(scale)
                     dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
@@ -2904,6 +2973,11 @@ def kernel_add_soft_weld_constraint(
     local_z: qd.f32,
     project_other_anchor: qd.i32,
     other_anchor_z: qd.f32,
+    align_to_world_plane: qd.i32,
+    anchor_qw: qd.f32,
+    anchor_qx: qd.f32,
+    anchor_qy: qd.f32,
+    anchor_qz: qd.f32,
     envs_idx: qd.types.ndarray(),
     dyn_state: array_class.DynState,
     constraint_state: array_class.ConstraintState,
@@ -2952,8 +3026,8 @@ def kernel_add_soft_weld_constraint(
                 )
                 if has_anchor_pos or has_anchor_local:
                     anchor = gs.qd_vec3([anchor_x, anchor_y, anchor_z])
+                    anchor_link = link1_idx
                     if has_anchor_local:
-                        anchor_link = link1_idx
                         if local_anchor_on_second:
                             anchor_link = link2_idx
                         anchor = gu.qd_transform_by_trans_quat(
@@ -2977,6 +3051,11 @@ def kernel_add_soft_weld_constraint(
                     for i_axis in qd.static(range(3)):
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
                         dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    if align_to_world_plane:
+                        func_align_weld_to_world_plane(
+                            i_e, i_b, anchor_link, gs.qd_vec4([anchor_qw, anchor_qx, anchor_qy, anchor_qz]),
+                            dyn_state, dyn_info, rigid_info,
+                        )
                 dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
                     [linear_stiffness, linear_damping, angular_stiffness, angular_damping, max_force, max_torque]
                 )

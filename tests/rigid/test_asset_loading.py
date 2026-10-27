@@ -274,8 +274,6 @@ def test_urdf_parsing(show_viewer, tol):
         for key in ((False, False), (False, True), (True, False), (True, True)):
             entities[key].set_pos(np.array([0.5, 0.0, 0.0]), relative=relative)
             entities[key].set_quat(np.array([0.0, 0.0, 0.0, 1.0]), relative=relative)
-        if show_viewer:
-            scene.visualizer.update()
         _check_entity_positions(0.0, tol=tol)
 
     # Check that `set_qpos` applies the same absolute transform in all cases. The fixed roots have no free joint to
@@ -291,8 +289,6 @@ def test_urdf_parsing(show_viewer, tol):
         entities[key].set_pos(np.array([0.0, config_y, 0.0]), relative=False)
         entities[key].set_quat(np.array(world_quat), relative=False)
         entities[key].set_qpos(door_angle)
-    if show_viewer:
-        scene.visualizer.update()
     _check_entity_positions(POS_OFFSET, tol=tol)
 
     # Add dof damping to stabilitze the physics
@@ -2035,8 +2031,11 @@ def test_align_heterogeneous_inertial(show_viewer, tol):
     dof_pos = het_obj.get_dofs_position()
     assert_allclose(dof_pos[..., -1], target_dof_pos, tol=1e-3)
     het_links_pos = het_obj.get_links_pos(relative=False)
-    assert_allclose(het_links_pos[..., 1, 0] - het_links_pos[..., 0, 0], target_dof_pos + 0.1, tol=1e-3)
-    assert_allclose(het_links_pos[..., 1, 1:], het_links_pos[..., 0, 1:], tol=5e-3)
+    links_offset = gu.inv_transform_by_quat(
+        het_links_pos[..., 1, :] - het_links_pos[..., 0, :], het_obj.get_quat(relative=False)
+    )
+    assert_allclose(links_offset[..., 0], target_dof_pos + 0.1, tol=1e-3)
+    assert_allclose(links_offset[..., 1:], 0.0, tol=tol)
 
     # Check that the acceleration is matching the analytical formula
     links_mass = qd_to_numpy(scene.rigid_solver.dyn_info.links.inertial_mass, None, links_idx, transpose=True)

@@ -315,7 +315,7 @@ def create_modified_narrowphase_file(tmp_path: Path):
         "_func_multicontact_detect(",
         ERRNO_CALLED_GJK_K2,
         "MODIFIED: GJK path in multicontact",
-        "collider_state.narrowphase_work_queues.mpr_i_b[i_work]",
+        "collider_state.work_queue.i_b[i_work]",
     )
 
     content = "\n".join(lines)
@@ -442,11 +442,10 @@ class AnalyticalVsGJKSceneCreator:
         self.scene_gjk._sim.rigid_solver._errno.fill(0)
         self.scene_gjk.step()
         errno_val = self.scene_gjk._sim.rigid_solver._errno[0]
-        use_split_narrowphase = self.scene_gjk._sim.rigid_solver.collider._use_split_narrowphase
-        if use_split_narrowphase:
-            # Kernel1 always runs GJK for collision detection (analytical paths are disabled).
-            assert (errno_val & ERRNO_CALLED_GJK_K1) != 0, "GJK scene should use GJK in contact0."
         if expect_collision:
+            # Kernel1 runs GJK on every pair left by the broad phase (analytical paths are disabled).
+            if self.scene_gjk._sim.rigid_solver.collider._use_split_narrowphase:
+                assert (errno_val & ERRNO_CALLED_GJK_K1) != 0, "GJK scene should use GJK in contact0."
             # On GPU: multicontact is reached when contact0 detects a collision and enqueues the pair.
             # On CPU: the monolithic kernel calls gjk.func_gjk_contact directly (skipping gjk.func_gjk).
             assert (errno_val & ERRNO_CALLED_GJK_K2) != 0, "GJK scene should use GJK for contact generation."
@@ -1096,8 +1095,6 @@ def test_maximum_contact_area(show_viewer, tol):
         tops_z = envs_scale * (PILLAR_HEIGHT - PENETRATION) - envs_corners_z
         top.set_pos(np.concatenate((offsets, tops_z[:, None]), axis=-1))
         top.set_quat(quats)
-        if show_viewer:
-            scene.visualizer.update()
         scene.rigid_solver.collider.clear()
         scene.rigid_solver.collider.detection()
         contacts = scene.rigid_solver.collider.get_contacts(as_tensor=False, to_torch=False)

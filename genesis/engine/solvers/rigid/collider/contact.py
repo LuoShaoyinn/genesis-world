@@ -158,6 +158,28 @@ def rotmatx(i0: int, i1: int, i2: int, matin: qd.types.matrix(3, 3), f0: int, f1
     return matres
 
 
+@qd.func
+def func_collider_reset_env(
+    i_b: int,
+    collider_state: array_class.ColliderState,
+    collider_static_config: qd.template(),
+    cache_only: qd.template(),
+):
+    """Drop what the collision detection of env i_b carries over from the previous steps.
+
+    The cache of contact normals and penetrations warm-starts the next detection. Unless 'cache_only', the next
+    detection also runs as the first one.
+    """
+    if qd.static(not cache_only):
+        collider_state.first_time[i_b] = True
+
+    # The contact cache is only held for the convex-convex pairs (see get_contact_cache in array_class.py)
+    if qd.static(collider_static_config.has_non_box_plane_convex_convex):
+        for i_pair in range(collider_state.contact_cache.normal.shape[0]):
+            collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+
+
 @qd.kernel(fastcache=True)
 def collider_kernel_reset(
     envs_idx: qd.types.ndarray(),
@@ -169,15 +191,46 @@ def collider_kernel_reset(
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=cache_only)
 
-        if qd.static(not cache_only):
-            collider_state.first_time[i_b] = True
 
-        # The contact cache is only held for the convex-convex pairs (see get_contact_cache in array_class.py)
-        if qd.static(collider_static_config.has_non_box_plane_convex_convex):
-            for i_pair in range(collider_state.contact_cache.normal.shape[0]):
-                collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
-                collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
+@qd.func
+def func_add_contacts_force_to_links(
+    i_b: int, dyn_state: array_class.DynState, collider_state: array_class.ColliderState
+):
+    """Add the force of every contact of env i_b to the contact force of the two links it pairs.
+
+    The forces are summed in contact order, which keeps the rounding of the sum fixed.
+    """
+    for i_c in range(collider_state.n_contacts[i_b]):
+        i_col = collider_state.contact_sort_idx[i_c, i_b]
+        i_la = collider_state.contact_data.link_a[i_col, i_b]
+        i_lb = collider_state.contact_data.link_b[i_col, i_b]
+        force = collider_state.contact_data.force[i_col, i_b]
+        dyn_state.links.contact_force[i_la, i_b] = dyn_state.links.contact_force[i_la, i_b] - force
+        dyn_state.links.contact_force[i_lb, i_b] = dyn_state.links.contact_force[i_lb, i_b] + force
+
+
+@qd.func
+def func_is_link_pair_hibernated(
+    i_la: int,
+    i_lb: int,
+    i_b: int,
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_config: qd.template(),
+):
+    """Check whether two links stand still in an environment: one sleeps and the other sleeps or is fixed.
+
+    The broadphase skips such a pair and the clear pass keeps its contacts from the last solve it took part in.
+    """
+    I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
+    I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
+    is_a_hibernated = dyn_state.links.is_hibernated[i_la, i_b]
+    is_b_hibernated = dyn_state.links.is_hibernated[i_lb, i_b]
+    return (is_a_hibernated and (is_b_hibernated or dyn_info.links.is_fixed[I_lb])) or (
+        is_b_hibernated and dyn_info.links.is_fixed[I_la]
+    )
 
 
 @qd.func
@@ -190,13 +243,13 @@ def func_collider_clear_env(
     rigid_config: qd.template(),
 ):
     if qd.static(rigid_config.use_hibernation):
-        # Advect the contacts of the sleepers: a hibernated-fixed pair stays where it is, so its contact is kept at the
-        # front of the buffer with the force of the last solve it took part in (see n_contacts_hibernated in
-        # array_class.py for what reads the kept range). The contacts are first flagged on their raw slot, in the sort
-        # key the narrowphase rewrites before reading it, then compacted in raw order: every slot written to was
-        # already read, so no kept contact is overwritten. The kept range then lists them in their last logical order
-        # (see func_sort_contacts), the raw order following the narrowphase's slot allocation, which the GPU leaves to
-        # atomics. An env with no sleeper keeps none (see n_awake_dofs in array_class.py).
+        # Advect the contacts of the sleepers: a pair standing still (func_is_link_pair_hibernated) stays where it is,
+        # so its contact is kept at the front of the buffer with the force of the last solve it took part in (see
+        # n_contacts_hibernated in array_class.py for what reads the kept range). The contacts are first flagged on
+        # their raw slot, in the sort key the narrowphase rewrites before reading it, then compacted in raw order: every
+        # slot written to was already read, so no kept contact is overwritten. The kept range then lists them in their
+        # last logical order (see func_sort_contacts), the raw order following the narrowphase's slot allocation, which
+        # the GPU leaves to atomics. An env with no sleeper keeps none (see n_awake_dofs in array_class.py).
         n_hib = 0
         if rigid_info.n_awake_dofs[i_b] < dyn_state.dofs.is_hibernated.shape[0]:
             n_raw = 0
@@ -208,11 +261,7 @@ def func_collider_clear_env(
                 i_c = collider_state.contact_sort_idx[i_c_, i_b]
                 i_la = collider_state.contact_data.link_a[i_c, i_b]
                 i_lb = collider_state.contact_data.link_b[i_c, i_b]
-                I_la = [i_la, i_b] if qd.static(rigid_config.batch_links_info) else i_la
-                I_lb = [i_lb, i_b] if qd.static(rigid_config.batch_links_info) else i_lb
-                if (dyn_state.links.is_hibernated[i_la, i_b] and dyn_info.links.is_fixed[I_lb]) or (
-                    dyn_state.links.is_hibernated[i_lb, i_b] and dyn_info.links.is_fixed[I_la]
-                ):
+                if func_is_link_pair_hibernated(i_la, i_lb, i_b, dyn_state, dyn_info, rigid_config):
                     collider_state.contact_sort_key[i_c, i_b] = 1.0
             n_hib = 0
             for i_c in range(n_raw):
@@ -267,14 +316,21 @@ def func_collider_clear_env(
 
 
 @qd.func
-def func_promote_woken_contacts(i_b: int, dyn_state: array_class.DynState, collider_state: array_class.ColliderState):
+def func_promote_woken_contacts(
+    i_b: int,
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    dyn_info: array_class.DynInfo,
+    rigid_config: qd.template(),
+):
     """Move the kept contacts of the links of env i_b that woke this step among the live contacts.
 
     A kept contact holds where its sleeper rests, and the narrowphase left the sleeper's pairs out while it slept, so
-    the woken link would solve its wake step without its support otherwise. The promoted contact moves to the end of
-    the kept range, which shrinks past it onto the first live slot (see n_contacts_hibernated in array_class.py), and
-    the kept contacts behind it close the gap in their order, so the getters keep listing the contacts of the links
-    still asleep as they stood. The caller then sorts the live range.
+    the woken link would solve its wake step without its support otherwise. A contact is promoted once its pair no
+    longer stands still (func_is_link_pair_hibernated). The promoted contact moves to the end of the kept range, which
+    shrinks past it onto the first live slot (see n_contacts_hibernated in array_class.py), and the kept contacts
+    behind it close the gap in their order, so the getters keep listing the contacts of the links still asleep as they
+    stood. The caller then sorts the live range.
     """
     n_hib = collider_state.n_contacts_hibernated[i_b]
     i_c_ = 0
@@ -282,8 +338,7 @@ def func_promote_woken_contacts(i_b: int, dyn_state: array_class.DynState, colli
         i_c = collider_state.contact_sort_idx[i_c_, i_b]
         i_la = collider_state.contact_data.link_a[i_c, i_b]
         i_lb = collider_state.contact_data.link_b[i_c, i_b]
-        # A kept contact pairs a sleeper with a fixed link, which never sleeps: both flags clear means the sleeper woke
-        if dyn_state.links.is_hibernated[i_la, i_b] or dyn_state.links.is_hibernated[i_lb, i_b]:
+        if func_is_link_pair_hibernated(i_la, i_lb, i_b, dyn_state, dyn_info, rigid_config):
             i_c_ = i_c_ + 1
         else:
             n_hib = n_hib - 1
@@ -301,11 +356,17 @@ def kernel_collider_clear(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b_ in range(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=False)
         func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
+        # Only the contacts of the sleepers remain listed, so their links alone keep a contact force
+        for i_l in range(dyn_state.links.contact_force.shape[0]):
+            dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+        func_add_contacts_force_to_links(i_b, dyn_state, collider_state)
 
 
 @qd.kernel(fastcache=True)
@@ -316,11 +377,17 @@ def kernel_masked_collider_clear(
     dyn_info: array_class.DynInfo,
     rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(),
+    collider_static_config: qd.template(),
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
     for i_b in range(envs_mask.shape[0]):
         if envs_mask[i_b]:
+            func_collider_reset_env(i_b, collider_state, collider_static_config, cache_only=False)
             func_collider_clear_env(i_b, dyn_state, collider_state, dyn_info, rigid_info, rigid_config)
+            # See 'kernel_collider_clear'
+            for i_l in range(dyn_state.links.contact_force.shape[0]):
+                dyn_state.links.contact_force[i_l, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            func_add_contacts_force_to_links(i_b, dyn_state, collider_state)
 
 
 @qd.kernel(fastcache=True)
@@ -1106,14 +1173,9 @@ def func_contact_support_hull(
                 i_ht = i_p
                 n_hull = n_hull + 1
 
-    # A hull vertex whose removal shrinks the hull by less than the fraction 'tol' of its area barely changes the
-    # support polygon, while one carrying a sizeable part of it stays, the corners of a sliver among them. The area lost
-    # is that of the triangle of the vertex with its two neighbours. Only the vertices losing strictly less than both
-    # neighbours are removed, which never removes two neighbours at once, so that every loss is that of the hull as it
-    # stands. Equal losses are ordered by the projected positions of the vertices, read lexicographically, which keeps
-    # the outcome independent of the order of the hull while a symmetric pair of neighbours, whose losses tie exactly,
-    # still loses one of them. Areas are compared twice over to spare the halving. A removed vertex is marked by
-    # encoding its contact index as negative, since its neighbours read it afterwards.
+    # Area-based removal limits each lost triangle to 'tol' of the original hull area. Removing local minima keeps
+    # adjacent corners for the next pass. Projected positions order near-equal losses (see area_rounding below).
+    # Negative contact indices mark removed corners while their neighbours still read them during the pass.
     hull_area_2 = gs.qd_float(0.0)
     hull_perimeter = gs.qd_float(0.0)
     # Collinear edge points follow the deep-interior rule. Preserve the deepest corner during area simplification
@@ -1136,6 +1198,8 @@ def func_contact_support_hull(
                 i_cb_deepest = i_cb
         pos_prev = pos_p
     area_tol = tol * qd.abs(hull_area_2)
+    # Near-equal area losses use the projected positions to keep corner selection stable under positional rounding.
+    area_rounding = rounding * hull_perimeter
 
     # A hull whose doubled area is within 'rounding' times its perimeter is a segment, every point within rounding of
     # one line. Its support is its two ends, the two vertices farthest apart, which a sweep to the farthest vertex from
@@ -1189,15 +1253,11 @@ def func_contact_support_hull(
                 is_vertex_collinear = losses[1] <= rounding * (dir_in.norm() + dir_out.norm())
                 is_least = True
                 for i_k in qd.static((0, 2)):
-                    is_least = is_least and (
-                        losses[1] < losses[i_k]
-                        or (
-                            losses[1] <= losses[i_k]
-                            and (
-                                poss[1, 0] < poss[i_k, 0] or (poss[1, 0] <= poss[i_k, 0] and poss[1, 1] < poss[i_k, 1])
-                            )
-                        )
-                    )
+                    # Removal eligibility takes precedence over positional tie-breaking.
+                    is_tie = qd.abs(losses[1] - losses[i_k]) <= area_rounding
+                    is_tie = is_tie and ((losses[1] <= area_tol) == (losses[i_k] <= area_tol))
+                    is_before = poss[1, 0] < poss[i_k, 0] or (poss[1, 0] <= poss[i_k, 0] and poss[1, 1] < poss[i_k, 1])
+                    is_least = is_least and ((not is_tie and losses[1] < losses[i_k]) or (is_tie and is_before))
                 if is_between and is_least and (is_vertex_collinear or losses[1] <= area_tol):
                     i_c = collider_state.contact_hull_stack[i_cb_start + i_h, i_b]
                     collider_state.contact_hull_stack[i_cb_start + i_h, i_b] = -1 - i_c

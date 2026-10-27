@@ -58,9 +58,6 @@ if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
 
 
-IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
-
-
 NEUTRAL_COLLISION_RES_ABS = 0.01
 NEUTRAL_COLLISION_RES_REL = 0.05
 
@@ -94,15 +91,22 @@ class Collider:
             and not self._solver._requires_grad
         )
 
+        # Two threads per core fill the warp slots the register use of the terrain pass leaves
+        self._n_terrain_threads = 1
+        if self.collider_config.has_terrain and gs.backend != gs.cpu:
+            self._n_terrain_threads = 2 * self.collider_config.gpu_cores
         # The split narrowphase launches one thread per core, its contact0 pass rounding up to whole environments. An
         # upper-bound estimate of the core count sizes these launches (Genesis-Embodied-AI/Genesis#2616).
         if self._use_split_narrowphase:
             gpu_cores = self.collider_config.gpu_cores
             n_contact0_threads = self._solver._B * ((gpu_cores + self._solver._B - 1) // self._solver._B)
-            self.mpr.activate(n_contact0_threads, gpu_cores)
+            self.mpr.activate(n_contact0_threads, max(gpu_cores, self._n_terrain_threads))
             self.gjk.activate(n_contact0_threads, gpu_cores)
-        elif self.collider_config.has_non_box_plane_convex_convex:
-            self.gjk.activate()
+        else:
+            if self._n_terrain_threads > 1:
+                self.mpr.activate(None, self._n_terrain_threads)
+            if self.collider_config.has_non_box_plane_convex_convex:
+                self.gjk.activate()
         if self.collider_config.has_terrain or self.collider_config.has_non_box_plane_convex_convex:
             self._support_field.activate()
 
@@ -151,6 +155,8 @@ class Collider:
             structs += [(self.gjk, name) for name in ("contact0_gjk_state", "multicontact_gjk_state")]
         elif self.collider_config.has_non_box_plane_convex_convex:
             structs.append((self.gjk, "gjk_state"))
+        if self._n_terrain_threads > 1 and not self._use_split_narrowphase:
+            structs.append((self.mpr, "multicontact_mpr_state"))
         for owner, name in structs:
             yield from array_class.iter_data(owner, name)
 
@@ -303,6 +309,7 @@ class Collider:
             self._solver,
             self._solver.rigid_config,
             n_possible_pairs_,
+            self._n_terrain_threads,
             self.collider_info,
             self.collider_config,
             split_narrowphase=self._use_split_narrowphase,
@@ -531,8 +538,10 @@ class Collider:
         # --- Build collision_pair_idx, valid pairs list, and count ---
         valid_indices = np.where(valid)[0]
         n_possible_pairs = len(valid_indices)
+        # Symmetric, so a pair finds its index in whichever order it comes (see func_broad_phase_geoms)
         collision_pair_idx = np.full((n_geoms, n_geoms), fill_value=-1, dtype=gs.np_int)
         collision_pair_idx[row[valid_indices], col[valid_indices]] = np.arange(n_possible_pairs, dtype=gs.np_int)
+        collision_pair_idx[col[valid_indices], row[valid_indices]] = np.arange(n_possible_pairs, dtype=gs.np_int)
 
         valid_collision_pairs = np.stack([row[valid_indices], col[valid_indices]], axis=1).astype(gs.np_int)
 
@@ -800,58 +809,13 @@ class Collider:
         )
 
     def clear(self, envs_idx=None):
-        self.reset(envs_idx, cache_only=False)
+        """Remove the contacts of the environments 'envs_idx' (None for all of them), with their forces.
 
-        if (
-            gs.use_zerocopy
-            and self._contact_data is not None
-            and not self._solver._use_hibernation
-            and (not isinstance(envs_idx, torch.Tensor) or (not IS_OLD_TORCH or envs_idx.dtype == torch.bool))
-        ):
-            n_contacts = qd_to_torch(self.collider_state.n_contacts, copy=False)
-            link_a = qd_to_torch(self.collider_state.contact_data.link_a, copy=False)
-            link_b = qd_to_torch(self.collider_state.contact_data.link_b, copy=False)
-            geom_a = qd_to_torch(self.collider_state.contact_data.geom_a, copy=False)
-            geom_b = qd_to_torch(self.collider_state.contact_data.geom_b, copy=False)
-            penetration = qd_to_torch(self.collider_state.contact_data.penetration, copy=False)
-            pos = qd_to_torch(self.collider_state.contact_data.pos, copy=False)
-            normal = qd_to_torch(self.collider_state.contact_data.normal, copy=False)
-            force = qd_to_torch(self.collider_state.contact_data.force, copy=False)
-            if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
-                n_contacts.masked_fill_(envs_idx, 0)
-                link_a.masked_fill_(envs_idx[None, :], -1)
-                link_b.masked_fill_(envs_idx[None, :], -1)
-                geom_a.masked_fill_(envs_idx[None, :], -1)
-                geom_b.masked_fill_(envs_idx[None, :], -1)
-                penetration.masked_fill_(envs_idx[None, :], 0.0)
-                pos.masked_fill_(envs_idx[None, :, None], 0.0)
-                normal.masked_fill_(envs_idx[None, :, None], 0.0)
-                force.masked_fill_(envs_idx[None, :, None], 0.0)
-            elif isinstance(envs_idx, torch.Tensor):
-                n_contacts.scatter_(0, envs_idx, 0)
-                link_a.scatter_(1, envs_idx[None, :].expand(link_a.shape[0], -1), -1)
-                link_b.scatter_(1, envs_idx[None, :].expand(link_b.shape[0], -1), -1)
-                geom_a.scatter_(1, envs_idx[None, :].expand(geom_a.shape[0], -1), -1)
-                geom_b.scatter_(1, envs_idx[None, :].expand(geom_b.shape[0], -1), -1)
-                penetration.scatter_(1, envs_idx[None, :].expand(link_a.shape[0], -1), 0.0)
-                pos.scatter_(1, envs_idx[None, :, None].expand(link_a.shape[0], -1, 3), 0.0)
-                normal.scatter_(1, envs_idx[None, :, None].expand(link_a.shape[0], -1, 3), 0.0)
-                force.scatter_(1, envs_idx[None, :, None].expand(link_a.shape[0], -1, 3), 0.0)
-            else:
-                env_mask = indices_to_mask(envs_idx)
-                n_contacts[env_mask] = 0
-                link_a[:, envs_idx] = -1
-                link_b[:, envs_idx] = -1
-                geom_a[:, envs_idx] = -1
-                geom_b[:, envs_idx] = -1
-                penetration[:, envs_idx] = 0.0
-                pos[:, envs_idx] = 0.0
-                normal[:, envs_idx] = 0.0
-                force[:, envs_idx] = 0.0
-            if gs.backend == gs.metal:
-                torch.mps.synchronize()
-            return
-
+        A hibernated entity keeps the contacts it rests on, with the forces of the last solve it took part in, for as
+        long as it sleeps. The contact force of every link is then the sum of the forces of the contacts it keeps.
+        """
+        self._contact_data_cache.clear()
+        # A kernel wipes the live contacts alone, while views over the contact buffers would wipe every slot of them
         if not isinstance(envs_idx, torch.Tensor):
             envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         if isinstance(envs_idx, torch.Tensor) and envs_idx.dtype == torch.bool:
@@ -865,6 +829,7 @@ class Collider:
             self._solver.dyn_info,
             self._solver.rigid_info,
             self._solver.rigid_config,
+            self.collider_config,
         )
 
     def detection(self) -> None:
@@ -1041,6 +1006,7 @@ def func_detection(
     func_update_geom_aabbs(geoms_init_AABB, dyn_state, dyn_info, rigid_config)
     if qd.static(has_possible_pairs):
         func_broad_phase(
+            geoms_init_AABB,
             dyn_state,
             collider_state,
             constraint_state,
@@ -1112,7 +1078,7 @@ def func_detection(
                 geoms_init_AABB,
                 dyn_state,
                 collider_state,
-                mpr_state,
+                multicontact_mpr_state,
                 dyn_info,
                 rigid_info,
                 collider_info,

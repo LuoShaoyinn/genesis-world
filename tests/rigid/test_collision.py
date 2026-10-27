@@ -362,8 +362,6 @@ def test_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_vie
 
     entity.set_pos(smooth_pos_world)
     entity.set_quat(smooth_quat_world)
-    if show_viewer:
-        scene.visualizer.update()
 
     for i_step in range(400):
         scene.step()
@@ -372,6 +370,70 @@ def test_no_drift(gjk_collision, entity_kind, entity_type, ground_type, show_vie
     # A tessellated ball settles into the basin of whichever facet it rests on, which is what this bound covers: it
     # sits a little over twice the largest displacement any entity here needs, in either precision.
     assert_allclose(pos_local[..., :2], smooth_xy_local, atol=5e-4)
+
+
+@pytest.mark.required
+@pytest.mark.xfail(reason="Flickering contact points make the entities drift at rest.", strict=False)
+@pytest.mark.parametrize("precision", ["32"])
+def test_convex_on_primitive_at_rest(show_viewer, tol):
+    # The tilt is generic, so that the faces of the supports are aligned with no world axis. The gravity vector is
+    # rotated by the same tilt, which leaves the entities nothing to slide down.
+    tilt_quat = gu.xyz_to_quat(np.radians((3.5, 1.2, 23.0)), rpy=True)
+    R = gu.quat_to_R(tilt_quat)
+    cube_mesh = trimesh.creation.box(extents=(0.06, 0.06, 0.06))
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=R @ (0.0, 0.0, -9.81),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.1, -0.3, 0.25),
+            camera_lookat=(0.1, 0.0, 0.1),
+            camera_fov=40,
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        gs.morphs.Cylinder(
+            pos=(0.0, 0.0, 0.1),
+            quat=tilt_quat,
+            fixed=True,
+            height=0.008,
+            radius=0.05,
+        ),
+    )
+    scene.add_entity(
+        gs.morphs.Box(
+            pos=(0.2, 0.0, 0.1),
+            quat=tilt_quat,
+            fixed=True,
+            size=(0.1, 0.1, 0.008),
+        ),
+    )
+    entity_on_cylinder = scene.add_entity(
+        gs.morphs.MeshSet(
+            pos=(0.0, 0.0, 0.1) + R @ (0.004, -0.003, 0.034),
+            quat=tilt_quat,
+            files=(cube_mesh,),
+        ),
+        visualize_contact=True,
+    )
+    entity_on_box = scene.add_entity(
+        gs.morphs.MeshSet(
+            pos=(0.2, 0.0, 0.1) + R @ (0.004, -0.003, 0.034),
+            quat=tilt_quat,
+            files=(cube_mesh,),
+        ),
+        visualize_contact=True,
+    )
+    scene.build(n_envs=2)
+
+    for _ in range(30):
+        scene.step()
+    for _ in range(50):
+        scene.step()
+        assert_allclose(entity_on_cylinder.get_dofs_velocity(), 0.0, tol=tol)
+        assert_allclose(entity_on_box.get_dofs_velocity(), 0.0, tol=tol)
 
 
 @pytest.mark.required
@@ -578,8 +640,6 @@ def test_box_contact_minimal_separation(detection, show_viewer, tol):
                         box.set_dofs_velocity(np.concatenate((vel_lin, np.random.normal(size=(N_ENVS, 3))), axis=-1))
                 boxes_pos[..., 1, :] = np.stack([tensor_to_array(box_b.get_pos()) for _, box_b in pairs_boxes], axis=1)
 
-                if show_viewer:
-                    scene.visualizer.update()
                 scene.rigid_solver.collider.clear()
                 scene.rigid_solver.collider.detection()
             else:
@@ -1333,6 +1393,28 @@ def test_contact_pruning(gjk_collision, show_viewer):
             color=(0, 0, 1, 0.8),
         ),
     )
+    scene.add_entity(
+        morph=gs.morphs.Plane(
+            pos=(0.0, 0.0, -0.3),
+        ),
+    )
+    meshes = []
+    for angle in np.linspace(0.0, np.pi / 2.0, 8, endpoint=False):
+        mesh = trimesh.creation.box(extents=(0.2, 0.2, 0.2))
+        quat = gu.xyz_to_quat(np.array((0.0, 0.0, angle)))
+        mesh.apply_transform(gu.trans_quat_to_T(trans=np.zeros(3), quat=quat))
+        meshes.append(mesh)
+    prism = scene.add_entity(
+        morph=gs.morphs.MeshSet(
+            files=meshes,
+            pos=(0.8, 0.0, 2.0),
+            decimate=False,
+        ),
+        surface=gs.surfaces.Default(
+            smooth=False,
+        ),
+        vis_mode="collision",
+    )
     scene.build(n_envs=2)
     # The box sits in the corner of the three walls in the first environment, and on the edge of the two walls after it
     # in the second one, where its only contacts come from the two link pairs of closest indices
@@ -1384,6 +1466,25 @@ def test_contact_pruning(gjk_collision, show_viewer):
                     f"dropped these {len(idxs) - n_hull_vertices} redundant contact(s):\n{details}"
                 )
     assert_allclose(box.get_pos(), ((0.0, 0.0, 0.0), (0.55, 0.0, 0.0)), atol=2e-3)
+
+    # Micrometre translations preserve the supporting area even when several boundary reductions have equal cost.
+    areas_reference = None
+    for i_step in range(8):
+        positions = np.array(((0.8, 0.0, -0.2001), (1.8, 0.0, -0.2001)))
+        positions[:, 0] += 1e-6 * np.sin(0.3 * i_step)
+        positions[:, 1] += 1e-6 * np.cos(0.7 * i_step)
+        prism.set_pos(positions)
+        prism.set_quat((1.0, 0.0, 0.0, 0.0))
+        scene.step()
+        contacts = prism.get_contacts()
+        contact_positions = tensor_to_array(contacts["position"])
+        contact_mask = tensor_to_array(contacts["valid_mask"])
+        areas = np.array(
+            [ConvexHull(contact_positions[i_b, contact_mask[i_b], :2]).volume for i_b in range(scene.n_envs)]
+        )
+        if areas_reference is None:
+            areas_reference = areas
+        assert_allclose(areas / areas_reference, 1.0, tol=1e-4)
 
 
 @pytest.mark.required
@@ -1583,9 +1684,6 @@ def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
     angle_yaw = np.random.uniform(low=-np.pi, high=np.pi, size=(N_ENVS, 1))
     smooth_quat = gu.xyz_to_quat(np.concatenate([np.zeros((N_ENVS, 2)), angle_yaw], axis=-1), rpy=True)
     entity.set_quat(smooth_quat)
-
-    if show_viewer:
-        scene.visualizer.update()
 
     for _ in range(20):
         scene.step()

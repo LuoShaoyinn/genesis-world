@@ -157,6 +157,7 @@ from .constraint.solver import (
     func_solve_body,
     kernel_request_suction_weld,
     kernel_get_suction_wrench,
+    kernel_contact_gated_soft_weld,
 )
 
 if TYPE_CHECKING:
@@ -1352,6 +1353,20 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             )
             if self._enable_collision:
                 collider.detection()
+            # Contact-gated soft weld valves are applied at every physics substep,
+            # after collision detection and before constraint assembly.
+            for index, (link1, link2, tip, anchor, params) in enumerate(getattr(self, '_contact_soft_welds', ())):
+                kernel_contact_gated_soft_weld(
+                    min(link1, link2), max(link1, link2), tip, index,
+                    self._contact_soft_weld_valves, self._contact_soft_weld_contacts,
+                    self._contact_soft_weld_engages,
+                    params['linear_stiffness'], params['linear_damping'],
+                    params['angular_stiffness'], params['angular_damping'],
+                    params['max_force'], params['max_torque'], int(link1 > link2),
+                    *anchor, 0, 1., 0., 0., 0.,
+                    self.dyn_state, collider.collider_state, constraint_solver.constraint_state,
+                    self.dyn_info, self.rigid_info, self.rigid_config, self._errno,
+                )
             if not self._disable_constraint:
                 kernel_substep_inequality(
                     self.dyn_state,
@@ -1386,6 +1401,28 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not isinstance(self.sim.coupler, SAPCoupler):
             self._is_forward_pos_updated = not self._enable_mujoco_compatibility
             self._is_forward_vel_updated = not self._enable_mujoco_compatibility
+
+    def configure_contact_soft_welds(self, welds):
+        """Configure (cup link, ground link, tip link, local anchor, gains) for substep valves."""
+        from genesis.engine.couplers import SAPCoupler
+        if self._requires_grad or isinstance(self.sim.coupler, SAPCoupler) or not self._enable_collision:
+            raise RuntimeError('Contact-gated soft welds require non-differentiable rigid collision solving')
+        self._contact_soft_welds = tuple(welds)
+        shape = (self._scene.n_envs, len(welds))
+        self._contact_soft_weld_valves = torch.zeros(shape, device=gs.device, dtype=gs.tc_float)
+        self._contact_soft_weld_contacts = torch.zeros(shape, device=gs.device, dtype=torch.bool)
+        self._contact_soft_weld_engages = torch.zeros(shape, device=gs.device, dtype=torch.bool)
+
+    def set_contact_soft_weld_valves(self, valves):
+        """Set per-environment valve requests for the next control interval."""
+        if valves.shape != self._contact_soft_weld_valves.shape:
+            raise ValueError('Wrong contact-gated valve shape')
+        self._contact_soft_weld_valves.copy_(valves)
+        self._contact_soft_weld_contacts.zero_()
+        self._contact_soft_weld_engages.zero_()
+
+    def get_contact_soft_weld_diagnostics(self):
+        return self._contact_soft_weld_contacts, self._contact_soft_weld_engages
 
     def get_error_envs_mask(self):
         return qd_to_torch(self._errno) > 0

@@ -155,6 +155,8 @@ from .constraint.solver import (
     func_add_inequality_constraints,
     func_resolve_post,
     func_solve_body,
+    kernel_request_suction_weld,
+    kernel_get_suction_wrench,
 )
 
 if TYPE_CHECKING:
@@ -3628,6 +3630,48 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             anchor_quat=anchor_quat,
             envs_idx=envs_idx,
         )
+
+    def _suction_request_inputs(self, envs_idx, link_idx):
+        envs = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device).contiguous()
+        links = torch.as_tensor(link_idx, dtype=gs.tc_int, device=gs.device).contiguous()
+        if envs.ndim != 1 or links.shape != envs.shape:
+            raise ValueError('envs_idx and link_idx must be one-dimensional and have equal length')
+        torch._assert_async(((envs >= 0) & (envs < self._scene.n_envs)).all(), 'Invalid environment index')
+        torch._assert_async(((links >= 0) & (links < self.n_links)).all(), 'Invalid link index')
+        planes = [entity for entity in self._scene.entities if isinstance(entity.morph, gs.morphs.Plane)]
+        if len(planes) != 1 or abs(float(planes[0].morph.pos[2])) > 1e-9:
+            raise ValueError('Suction welding requires exactly one plane at z=0')
+        ground = planes[0].base_link.idx
+        torch._assert_async((links != ground).all(), 'Cannot weld the plane to itself')
+        return envs, links, ground
+
+    def request_suction_cup_welding(self, envs_idx, link_idx, stiffness, damping, max_wrench):
+        """Request z=0-plane welds; each [N,6] row is force XYZ then torque XYZ.
+
+        Wrenches become available after a physics substep. Existing active pairs
+        remain unchanged; broken pairs are re-armed at their current poses.
+        """
+        if self._requires_grad:
+            raise RuntimeError('Dynamic suction welds do not support differentiable simulation')
+        envs, links, ground = self._suction_request_inputs(envs_idx, link_idx)
+        arrays = []
+        for name, value in (('stiffness', stiffness), ('damping', damping), ('max_wrench', max_wrench)):
+            value = torch.as_tensor(value, dtype=gs.tc_float, device=gs.device).contiguous()
+            if value.shape != (envs.numel(), 6):
+                raise ValueError(f'{name} must have shape (N, 6)')
+            torch._assert_async((~torch.isnan(value) & (value >= 0)).all(), f'Invalid {name}')
+            arrays.append(value)
+        self.constraint_solver._eq_const_info_cache.clear()
+        kernel_request_suction_weld(envs, links, ground, *arrays, self.dyn_state,
+            self.constraint_solver.constraint_state, self.dyn_info, self.rigid_info, self.rigid_config, self._errno)
+
+    def get_wrench(self, envs_idx, link_idx):
+        """Latest solved world-frame [N,6] wrench; +inf for absent, broken, or unsolved welds."""
+        envs, links, ground = self._suction_request_inputs(envs_idx, link_idx)
+        out = torch.full((envs.numel(), 6), float('inf'), device=gs.device, dtype=gs.tc_float)
+        kernel_get_suction_wrench(envs, links, ground, out, self.constraint_solver.constraint_state,
+                                  self.dyn_info, self.rigid_info, self.rigid_config)
+        return out
 
     def request_soft_weld_constraint(self, link1_idx, link2_idx, **kwargs):
         """Request a trial weld; call the returned handle's result after stepping."""

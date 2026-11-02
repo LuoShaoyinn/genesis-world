@@ -2913,6 +2913,9 @@ class EqualitiesInfo:
     eq_type: qd.Tensor
     sol_params: qd.Tensor
     soft_weld_params: qd.Tensor
+    soft_weld_stiffness: qd.Tensor
+    soft_weld_damping: qd.Tensor
+    soft_weld_max_wrench: qd.Tensor
     soft_weld_force: qd.Tensor
     soft_weld_had_rows: qd.Tensor
 
@@ -2929,6 +2932,9 @@ def get_equalities_info(solver, is_active=True):
         # [linear stiffness, linear damping, angular stiffness, angular damping,
         #  maximum linear row force, maximum angular row force].
         soft_weld_params=V(dtype=gs.qd_vec6, shape=shape),
+        soft_weld_stiffness=V(dtype=gs.qd_vec6, shape=shape),
+        soft_weld_damping=V(dtype=gs.qd_vec6, shape=shape),
+        soft_weld_max_wrench=V(dtype=gs.qd_vec6, shape=shape),
         soft_weld_force=V(dtype=gs.qd_vec6, shape=shape),
         soft_weld_had_rows=V(dtype=gs.qd_bool, shape=shape),
     )

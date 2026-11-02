@@ -3075,67 +3075,71 @@ def kernel_add_soft_weld_constraint(
 @qd.kernel(fastcache=True)
 def kernel_request_suction_weld(
     envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), ground_idx: qd.i32,
+    order: qd.types.ndarray(), offsets: qd.types.ndarray(),
     stiffness: qd.types.ndarray(), damping: qd.types.ndarray(), max_wrench: qd.types.ndarray(),
     dyn_state: array_class.DynState, constraint_state: array_class.ConstraintState,
     dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
     rigid_config: qd.template(), errno: qd.Tensor,
 ):
-    qd.loop_config(serialize=True)
-    for i_b_ in range(envs_idx.shape[0]):
-        i_b = envs_idx[i_b_]
-        link1_idx = qd.min(links_idx[i_b_], ground_idx)
-        link2_idx = qd.max(links_idx[i_b_], ground_idx)
-        anchor_link = links_idx[i_b_]
-        i_broken = gs.qd_int(-1)
-        i_reusable = gs.qd_int(-1)
-        is_duplicate = False
-        for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
-            eq_type = dyn_info.equalities.eq_type[i_e, i_b]
-            same_pair = (
-                dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
-                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
-            ) or (
-                dyn_info.equalities.eq_obj1id[i_e, i_b] == link2_idx
-                and dyn_info.equalities.eq_obj2id[i_e, i_b] == link1_idx
-            )
-            if same_pair and (eq_type == gs.EQUALITY_TYPE.WELD or eq_type == gs.EQUALITY_TYPE.SOFT_WELD):
-                is_duplicate = True
-            if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
-                if i_reusable < 0:
-                    i_reusable = i_e
-                if same_pair:
-                    i_broken = i_e
-        if is_duplicate:
-            pass
-        else:
-            i_e = i_broken
-            if i_e < 0:
-                i_e = i_reusable
-            if i_e < 0:
-                i_e = constraint_state.qd_n_equalities[i_b]
-                if i_e == rigid_info.n_candidate_equalities[None]:
-                    errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_DYNAMIC_EQUALITIES
-                else:
-                    constraint_state.qd_n_equalities[i_b] = i_e + 1
-            if i_e < rigid_info.n_candidate_equalities[None]:
-                func_init_weld_record(
-                    i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.SOFT_WELD, dyn_state, dyn_info, rigid_info
+    qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
+    for i_b in range(offsets.shape[0] - 1):
+        # Each environment has a single writer. Stable sorting preserves the
+        # caller's request order, including duplicate pairs in an environment.
+        for pos in range(offsets[i_b], offsets[i_b + 1]):
+            i_b_ = order[pos]
+            link1_idx = qd.min(links_idx[i_b_], ground_idx)
+            link2_idx = qd.max(links_idx[i_b_], ground_idx)
+            anchor_link = links_idx[i_b_]
+            i_broken = gs.qd_int(-1)
+            i_reusable = gs.qd_int(-1)
+            is_duplicate = False
+            for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
+                eq_type = dyn_info.equalities.eq_type[i_e, i_b]
+                same_pair = (
+                    dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
+                    and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
+                ) or (
+                    dyn_info.equalities.eq_obj1id[i_e, i_b] == link2_idx
+                    and dyn_info.equalities.eq_obj2id[i_e, i_b] == link1_idx
                 )
-                anchor = dyn_state.links.pos[anchor_link, i_b]
-                projected = gs.qd_vec3([anchor[0], anchor[1], 0.0])
-                anchor1 = anchor if anchor_link == link1_idx else projected
-                anchor2 = projected if anchor_link == link1_idx else anchor
-                pos1 = gu.qd_inv_transform_by_trans_quat(anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b])
-                pos2 = gu.qd_inv_transform_by_trans_quat(anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b])
-                for i_axis in qd.static(range(3)):
-                    dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
-                    dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
-                for axis in qd.static(range(6)):
-                    dyn_info.equalities.soft_weld_stiffness[i_e, i_b][axis] = stiffness[i_b_, axis]
-                    dyn_info.equalities.soft_weld_damping[i_e, i_b][axis] = damping[i_b_, axis]
-                    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b][axis] = max_wrench[i_b_, axis]
-                dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
-                dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+                if same_pair and (eq_type == gs.EQUALITY_TYPE.WELD or eq_type == gs.EQUALITY_TYPE.SOFT_WELD):
+                    is_duplicate = True
+                if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
+                    if i_reusable < 0:
+                        i_reusable = i_e
+                    if same_pair:
+                        i_broken = i_e
+            if is_duplicate:
+                pass
+            else:
+                i_e = i_broken
+                if i_e < 0:
+                    i_e = i_reusable
+                if i_e < 0:
+                    i_e = constraint_state.qd_n_equalities[i_b]
+                    if i_e == rigid_info.n_candidate_equalities[None]:
+                        errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_DYNAMIC_EQUALITIES
+                    else:
+                        constraint_state.qd_n_equalities[i_b] = i_e + 1
+                if i_e < rigid_info.n_candidate_equalities[None]:
+                    func_init_weld_record(
+                        i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.SOFT_WELD, dyn_state, dyn_info, rigid_info
+                    )
+                    anchor = dyn_state.links.pos[anchor_link, i_b]
+                    projected = gs.qd_vec3([anchor[0], anchor[1], 0.0])
+                    anchor1 = anchor if anchor_link == link1_idx else projected
+                    anchor2 = projected if anchor_link == link1_idx else anchor
+                    pos1 = gu.qd_inv_transform_by_trans_quat(anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b])
+                    pos2 = gu.qd_inv_transform_by_trans_quat(anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b])
+                    for i_axis in qd.static(range(3)):
+                        dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
+                        dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    for axis in qd.static(range(6)):
+                        dyn_info.equalities.soft_weld_stiffness[i_e, i_b][axis] = stiffness[i_b_, axis]
+                        dyn_info.equalities.soft_weld_damping[i_e, i_b][axis] = damping[i_b_, axis]
+                        dyn_info.equalities.soft_weld_max_wrench[i_e, i_b][axis] = max_wrench[i_b_, axis]
+                    dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
+                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
 
 
 @qd.kernel(fastcache=True)

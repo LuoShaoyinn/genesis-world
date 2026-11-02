@@ -3661,8 +3661,14 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 raise ValueError(f'{name} must have shape (N, 6)')
             torch._assert_async((~torch.isnan(value) & (value >= 0)).all(), f'Invalid {name}')
             arrays.append(value)
+        # Group by environment on-device; each solver thread owns its env's
+        # dynamic constraint list and processes its requests in original order.
+        order = torch.argsort(envs, stable=True)
+        sorted_envs = envs[order].contiguous()
+        boundaries = torch.arange(self._scene.n_envs + 1, device=envs.device, dtype=envs.dtype)
+        offsets = torch.searchsorted(sorted_envs, boundaries, out_int32=True)
         self.constraint_solver._eq_const_info_cache.clear()
-        kernel_request_suction_weld(envs, links, ground, *arrays, self.dyn_state,
+        kernel_request_suction_weld(envs, links, ground, order, offsets, *arrays, self.dyn_state,
             self.constraint_solver.constraint_state, self.dyn_info, self.rigid_info, self.rigid_config, self._errno)
 
     def get_wrench(self, envs_idx, link_idx):

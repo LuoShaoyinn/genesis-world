@@ -1339,6 +1339,9 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             constraint_solver = self.constraint_solver
             collider._contact_data_cache.clear()
             constraint_solver._eq_const_info_cache.clear()
+            # Contact-gated welds change the equality list after collision detection.
+            # Defer row assembly in that case so rows match post-solve bookkeeping.
+            contact_welds = getattr(self, '_contact_soft_welds', ())
             kernel_substep_dynamics(
                 self.dyn_state,
                 collider.collider_state,
@@ -1349,13 +1352,13 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self._is_forward_pos_updated,
                 self._is_forward_vel_updated,
                 self._is_backward,
-                not self._disable_constraint,
+                not self._disable_constraint and not contact_welds,
             )
             if self._enable_collision:
                 collider.detection()
             # Contact-gated soft weld valves are applied at every physics substep,
             # after collision detection and before constraint assembly.
-            for index, (link1, link2, tip, anchor, params) in enumerate(getattr(self, '_contact_soft_welds', ())):
+            for index, (link1, link2, tip, anchor, params) in enumerate(contact_welds):
                 kernel_contact_gated_soft_weld(
                     min(link1, link2), max(link1, link2), tip, index,
                     self._contact_soft_weld_valves, self._contact_soft_weld_contacts,
@@ -1368,6 +1371,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     self.dyn_info, self.rigid_info, self.rigid_config, self._errno,
                 )
             if not self._disable_constraint:
+                if contact_welds:
+                    kernel_substep_equality(
+                        self.dyn_state, collider.collider_state, constraint_solver.constraint_state,
+                        self.dyn_info, self.rigid_info, self.rigid_config,
+                    )
                 kernel_substep_inequality(
                     self.dyn_state,
                     collider.collider_state,
@@ -1405,7 +1413,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     def configure_contact_soft_welds(self, welds):
         """Configure (cup link, ground link, tip link, local anchor, gains) for substep valves."""
         from genesis.engine.couplers import SAPCoupler
-        if self._requires_grad or isinstance(self.sim.coupler, SAPCoupler) or not self._enable_collision:
+        if self._requires_grad or isinstance(self.sim.coupler, SAPCoupler) or not self._enable_collision or self._disable_constraint:
             raise RuntimeError('Contact-gated soft welds require non-differentiable rigid collision solving')
         self._contact_soft_welds = tuple(welds)
         shape = (self._scene.n_envs, len(welds))
@@ -3964,6 +3972,19 @@ def kernel_substep_dynamics(
     )
     if qd.static(enable_constraint):
         func_add_equality_constraints(dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_substep_equality(
+    dyn_state: array_class.DynState,
+    collider_state: array_class.ColliderState,
+    constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Assemble equality rows after contact-gated weld mutations."""
+    func_add_equality_constraints(dyn_state, collider_state, constraint_state, dyn_info, rigid_info, rigid_config)
 
 
 @qd.kernel(graph=True, fastcache=True)

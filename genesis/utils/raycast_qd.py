@@ -4,7 +4,7 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.bvh import func_build_bvh
-from genesis.engine.solvers.rigid.rigid_solver import func_update_all_verts
+from genesis.engine.solvers.rigid.abd.forward_kinematics import func_update_all_verts
 
 
 # FIXME: get_triangle_vertices/bvh_ray_cast/update_aabbs duplicate their visual counterparts below. The two paths
@@ -48,6 +48,7 @@ def bvh_ray_cast(
     bvh_tree_state: array_class.BVHTreeState,
     dyn_info: array_class.DynInfo,
     eps: float,
+    accept_origin: int = 0,
 ):
     """
     Cast a ray through a BVH and find the closest intersection.
@@ -104,7 +105,7 @@ def bvh_ray_cast(
                 v0, v1, v2 = tri_vertices[:, 0], tri_vertices[:, 1], tri_vertices[:, 2]
 
                 # Perform ray-triangle intersection
-                hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps)
+                hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps, accept_origin)
 
                 if hit_distance >= 0.0 and hit_distance < closest_distance:
                     closest_distance = hit_distance
@@ -169,6 +170,7 @@ def ray_triangle_intersection(
     v1: qd.types.vector(3),
     v2: qd.types.vector(3),
     eps: float,
+    accept_origin: int = 0,
 ):
     """
     Watertight ray-triangle intersection in the ray frame produced by ray_projection.
@@ -207,7 +209,7 @@ def ray_triangle_intersection(
     if is_crossing and det != 0.0:
         # A zero determinant means the ray runs within the triangle plane, where it has no single crossing point.
         t = edge_areas.dot(verts_z) / det
-        if t > eps:
+        if t > eps or (accept_origin and t >= 0.0):
             hit_distance = t
 
     return hit_distance
@@ -440,7 +442,7 @@ def bvh_ray_cast_visual(
                 tri_vertices = get_visual_triangle_vertices(i_f, i_b, dyn_state, dyn_info)
                 v0, v1, v2 = tri_vertices[:, 0], tri_vertices[:, 1], tri_vertices[:, 2]
 
-                hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps)
+                hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps, False)
 
                 if hit_distance >= 0.0 and hit_distance < closest_distance:
                     closest_distance = hit_distance
@@ -672,6 +674,7 @@ def kernel_cast_ray(
                 bvh_tree_state,
                 dyn_info,
                 eps,
+                False,
             )
         if cur_hit_face >= 0:
             result.distance[i_b] = cur_distance
@@ -859,6 +862,7 @@ def kernel_cast_rays(
             bvh_tree_state_a,
             dyn_info,
             eps,
+            False,
         )
         if qd.static(is_split):
             hit_range = max_ranges[i_s] if hit_face < 0 else hit_distance
@@ -872,6 +876,7 @@ def kernel_cast_rays(
                 bvh_tree_state_b,
                 dyn_info,
                 eps,
+                False,
             )
             if hit_face_b >= 0:
                 hit_face = hit_face_b

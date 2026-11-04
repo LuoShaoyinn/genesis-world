@@ -2701,6 +2701,56 @@ def add_frictionloss_constraints(
 
 
 @qd.func
+def func_remove_dynamic_equality(
+    i_e, i_b, constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo,
+):
+    """Swap-remove a dynamic equality, including all soft-weld state."""
+    last = constraint_state.qd_n_equalities[i_b] - 1
+    if i_e < last:
+        dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[last, i_b]
+        dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[last, i_b]
+        dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[last, i_b]
+        dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[last, i_b]
+        dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[last, i_b]
+        dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[last, i_b]
+        dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = dyn_info.equalities.soft_weld_stiffness[last, i_b]
+        dyn_info.equalities.soft_weld_damping[i_e, i_b] = dyn_info.equalities.soft_weld_damping[last, i_b]
+        dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = dyn_info.equalities.soft_weld_max_wrench[last, i_b]
+        dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[last, i_b]
+        dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[last, i_b]
+    constraint_state.qd_n_equalities[i_b] = last
+
+
+@qd.func
+def func_set_weld_anchors(
+    i_e, i_b, link1_idx, link2_idx, anchor1, anchor2,
+    dyn_state: array_class.DynState, dyn_info: array_class.DynInfo,
+):
+    """Store world-space attachment points in their respective link frames."""
+    pos1 = gu.qd_inv_transform_by_trans_quat(
+        anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
+    )
+    pos2 = gu.qd_inv_transform_by_trans_quat(
+        anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
+    )
+    for axis in qd.static(range(3)):
+        dyn_info.equalities.eq_data[i_e, i_b][axis + 3] = pos1[axis]
+        dyn_info.equalities.eq_data[i_e, i_b][axis] = pos2[axis]
+
+
+@qd.func
+def func_set_soft_weld_params(i_e, i_b, params, dyn_info: array_class.DynInfo):
+    """Initialize isotropic soft-weld gains and clear the previous solution."""
+    dyn_info.equalities.soft_weld_params[i_e, i_b] = params
+    p = dyn_info.equalities.soft_weld_params[i_e, i_b]
+    dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = gs.qd_vec6([p[0], p[0], p[0], p[2], p[2], p[2]])
+    dyn_info.equalities.soft_weld_damping[i_e, i_b] = gs.qd_vec6([p[1], p[1], p[1], p[3], p[3], p[3]])
+    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = gs.qd_vec6([p[4], p[4], p[4], p[5], p[5], p[5]])
+    dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
+    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+
+
+@qd.func
 def func_init_weld_record(
     i_e,
     i_b,
@@ -2713,19 +2763,10 @@ def func_init_weld_record(
 ):
     """Capture the links' current relative pose for either dynamic weld type."""
     shared_pos = dyn_state.links.pos[link1_idx, i_b]
-    pos1 = gu.qd_inv_transform_by_trans_quat(
-        shared_pos, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
-    )
-    pos2 = gu.qd_inv_transform_by_trans_quat(
-        shared_pos, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
-    )
-
     dyn_info.equalities.eq_type[i_e, i_b] = gs.qd_int(eq_type)
     dyn_info.equalities.eq_obj1id[i_e, i_b] = link1_idx
     dyn_info.equalities.eq_obj2id[i_e, i_b] = link2_idx
-    for i_3 in qd.static(range(3)):
-        dyn_info.equalities.eq_data[i_e, i_b][i_3 + 3] = pos1[i_3]
-        dyn_info.equalities.eq_data[i_e, i_b][i_3] = pos2[i_3]
+    func_set_weld_anchors(i_e, i_b, link1_idx, link2_idx, shared_pos, shared_pos, dyn_state, dyn_info)
 
     relpose = gu.qd_quat_mul(gu.qd_inv_quat(dyn_state.links.quat[link1_idx, i_b]), dyn_state.links.quat[link2_idx, i_b])
     for i_4 in qd.static(range(4)):
@@ -2867,20 +2908,7 @@ def kernel_apply_soft_weld_masked(
                     and dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
                     and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
                 ):
-                    i_last = constraint_state.qd_n_equalities[i_b] - 1
-                    if i_e < i_last:
-                        dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[i_last, i_b]
-                        dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[i_last, i_b]
-                        dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
-                        dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
-                        dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
-                        dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
-                        dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = dyn_info.equalities.soft_weld_max_wrench[i_last, i_b]
-                        dyn_info.equalities.soft_weld_damping[i_e, i_b] = dyn_info.equalities.soft_weld_damping[i_last, i_b]
-                        dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = dyn_info.equalities.soft_weld_stiffness[i_last, i_b]
-                        dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
-                        dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[i_last, i_b]
-                    constraint_state.qd_n_equalities[i_b] = i_last
+                    func_remove_dynamic_equality(i_e, i_b, constraint_state, dyn_info)
         if engage_mask[i_b]:
             i_broken = gs.qd_int(-1)
             i_reusable = gs.qd_int(-1)
@@ -2928,15 +2956,7 @@ def kernel_apply_soft_weld_masked(
                     if local_anchor_on_second:
                         anchor1 = ground_anchor
                         anchor2 = cup_anchor
-                    pos1 = gu.qd_inv_transform_by_trans_quat(
-                        anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
-                    )
-                    pos2 = gu.qd_inv_transform_by_trans_quat(
-                        anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
-                    )
-                    for i_axis in qd.static(range(3)):
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    func_set_weld_anchors(i_e, i_b, link1_idx, link2_idx, anchor1, anchor2, dyn_state, dyn_info)
                     if align_to_world_plane:
                         func_align_weld_to_world_plane(
                             i_e, i_b, cup_link, gs.qd_vec4([anchor_qw, anchor_qx, anchor_qy, anchor_qz]),
@@ -2944,17 +2964,11 @@ def kernel_apply_soft_weld_masked(
                         )
                     scale = gain_scale[i_b]
                     damping_scale = qd.sqrt(scale)
-                    dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
+                    func_set_soft_weld_params(i_e, i_b, qd.Vector(
                         [linear_stiffness * scale, linear_damping * damping_scale,
                          angular_stiffness * scale, angular_damping * damping_scale,
                          max_force, max_torque]
-                    )
-                    p = dyn_info.equalities.soft_weld_params[i_e, i_b]
-                    dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = gs.qd_vec6([p[0], p[0], p[0], p[2], p[2], p[2]])
-                    dyn_info.equalities.soft_weld_damping[i_e, i_b] = gs.qd_vec6([p[1], p[1], p[1], p[3], p[3], p[3]])
-                    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = gs.qd_vec6([p[4], p[4], p[4], p[5], p[5], p[5]])
-                    dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
-                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+                    ), dyn_info)
 
 
 @qd.kernel(fastcache=True)
@@ -2998,20 +3012,7 @@ def kernel_contact_gated_soft_weld(
                     and dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
                     and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
                 ):
-                    i_last = constraint_state.qd_n_equalities[i_b] - 1
-                    if i_e < i_last:
-                        dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[i_last, i_b]
-                        dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[i_last, i_b]
-                        dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
-                        dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
-                        dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
-                        dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
-                        dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = dyn_info.equalities.soft_weld_stiffness[i_last, i_b]
-                        dyn_info.equalities.soft_weld_damping[i_e, i_b] = dyn_info.equalities.soft_weld_damping[i_last, i_b]
-                        dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = dyn_info.equalities.soft_weld_max_wrench[i_last, i_b]
-                        dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
-                        dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[i_last, i_b]
-                    constraint_state.qd_n_equalities[i_b] = i_last
+                    func_remove_dynamic_equality(i_e, i_b, constraint_state, dyn_info)
         if engage:
             i_broken = gs.qd_int(-1)
             i_reusable = gs.qd_int(-1)
@@ -3059,15 +3060,7 @@ def kernel_contact_gated_soft_weld(
                     if local_anchor_on_second:
                         anchor1 = ground_anchor
                         anchor2 = cup_anchor
-                    pos1 = gu.qd_inv_transform_by_trans_quat(
-                        anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
-                    )
-                    pos2 = gu.qd_inv_transform_by_trans_quat(
-                        anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
-                    )
-                    for i_axis in qd.static(range(3)):
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    func_set_weld_anchors(i_e, i_b, link1_idx, link2_idx, anchor1, anchor2, dyn_state, dyn_info)
                     if align_to_world_plane:
                         func_align_weld_to_world_plane(
                             i_e, i_b, cup_link, gs.qd_vec4([anchor_qw, anchor_qx, anchor_qy, anchor_qz]),
@@ -3075,17 +3068,11 @@ def kernel_contact_gated_soft_weld(
                         )
                     scale = 1.0
                     damping_scale = qd.sqrt(scale)
-                    dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
+                    func_set_soft_weld_params(i_e, i_b, qd.Vector(
                         [linear_stiffness * scale, linear_damping * damping_scale,
                          angular_stiffness * scale, angular_damping * damping_scale,
                          max_force, max_torque]
-                    )
-                    p = dyn_info.equalities.soft_weld_params[i_e, i_b]
-                    dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = gs.qd_vec6([p[0], p[0], p[0], p[2], p[2], p[2]])
-                    dyn_info.equalities.soft_weld_damping[i_e, i_b] = gs.qd_vec6([p[1], p[1], p[1], p[3], p[3], p[3]])
-                    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = gs.qd_vec6([p[4], p[4], p[4], p[5], p[5], p[5]])
-                    dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
-                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+                    ), dyn_info)
 
 
 @qd.kernel(fastcache=True)
@@ -3178,29 +3165,15 @@ def kernel_add_soft_weld_constraint(
                             anchor1 = projected
                         else:
                             anchor2 = projected
-                    pos1 = gu.qd_inv_transform_by_trans_quat(
-                        anchor1, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b]
-                    )
-                    pos2 = gu.qd_inv_transform_by_trans_quat(
-                        anchor2, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b]
-                    )
-                    for i_axis in qd.static(range(3)):
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis + 3] = pos1[i_axis]
-                        dyn_info.equalities.eq_data[i_e, i_b][i_axis] = pos2[i_axis]
+                    func_set_weld_anchors(i_e, i_b, link1_idx, link2_idx, anchor1, anchor2, dyn_state, dyn_info)
                     if align_to_world_plane:
                         func_align_weld_to_world_plane(
                             i_e, i_b, anchor_link, gs.qd_vec4([anchor_qw, anchor_qx, anchor_qy, anchor_qz]),
                             dyn_state, dyn_info, rigid_info,
                         )
-                dyn_info.equalities.soft_weld_params[i_e, i_b] = qd.Vector(
+                func_set_soft_weld_params(i_e, i_b, qd.Vector(
                     [linear_stiffness, linear_damping, angular_stiffness, angular_damping, max_force, max_torque]
-                )
-                p = dyn_info.equalities.soft_weld_params[i_e, i_b]
-                dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = gs.qd_vec6([p[0], p[0], p[0], p[2], p[2], p[2]])
-                dyn_info.equalities.soft_weld_damping[i_e, i_b] = gs.qd_vec6([p[1], p[1], p[1], p[3], p[3], p[3]])
-                dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = gs.qd_vec6([p[4], p[4], p[4], p[5], p[5], p[5]])
-                dyn_info.equalities.soft_weld_force[i_e, i_b] = qd.Vector.zero(gs.qd_float, 6)
-                dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = False
+                ), dyn_info)
     return status
 
 
@@ -3244,20 +3217,7 @@ def kernel_request_suction_weld(
                     reusable = i_e
                     frame_record = i_e
             if release and frame_record >= 0:
-                last = constraint_state.qd_n_equalities[i_b] - 1
-                if frame_record < last:
-                    dyn_info.equalities.eq_type[frame_record, i_b] = dyn_info.equalities.eq_type[last, i_b]
-                    dyn_info.equalities.eq_obj1id[frame_record, i_b] = dyn_info.equalities.eq_obj1id[last, i_b]
-                    dyn_info.equalities.eq_obj2id[frame_record, i_b] = dyn_info.equalities.eq_obj2id[last, i_b]
-                    dyn_info.equalities.eq_data[frame_record, i_b] = dyn_info.equalities.eq_data[last, i_b]
-                    dyn_info.equalities.sol_params[frame_record, i_b] = dyn_info.equalities.sol_params[last, i_b]
-                    dyn_info.equalities.soft_weld_params[frame_record, i_b] = dyn_info.equalities.soft_weld_params[last, i_b]
-                    dyn_info.equalities.soft_weld_stiffness[frame_record, i_b] = dyn_info.equalities.soft_weld_stiffness[last, i_b]
-                    dyn_info.equalities.soft_weld_damping[frame_record, i_b] = dyn_info.equalities.soft_weld_damping[last, i_b]
-                    dyn_info.equalities.soft_weld_max_wrench[frame_record, i_b] = dyn_info.equalities.soft_weld_max_wrench[last, i_b]
-                    dyn_info.equalities.soft_weld_force[frame_record, i_b] = dyn_info.equalities.soft_weld_force[last, i_b]
-                    dyn_info.equalities.soft_weld_had_rows[frame_record, i_b] = dyn_info.equalities.soft_weld_had_rows[last, i_b]
-                constraint_state.qd_n_equalities[i_b] = last
+                func_remove_dynamic_equality(frame_record, i_b, constraint_state, dyn_info)
             if request_now and not active:
                 cup_pos = dyn_state.links.pos[frame, i_b]
                 cup_quat = dyn_state.links.quat[frame, i_b]
@@ -3295,11 +3255,7 @@ def kernel_request_suction_weld(
                         func_init_weld_record(i_e, i_b, link1_idx, link2_idx, gs.EQUALITY_TYPE.SOFT_WELD,
                                               dyn_state, dyn_info, rigid_info)
                         point = origin + distance * direction
-                        pos1 = gu.qd_inv_transform_by_trans_quat(point, dyn_state.links.pos[link1_idx, i_b], dyn_state.links.quat[link1_idx, i_b])
-                        pos2 = gu.qd_inv_transform_by_trans_quat(point, dyn_state.links.pos[link2_idx, i_b], dyn_state.links.quat[link2_idx, i_b])
-                        for axis in qd.static(range(3)):
-                            dyn_info.equalities.eq_data[i_e, i_b][axis + 3] = pos1[axis]
-                            dyn_info.equalities.eq_data[i_e, i_b][axis] = pos2[axis]
+                        func_set_weld_anchors(i_e, i_b, link1_idx, link2_idx, point, point, dyn_state, dyn_info)
                         for axis in qd.static(range(6)):
                             dyn_info.equalities.soft_weld_stiffness[i_e, i_b][axis] = stiffness[i_req, axis]
                             dyn_info.equalities.soft_weld_damping[i_e, i_b][axis] = damping[i_req, axis]
@@ -3366,24 +3322,7 @@ def kernel_delete_dynamic_constraint(
             if dyn_info.equalities.eq_type[i_e, i_b] == eq_type and (
                 (link_a == link1_idx and link_b == link2_idx) or (link_a == link2_idx and link_b == link1_idx)
             ):
-                if i_e < constraint_state.qd_n_equalities[i_b] - 1:
-                    # Swap-remove must move the whole constraint record, not just its type,
-                    # otherwise the surviving slot keeps the deleted constraint's links/data.
-                    i_last = constraint_state.qd_n_equalities[i_b] - 1
-                    dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[i_last, i_b]
-                    dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[i_last, i_b]
-                    dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
-                    dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
-                    dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
-                    dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
-                    dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = dyn_info.equalities.soft_weld_stiffness[i_last, i_b]
-                    dyn_info.equalities.soft_weld_damping[i_e, i_b] = dyn_info.equalities.soft_weld_damping[i_last, i_b]
-                    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = dyn_info.equalities.soft_weld_max_wrench[i_last, i_b]
-                    dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
-                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[
-                        i_last, i_b
-                    ]
-                constraint_state.qd_n_equalities[i_b] = constraint_state.qd_n_equalities[i_b] - 1
+                func_remove_dynamic_equality(i_e, i_b, constraint_state, dyn_info)
 
 
 @qd.kernel(fastcache=True)
@@ -3406,22 +3345,7 @@ def kernel_delete_soft_weld_constraint(
                 and dyn_info.equalities.eq_obj1id[i_e, i_b] == link1_idx
                 and dyn_info.equalities.eq_obj2id[i_e, i_b] == link2_idx
             ):
-                i_last = constraint_state.qd_n_equalities[i_b] - 1
-                if i_e < i_last:
-                    dyn_info.equalities.eq_type[i_e, i_b] = dyn_info.equalities.eq_type[i_last, i_b]
-                    dyn_info.equalities.eq_obj1id[i_e, i_b] = dyn_info.equalities.eq_obj1id[i_last, i_b]
-                    dyn_info.equalities.eq_obj2id[i_e, i_b] = dyn_info.equalities.eq_obj2id[i_last, i_b]
-                    dyn_info.equalities.eq_data[i_e, i_b] = dyn_info.equalities.eq_data[i_last, i_b]
-                    dyn_info.equalities.sol_params[i_e, i_b] = dyn_info.equalities.sol_params[i_last, i_b]
-                    dyn_info.equalities.soft_weld_params[i_e, i_b] = dyn_info.equalities.soft_weld_params[i_last, i_b]
-                    dyn_info.equalities.soft_weld_stiffness[i_e, i_b] = dyn_info.equalities.soft_weld_stiffness[i_last, i_b]
-                    dyn_info.equalities.soft_weld_damping[i_e, i_b] = dyn_info.equalities.soft_weld_damping[i_last, i_b]
-                    dyn_info.equalities.soft_weld_max_wrench[i_e, i_b] = dyn_info.equalities.soft_weld_max_wrench[i_last, i_b]
-                    dyn_info.equalities.soft_weld_force[i_e, i_b] = dyn_info.equalities.soft_weld_force[i_last, i_b]
-                    dyn_info.equalities.soft_weld_had_rows[i_e, i_b] = dyn_info.equalities.soft_weld_had_rows[
-                        i_last, i_b
-                    ]
-                constraint_state.qd_n_equalities[i_b] = i_last
+                func_remove_dynamic_equality(i_e, i_b, constraint_state, dyn_info)
 
 
 # =====================================================================================================================

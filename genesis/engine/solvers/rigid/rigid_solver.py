@@ -157,8 +157,8 @@ from .constraint.solver import (
     func_solve_body,
     kernel_request_suction_weld,
     kernel_get_suction_wrench,
+    kernel_get_suction_status,
     kernel_contact_gated_soft_weld,
-    kernel_ray_suction_soft_weld,
 )
 
 if TYPE_CHECKING:
@@ -1343,7 +1343,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             # Contact-gated welds change the equality list after collision detection.
             # Defer row assembly in that case so rows match post-solve bookkeeping.
             contact_welds = getattr(self, '_contact_soft_welds', ())
-            ray_welds = getattr(self, '_ray_suction_welds', ())
             kernel_substep_dynamics(
                 self.dyn_state,
                 collider.collider_state,
@@ -1354,7 +1353,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self._is_forward_pos_updated,
                 self._is_forward_vel_updated,
                 self._is_backward,
-                not self._disable_constraint and not (contact_welds or ray_welds),
+                not self._disable_constraint and not contact_welds,
             )
             if self._enable_collision:
                 collider.detection()
@@ -1372,23 +1371,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     self.dyn_state, collider.collider_state, constraint_solver.constraint_state,
                     self.dyn_info, self.rigid_info, self.rigid_config, self._errno,
                 )
-            for index, (link1, link2, tip, anchor, params) in enumerate(ray_welds):
-                kernel_ray_suction_soft_weld(
-                    min(link1, link2), max(link1, link2), tip, index,
-                    self._ray_suction_valves, self._ray_suction_previous,
-                    self._ray_suction_hits, self._ray_suction_engages,
-                    self._ray_suction_points, self._ray_suction_normals,
-                    self._ray_suction_max_cast_distance, self._ray_suction_bvh.state.tree,
-                    self._ray_suction_is_plane,
-                    params['linear_stiffness'], params['linear_damping'],
-                    params['angular_stiffness'], params['angular_damping'],
-                    params['max_force'], params['max_torque'], int(link1 > link2),
-                    *anchor, 0, 1., 0., 0., 0.,
-                    self.dyn_state, collider.collider_state, constraint_solver.constraint_state,
-                    self.dyn_info, self.rigid_info, self.rigid_config, self._errno,
-                )
             if not self._disable_constraint:
-                if contact_welds or ray_welds:
+                if contact_welds:
                     kernel_substep_equality(
                         self.dyn_state, collider.collider_state, constraint_solver.constraint_state,
                         self.dyn_info, self.rigid_info, self.rigid_config,
@@ -1426,93 +1410,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if not isinstance(self.sim.coupler, SAPCoupler):
             self._is_forward_pos_updated = not self._enable_mujoco_compatibility
             self._is_forward_vel_updated = not self._enable_mujoco_compatibility
-
-    def configure_ray_suction_welds(self, welds, max_cast_distance=0.01):
-        """Configure cup-frame ray requests against one fixed collision target.
-
-        Each weld is (cup link, fixed target link, suction frame link,
-        local anchor, gains). The frame must be a collision-free descendant of
-        the cup. A valve rising edge casts once from (0, 0, -max_cast_distance/2)
-        in that frame, along local +Z. A miss is not retried until the valve is
-        turned off and on. The fixed target must not be moved after
-        configuration. The closest hit within [0, max_cast_distance) is latched.
-        """
-        from genesis.engine.bvh import get_bvh_data
-        from genesis.engine.couplers import SAPCoupler
-        from genesis.utils.raycast_qd import kernel_refresh_collision_subset_bvh
-        if self._requires_grad or isinstance(self.sim.coupler, SAPCoupler) or not self._enable_collision or self._disable_constraint:
-            raise RuntimeError('Ray suction requires non-differentiable rigid collision solving')
-        if not np.isfinite(max_cast_distance) or max_cast_distance <= 0:
-            raise ValueError('max_cast_distance must be positive and finite')
-        welds = tuple(welds)
-        if not welds or len({w[1] for w in welds}) != 1:
-            raise ValueError('Ray suction requires a single fixed target link')
-        for cup, target, frame, _, _ in welds:
-            if not 0 <= frame < self.n_links or frame in (cup, target):
-                raise ValueError('Ray suction requires a distinct suction frame link')
-            if self.links[frame].n_geoms:
-                raise ValueError('Ray suction frame must not have collision geometry')
-            parent = self.links[frame].parent_idx
-            while parent >= 0 and parent != cup:
-                parent = self.links[parent].parent_idx
-            if parent != cup:
-                raise ValueError('Ray suction frame must be a descendant of the cup link')
-        target = welds[0][1]
-        if not self.links[target].is_fixed or self._enable_heterogeneous:
-            raise ValueError('Ray suction requires a fixed target with shared geometry')
-        entities = [e for e in self._scene.entities if e.base_link.idx == target]
-        if len(entities) != 1:
-            raise ValueError('Ray suction target must be an entity base link')
-        self._ray_suction_is_plane = isinstance(entities[0].morph, gs.morphs.Plane)
-        if self._ray_suction_is_plane:
-            self._ray_suction_bvh = get_bvh_data(1, 0, is_active=False)
-        else:
-            face_geom = qd_to_numpy(self.dyn_info.faces.geom_idx)
-            geom_link = qd_to_numpy(self.dyn_info.geoms.link_idx)
-            faces = np.flatnonzero(geom_link[face_geom] == target)
-            if not len(faces):
-                raise ValueError('Ray suction target has no collision triangles')
-            face_verts = qd_to_numpy(self.dyn_info.faces.verts_idx)[faces]
-            if not qd_to_numpy(self.dyn_info.verts.is_fixed)[face_verts].all():
-                raise ValueError('Ray suction target vertices must be fixed and shared across environments')
-            faces_idx = torch.as_tensor(faces, dtype=gs.tc_int, device=gs.device)
-            self._ray_suction_bvh = get_bvh_data(1, len(faces))
-            self.update_forward_pos()
-            kernel_refresh_collision_subset_bvh(
-                faces_idx, self.dyn_state, self._ray_suction_bvh.state, self.dyn_info,
-                self._ray_suction_bvh.config, self.rigid_config, gs.EPS, True,
-            )
-        self._ray_suction_welds = welds
-        self._ray_suction_max_cast_distance = float(max_cast_distance)
-        shape = (self._scene.n_envs, len(welds))
-        self._ray_suction_valves = torch.zeros(shape, device=gs.device, dtype=gs.tc_float)
-        self._ray_suction_previous = torch.zeros(shape, device=gs.device, dtype=torch.bool)
-        self._ray_suction_hits = torch.zeros(shape, device=gs.device, dtype=torch.bool)
-        self._ray_suction_engages = torch.zeros(shape, device=gs.device, dtype=torch.bool)
-        self._ray_suction_points = torch.zeros((*shape, 3), device=gs.device, dtype=gs.tc_float)
-        self._ray_suction_normals = torch.zeros_like(self._ray_suction_points)
-
-    def set_ray_suction_valves(self, valves):
-        """Queue valve requests for the next control interval without host readback."""
-        if valves.shape != self._ray_suction_valves.shape:
-            raise ValueError('Wrong ray suction valve shape')
-        self._ray_suction_valves.copy_(valves)
-        self._ray_suction_hits.zero_()
-        self._ray_suction_engages.zero_()
-
-    def reset_ray_suction_requests(self, envs_idx):
-        """Clear latched requests and diagnostics for reset environments."""
-        self._ray_suction_valves[envs_idx] = 0
-        self._ray_suction_previous[envs_idx] = False
-        self._ray_suction_hits[envs_idx] = False
-        self._ray_suction_engages[envs_idx] = False
-        self._ray_suction_points[envs_idx] = 0
-        self._ray_suction_normals[envs_idx] = 0
-
-    def get_ray_suction_diagnostics(self):
-        """Return device-side hit, engage, last hit point and normal tensors."""
-        return (self._ray_suction_hits, self._ray_suction_engages,
-                self._ray_suction_points, self._ray_suction_normals)
 
     def configure_contact_soft_welds(self, welds):
         """Configure (cup link, ground link, tip link, local anchor, gains) for substep valves."""
@@ -3787,18 +3684,14 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             raise ValueError('envs_idx and link_idx must be one-dimensional and have equal length')
         torch._assert_async(((envs >= 0) & (envs < self._scene.n_envs)).all(), 'Invalid environment index')
         torch._assert_async(((links >= 0) & (links < self.n_links)).all(), 'Invalid link index')
-        planes = [entity for entity in self._scene.entities if isinstance(entity.morph, gs.morphs.Plane)]
-        if len(planes) != 1 or abs(float(planes[0].morph.pos[2])) > 1e-9:
-            raise ValueError('Suction welding requires exactly one plane at z=0')
-        ground = planes[0].base_link.idx
-        torch._assert_async((links != ground).all(), 'Cannot weld the plane to itself')
-        return envs, links, ground
+        return envs, links
 
     def request_suction_cup_welding(self, envs_idx, link_idx, stiffness, damping, max_wrench, max_cast_distance=0.01):
-        """Request z=0-plane welds; each [N,6] row is force XYZ then torque XYZ.
+        """Request scene-surface welds; each [N,6] row is force XYZ then torque XYZ.
 
         Cast from suction-frame local (0, 0, -max_cast_distance / 2) along local +Z.
         ``link_idx`` must identify the collision-free suction frame, not its parent.
+        The nearest collision surface outside the frame's own entity is used.
         A ray miss leaves the weld absent. The distance is in meters.
 
         Wrenches become available after a physics substep. Existing active pairs
@@ -3808,7 +3701,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             raise RuntimeError('Dynamic suction welds do not support differentiable simulation')
         if not np.isfinite(max_cast_distance) or max_cast_distance <= 0:
             raise ValueError('max_cast_distance must be positive and finite')
-        envs, links, ground = self._suction_request_inputs(envs_idx, link_idx)
+        envs, links = self._suction_request_inputs(envs_idx, link_idx)
         if not hasattr(self, '_suction_collision_free_links'):
             self._suction_collision_free_links = torch.tensor(
                 [link.n_geoms == 0 for link in self.links], dtype=torch.bool, device=gs.device
@@ -3817,7 +3710,6 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._suction_collision_free_links[links.long()].all(),
             'Suction frame must not have collision geometry',
         )
-        self.update_forward_pos()
         arrays = []
         for name, value in (('stiffness', stiffness), ('damping', damping), ('max_wrench', max_wrench)):
             value = torch.as_tensor(value, dtype=gs.tc_float, device=gs.device).contiguous()
@@ -3825,6 +3717,27 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 raise ValueError(f'{name} must have shape (N, 6)')
             torch._assert_async((~torch.isnan(value) & (value >= 0)).all(), f'Invalid {name}')
             arrays.append(value)
+        # Reuse Genesis's shared sensor raycast BVH where available. If no
+        # raycasting sensor exists, lazily create the same context on demand;
+        # its dynamic geometry is refreshed when requests arrive, not per step.
+        from genesis.engine.sensors.raycaster import RaycastContext
+        self.update_forward_pos()
+        context = self.sim._sensor_manager._shared_contexts.get(RaycastContext)
+        if context is None:
+            context = getattr(self, '_suction_raycast_context', None)
+            if context is None:
+                context = self._suction_raycast_context = RaycastContext(self.sim)
+        if context.is_active:
+            context.update()
+        else:
+            context.activate()
+        trees = [entry for entry in context.collision_bvh_contexts if entry.solver is self]
+        if not trees:
+            return
+        if len(trees) > 2:
+            raise RuntimeError('Unexpected number of rigid collision BVHs')
+        first = trees[0]
+        second = trees[1] if len(trees) == 2 else first
         # Group by environment on-device; each solver thread owns its env's
         # dynamic constraint list and processes its requests in original order.
         order = torch.argsort(envs, stable=True)
@@ -3832,14 +3745,85 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         boundaries = torch.arange(self._scene.n_envs + 1, device=envs.device, dtype=envs.dtype)
         offsets = torch.searchsorted(sorted_envs, boundaries, out_int32=True)
         self.constraint_solver._eq_const_info_cache.clear()
-        kernel_request_suction_weld(envs, links, ground, order, offsets, *arrays, float(max_cast_distance), self.dyn_state,
+        control = getattr(self, '_suction_valve_call', None)
+        valves, previous = control if control is not None else (links, links)
+        if control is not None:
+            hits, engages, points, normals = self._suction_valve_diagnostics
+        else:
+            hits = engages = links
+            points = normals = arrays[0]
+        kernel_request_suction_weld(envs, links, order, offsets, *arrays, float(max_cast_distance),
+            valves, previous, control is not None,
+            hits, engages, points, normals,
+            first.bvh_state.tree, first.env_bvh_idx, second.bvh_state.tree, second.env_bvh_idx, len(trees) == 2, self.dyn_state,
             self.constraint_solver.constraint_state, self.dyn_info, self.rigid_info, self.rigid_config, self._errno)
+
+    def set_suction_cup_valves(self, envs_idx, link_idx, valves, stiffness, damping, max_wrench, max_cast_distance=0.01):
+        """Apply valve changes to the same scene-ray request operator; no setup is required."""
+        envs, links = self._suction_request_inputs(envs_idx, link_idx)
+        valves = torch.as_tensor(valves, dtype=gs.tc_float, device=gs.device).reshape(-1).contiguous()
+        if valves.shape != envs.shape:
+            raise ValueError('valves must match the one-dimensional request batch')
+        if not hasattr(self, '_suction_valve_previous'):
+            self._suction_valve_previous = torch.zeros_like(valves, dtype=torch.bool)
+        if self._suction_valve_previous.shape != valves.shape:
+            raise ValueError('Suction valve batch shape cannot change between calls')
+        self.get_suction_cup_diagnostics(envs, links)
+        self._suction_valve_diagnostics[0].zero_()
+        self._suction_valve_diagnostics[1].zero_()
+        self._suction_valve_arguments = (envs, links, stiffness, damping, max_wrench, max_cast_distance)
+        self._suction_valve_call = (valves, self._suction_valve_previous)
+        try:
+            self.request_suction_cup_welding(envs, links, stiffness, damping, max_wrench, max_cast_distance)
+        finally:
+            self._suction_valve_call = None
+
+    def reset_suction_cup_valves(self, envs_idx):
+        """Release suction and clear valve latches for selected environments."""
+        if not hasattr(self, '_suction_valve_arguments'):
+            return
+        envs, links, stiffness, damping, max_wrench, distance = self._suction_valve_arguments
+        valves = self._suction_valve_previous.to(dtype=gs.tc_float)
+        valves[torch.isin(envs, envs_idx)] = 0
+        self.set_suction_cup_valves(envs, links, valves, stiffness, damping, max_wrench, distance)
+
+    def get_suction_cup_status(self, envs_idx, link_idx):
+        """Return active and broken flags for each suction frame request."""
+        envs, links = self._suction_request_inputs(envs_idx, link_idx)
+        out = torch.zeros((envs.numel(), 2), dtype=gs.tc_int, device=gs.device)
+        kernel_get_suction_status(envs, links, out, self.constraint_solver.constraint_state,
+                                  self.dyn_info, self.rigid_info, self.rigid_config)
+        return {'active': out[:, 0].bool(), 'broken': out[:, 1].bool()}
+
+    def get_suction_cup_measurements(self, envs_idx, link_idx):
+        """Return status and finite wrenches for observation consumers."""
+        envs, links = self._suction_request_inputs(envs_idx, link_idx)
+        status = self.get_suction_cup_status(envs, links)
+        wrench = torch.zeros((envs.numel(), 6), device=gs.device, dtype=gs.tc_float)
+        kernel_get_suction_wrench(envs, links, wrench, self.constraint_solver.constraint_state,
+                                  self.dyn_info, self.rigid_info, self.rigid_config)
+        return status, wrench
+
+    def get_suction_cup_diagnostics(self, envs_idx, link_idx):
+        """Return per-request hit and engagement flags and the last hit geometry."""
+        envs, _ = self._suction_request_inputs(envs_idx, link_idx)
+        if not hasattr(self, '_suction_valve_diagnostics'):
+            count = envs.numel()
+            self._suction_valve_diagnostics = (
+                torch.zeros(count, dtype=torch.bool, device=gs.device),
+                torch.zeros(count, dtype=torch.bool, device=gs.device),
+                torch.zeros((count, 3), dtype=gs.tc_float, device=gs.device),
+                torch.zeros((count, 3), dtype=gs.tc_float, device=gs.device),
+            )
+        if self._suction_valve_diagnostics[0].numel() != envs.numel():
+            raise ValueError('Suction diagnostic batch shape cannot change between calls')
+        return self._suction_valve_diagnostics
 
     def get_wrench(self, envs_idx, link_idx):
         """Latest solved world-frame [N,6] wrench; +inf for absent, broken, or unsolved welds."""
-        envs, links, ground = self._suction_request_inputs(envs_idx, link_idx)
+        envs, links = self._suction_request_inputs(envs_idx, link_idx)
         out = torch.full((envs.numel(), 6), float('inf'), device=gs.device, dtype=gs.tc_float)
-        kernel_get_suction_wrench(envs, links, ground, out, self.constraint_solver.constraint_state,
+        kernel_get_suction_wrench(envs, links, out, self.constraint_solver.constraint_state,
                                   self.dyn_info, self.rigid_info, self.rigid_config)
         return out
 

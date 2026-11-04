@@ -49,6 +49,9 @@ def bvh_ray_cast(
     dyn_info: array_class.DynInfo,
     eps: float,
     accept_origin: int = 0,
+    exclude_entity: int = -1,
+    batch_links_info: qd.template() = False,
+    filter_entity: qd.template() = False,
 ):
     """
     Cast a ray through a BVH and find the closest intersection.
@@ -100,17 +103,19 @@ def bvh_ray_cast(
                 # The leaf payload carries the global face index; see kernel_refresh_collision_bvh.
                 i_f = bvh_tree_state.leaves_idx[i_t, node_idx - (n_triangles - 1)]
 
-                # Get triangle vertices
-                tri_vertices = get_triangle_vertices(i_f, i_b, dyn_state, dyn_info)
-                v0, v1, v2 = tri_vertices[:, 0], tri_vertices[:, 1], tri_vertices[:, 2]
-
-                # Perform ray-triangle intersection
-                hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps, accept_origin)
-
-                if hit_distance >= 0.0 and hit_distance < closest_distance:
-                    closest_distance = hit_distance
-                    hit_face = i_f
-                    hit_normal = triangle_face_normal(v0, v1, v2)
+                eligible = True
+                if qd.static(filter_entity):
+                    i_link = dyn_info.geoms.link_idx[dyn_info.faces.geom_idx[i_f]]
+                    link_idx = [i_link, i_b] if qd.static(batch_links_info) else i_link
+                    eligible = dyn_info.links.entity_idx[link_idx] != exclude_entity
+                if eligible:
+                    tri_vertices = get_triangle_vertices(i_f, i_b, dyn_state, dyn_info)
+                    v0, v1, v2 = tri_vertices[:, 0], tri_vertices[:, 1], tri_vertices[:, 2]
+                    hit_distance = ray_triangle_intersection(axes, ray_start, shear, v0, v1, v2, eps, accept_origin)
+                    if hit_distance >= 0.0 and hit_distance < closest_distance:
+                        closest_distance = hit_distance
+                        hit_face = i_f
+                        hit_normal = triangle_face_normal(v0, v1, v2)
             else:  # Internal node
                 # Push children onto stack
                 if stack_idx < STACK_SIZE - 2:

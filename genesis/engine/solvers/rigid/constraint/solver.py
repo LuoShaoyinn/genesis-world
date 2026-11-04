@@ -3173,7 +3173,6 @@ def kernel_ray_suction_soft_weld(
                     constraint_state.qd_n_equalities[i_b] = i_last
         if engage:
             i_broken = gs.qd_int(-1)
-            i_reusable = gs.qd_int(-1)
             is_duplicate = False
             for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
                 eq_type = dyn_info.equalities.eq_type[i_e, i_b]
@@ -3183,17 +3182,14 @@ def kernel_ray_suction_soft_weld(
                 )
                 if same_pair and (eq_type == gs.EQUALITY_TYPE.WELD or eq_type == gs.EQUALITY_TYPE.SOFT_WELD):
                     is_duplicate = True
-                if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
-                    if i_reusable < 0:
-                        i_reusable = i_e
-                    if same_pair:
-                        i_broken = i_e
+                if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD and same_pair:
+                    i_broken = i_e
             if is_duplicate:
                 errno[i_b] = errno[i_b] | array_class.ErrorCode.DUPLICATE_DYNAMIC_WELD
             else:
+                # Preserve broken records for other cup/target pairs. They
+                # remain failed until that pair is released or re-requested.
                 i_e = i_broken
-                if i_e < 0:
-                    i_e = i_reusable
                 if i_e < 0:
                     i_e = constraint_state.qd_n_equalities[i_b]
                     if i_e == rigid_info.n_candidate_equalities[None]:
@@ -3377,7 +3373,6 @@ def kernel_request_suction_weld(
             link2_idx = qd.max(links_idx[i_b_], ground_idx)
             anchor_link = links_idx[i_b_]
             i_broken = gs.qd_int(-1)
-            i_reusable = gs.qd_int(-1)
             is_duplicate = False
             for i_e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[i_b]):
                 eq_type = dyn_info.equalities.eq_type[i_e, i_b]
@@ -3390,11 +3385,8 @@ def kernel_request_suction_weld(
                 )
                 if same_pair and (eq_type == gs.EQUALITY_TYPE.WELD or eq_type == gs.EQUALITY_TYPE.SOFT_WELD):
                     is_duplicate = True
-                if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD:
-                    if i_reusable < 0:
-                        i_reusable = i_e
-                    if same_pair:
-                        i_broken = i_e
+                if eq_type == gs.EQUALITY_TYPE.BROKEN_SOFT_WELD and same_pair:
+                    i_broken = i_e
             cup_pos = dyn_state.links.pos[anchor_link, i_b]
             cup_quat = dyn_state.links.quat[anchor_link, i_b]
             ray_origin = cup_pos + gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, -0.5 * max_cast_distance]), cup_quat)
@@ -3405,9 +3397,9 @@ def kernel_request_suction_weld(
             if is_duplicate or distance < 0.0 or distance >= max_cast_distance:
                 pass
             else:
+                # Preserve broken records for other cup/target pairs. They
+                # remain failed until that pair is released or re-requested.
                 i_e = i_broken
-                if i_e < 0:
-                    i_e = i_reusable
                 if i_e < 0:
                     i_e = constraint_state.qd_n_equalities[i_b]
                     if i_e == rigid_info.n_candidate_equalities[None]:

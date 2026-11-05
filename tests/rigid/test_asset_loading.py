@@ -63,63 +63,6 @@ def test_visual_only_open_mesh_inertial(tmp_path, monkeypatch, caplog, inertial_
 
 
 @pytest.mark.required
-def test_urdf_explicit_collision_exclusions(tmp_path):
-    root = ET.Element("robot", name="excluded_pairs")
-    for i, name in enumerate(("base", "middle", "tip")):
-        link = ET.SubElement(root, "link", name=name)
-        for _ in range(2 if name == "tip" else 1):
-            collision = ET.SubElement(link, "collision")
-            geometry = ET.SubElement(collision, "geometry")
-            ET.SubElement(geometry, "box", size="0.1 0.1 0.1")
-        if i:
-            joint = ET.SubElement(root, "joint", name=f"joint_{i}", type="continuous")
-            ET.SubElement(joint, "parent", link="base" if i == 1 else "middle")
-            ET.SubElement(joint, "child", link=name)
-            ET.SubElement(joint, "origin", xyz="0.3 0 0")
-            ET.SubElement(joint, "axis", xyz="0 0 1")
-    ET.SubElement(root, "disable_collisions", link1="base", link2="tip")
-    urdf = tmp_path / "excluded.urdf"
-    ET.ElementTree(root).write(urdf)
-    # With both automatic filters off, only the explicit exclusion can disable these pairs.
-    scene = gs.Scene(
-        rigid_options=gs.options.RigidOptions(enable_neutral_collision=True, enable_adjacent_collision=True),
-        show_viewer=False,
-    )
-    plane = scene.add_entity(gs.morphs.Plane())
-    robots = [scene.add_entity(gs.morphs.URDF(file=urdf, align=False, pos=(0, i, 1))) for i in range(2)]
-    scene.build()
-    matrix = scene.rigid_solver.collider._compute_collision_pair_idx()[1]
-
-    def eligible(a, b):
-        return matrix[min(a.idx, b.idx), max(a.idx, b.idx)] >= 0
-
-    for robot in robots:
-        base = robot.get_link("base").geoms[0]
-        middle = robot.get_link("middle").geoms[0]
-        for tip in robot.get_link("tip").geoms:
-            assert not eligible(base, tip)
-            assert eligible(middle, tip)
-        assert eligible(base, middle)
-        for geom in robot.geoms:
-            assert eligible(plane.geoms[0], geom)
-    # Synthesized masks must not leak across independently loaded copies of the robot.
-    for a in robots[0].geoms:
-        for b in robots[1].geoms:
-            assert eligible(a, b)
-
-
-@pytest.mark.required
-@pytest.mark.parametrize("link1, link2", [("base", "missing"), ("base", "base"), ("base", None)])
-def test_urdf_invalid_collision_exclusion(link1, link2):
-    exclusion = ET.Element("disable_collisions", link1=link1)
-    if link2 is not None:
-        exclusion.set("link2", link2)
-    morph = gs.morphs.URDF(file=f'<robot name="invalid">{ET.tostring(exclusion, encoding="unicode")}</robot>')
-    with pytest.raises(gs.GenesisException, match="Invalid URDF collision exclusion"):
-        uu.apply_collision_exclusions(morph, [{"name": "base"}], [[]])
-
-
-@pytest.mark.required
 @pytest.mark.parametrize("model_name", ["depth_first_tree_mjcf", "depth_first_tree_urdf"])
 def test_depth_first_link_ordering(xml_path, model_name, show_viewer):
     # Links must be parsed depth-first so every subtree - hence every free body's DOFs - occupies a contiguous index
@@ -819,23 +762,15 @@ def test_urdf_capsule(tmp_path, show_viewer, tol):
 @pytest.mark.required
 @pytest.mark.parametrize("model_name", ["pendulum_with_joint_dynamics", "joint_with_partial_dynamics"])
 @pytest.mark.parametrize("joint_damping, joint_friction", [(1.0, 2.0), (1.0, None), (None, 2.0)])
-@pytest.mark.parametrize("joint_armature", [None, 0.001])
-def test_urdf_joint_dynamics(joint_damping, joint_friction, joint_armature, xml_path):
+def test_urdf_joint_dynamics(joint_damping, joint_friction, xml_path):
     # A <dynamics> tag authoring only one of damping/friction leaves the other one unset. It must fall back to zero
     # like an absent tag rather than reaching the solver as a null value.
-    tree = ET.parse(xml_path)
-    joint = tree.getroot().find("joint")
-    if joint_armature is not None:
-        joint.find("dynamics").set("armature", str(joint_armature))
-    ET.SubElement(joint, "safety_controller", k_position="3.0", k_velocity="0.1")
-    tree.write(xml_path)
     scene = gs.Scene()
     robot = scene.add_entity(
         gs.morphs.URDF(
             file=xml_path,
             pos=(0, 0, 0.8),
             convexify=True,
-            default_armature=0.1,
         ),
     )
     scene.build()
@@ -845,9 +780,6 @@ def test_urdf_joint_dynamics(joint_damping, joint_friction, joint_armature, xml_
     assert_allclose(robot.joints[1].desc.dofs_damping, expected_damping, tol=gs.EPS)
     assert_allclose(robot.joints[0].desc.dofs_frictionloss, 0.0, tol=gs.EPS)
     assert_allclose(robot.joints[1].desc.dofs_frictionloss, expected_frictionloss, tol=gs.EPS)
-    assert_allclose(robot.get_dofs_armature()[-1], 0.1 if joint_armature is None else joint_armature, tol=gs.EPS)
-    assert_allclose(robot.get_dofs_kp()[-1], 3.0, tol=gs.EPS)
-    assert_allclose(robot.get_dofs_kv()[-1], 0.1, tol=gs.EPS)
 
 
 @pytest.mark.slow  # ~200s

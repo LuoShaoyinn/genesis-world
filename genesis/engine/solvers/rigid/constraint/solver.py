@@ -21,7 +21,7 @@ from genesis.engine.solvers.rigid.abd.misc import (
 from genesis.utils.misc import assign_indexed_tensor, indices_to_mask, qd_to_numpy, qd_to_torch
 
 from ..collider.contact import func_add_contacts_force_to_links
-from .weld import SoftWeldConstraintMixin, func_remove_dynamic_equality, func_update_soft_weld_wrenches
+from .weld import func_remove_dynamic_equality, func_update_soft_weld_wrenches
 from .weld_rows import func_equality_weld
 from .island import (
     func_build_islands,
@@ -114,7 +114,7 @@ if TYPE_CHECKING:
 IS_OLD_TORCH = tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8)
 
 
-class ConstraintSolver(SoftWeldConstraintMixin):
+class ConstraintSolver:
     def __init__(self, rigid_solver: "RigidSolver"):
         self._solver = rigid_solver
         self._collider = rigid_solver.collider

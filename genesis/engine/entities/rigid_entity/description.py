@@ -962,8 +962,6 @@ class KinematicEntityDescription(EntityDescription):
                     "Falling back to legacy URDF parser. Default values of physics properties may be off:\n"
                     + str(e).replace("\n", " - ")
                 )
-            if isinstance(morph, gs.morphs.URDF):
-                uu.apply_collision_exclusions(morph, l_infos, links_g_infos)
         elif isinstance(morph, gs.morphs.USD):
             # Imported here since USD support is optional and its bindings load with the package
             from genesis.utils.usd import parse_usd_rigid_entity

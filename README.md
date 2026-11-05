@@ -251,3 +251,43 @@ Pruned from Simulation Interface (same logic — labels/paths still valid):
 | [Close kinematic chain](./examples/rigid/closed_loop.py) | [Advanced: muscle](./examples/tutorials/advanced_muscle.py) | [Advanced: hybrid robot](./examples/tutorials/advanced_hybrid_robot.py) |
 | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/rigid_closed_loop.webp" width="240"> | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/tutorials_advanced_muscle.webp" width="240"> | <img src="https://raw.githubusercontent.com/Genesis-Embodied-AI/genesis-world/readme-assets/videos/tutorials_advanced_hybrid_robot.webp" width="240"> |
 -->
+
+### Registered suction cups
+
+Register one handle per collision-free suction-frame link before building the
+scene. Link indices are global rigid-solver indices; keep fixed frame links when
+loading a robot. The solver requires collision and non-differentiable rigid
+constraints, and `max_dynamic_constraints` must accommodate the cups.
+
+```python
+solver = scene.sim.rigid_solver
+cup = solver.add_suction_cup(
+    link_idx=robot.get_link("cup_frame").idx,
+    stiffness=(2400, 2400, 2400, 0.016, 0.016, 0.016),
+    damping=(10, 10, 10, 0.000125, 0.000125, 0.000125),
+    max_wrench=(5, 5, 5, 0.1, 0.1, 0.1),
+    max_cast_distance=0.03,
+)
+scene.build(n_envs=1024)
+
+normal = cup.get_normal_proj(envs_idx)  # [N, 3], cup frame; zero on miss
+cup.request_suction_cup_welding(envs_idx)
+scene.step()
+wrench = cup.get_wrench(envs_idx)       # [N, 6], world frame
+cup.release_suction_cup(envs_idx)
+```
+
+All operations select environments for this cup; `envs_idx=None` selects all.
+A ray starts half the cast distance behind the cup origin and goes along the
+cup's local +Z for the full cast distance. It excludes the cup's own entity and
+hits the nearest collision surface. A request that misses does nothing; a later
+request can retry. Active welds are unchanged by subsequent requests. A broken
+weld can be re-armed by another request. Release and scene reset remove welds.
+
+Normals are fresh raycasts, oriented against the ray and rotated into the cup
+frame. Wrenches are force XYZ in N followed by direct torque XYZ in N m, acting
+on the cup, from the last solved physics substep. An absent, broken or unsolved
+weld returns `+inf`. Stiffness and damping are scalar or six values in linear
+then angular order (N/m, N s/m, N m/rad, N m s/rad); maximum wrench is scalar or
+six per-world-axis force/torque limits. Return tensors always retain the selected
+environment dimension, including for scenes built without parallel environments.

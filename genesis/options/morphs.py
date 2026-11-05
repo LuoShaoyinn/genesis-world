@@ -1131,16 +1131,6 @@ class URDF(FileMorph):
     xacro_args : dict, optional
         Key-value pairs to override ``xacro:arg`` declarations in the xacro file
         (e.g. ``{"use_sim": "true", "arm_length": "0.5"}``). Only used for ``.xacro`` files. Defaults to ``{}``.
-
-    Notes
-    -----
-    Genesis accepts reflected motor inertia in the URDF joint's ``<dynamics armature="..."/>`` attribute, in kg for
-    prismatic joints or kg m^2 for revolute joints. This is an extension to URDF. Nonzero authored values take precedence
-    over ``default_armature``; use ``default_armature=None`` to retain authored zeros as well.
-
-    Genesis also accepts SRDF-style ``<disable_collisions link1="..." link2="..." reason="..."/>`` elements
-    directly under the URDF ``<robot>``. They disable only those link pairs within the entity, retaining contacts
-    against other entities. Referenced fixed links must be retained with ``links_to_keep``.
     """
 
     fixed: StrictBool = False

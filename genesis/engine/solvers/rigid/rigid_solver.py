@@ -346,6 +346,8 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
         self._init_geom_fields()
         self._init_equality_fields()
         self._init_dof_length()
+        for cup in getattr(self, "_suction_cups", ()):
+            cup._build(self._B)
 
         # Compute the pose of every link in the neutral configuration and update the pose of all the geometries,
         # including inactive variants for a given env: the step updates the active variant alone, so this is the only
@@ -1290,9 +1292,22 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
         if self._requires_grad and f == 0:
             kernel_save_adjoint_cache(f, self.dyn_state, self._rigid_adjoint_cache, self.rigid_info, self.rigid_config)
 
+        cups = getattr(self, "_suction_cups", ())
+        if cups:
+            # Refresh kinematics and the shared scene BVH at every physics
+            # substep, before forward dynamics consumes the spring forces.
+            self.update_forward_pos()
+            if not self._is_forward_vel_updated:
+                kernel_forward_velocity(self._scene._envs_idx, self.dyn_state, self.dyn_info,
+                                        self.rigid_info, self.rigid_config, False)
+                self._is_forward_vel_updated = True
+            trees = cups[0]._trees()
+            for cup in cups:
+                cup._apply_ghost_spring(trees)
+
         # Coupling forces from the previous coupling phase may target hibernated links (see
         # kernel_wakeup_coupled_links in abd/misc.py). They can only exist when another solver is active.
-        if self._use_hibernation and len(self.sim.active_solvers) > 1:
+        if self._use_hibernation and (len(self.sim.active_solvers) > 1 or cups):
             kernel_wakeup_coupled_links(
                 self.dyn_state,
                 self.constraint_solver.constraint_state,
@@ -1823,6 +1838,13 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
     def set_state(self, f, state, envs_idx=None, *, partial: bool = False) -> None:
         if not self.is_active:
             return
+
+        for cup in getattr(self, "_suction_cups", ()):
+            if cup._ghost_force is not None:
+                if envs_idx is None:
+                    cup._ghost_force.zero_()
+                else:
+                    cup._ghost_force[envs_idx] = 0.0
 
         if partial:
             self.collider.reset(envs_idx)

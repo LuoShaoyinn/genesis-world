@@ -6,6 +6,8 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.utils.raycast_qd import bvh_ray_cast
+from ..abd.forward_dynamics import func_vel_at_point
+from ..abd.misc import func_apply_coupling_force
 
 
 @qd.func
@@ -138,22 +140,49 @@ def kernel_request_suction_weld(
 
 
 @qd.kernel(fastcache=True)
-def kernel_get_suction_wrench(
-    envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(),
-    out: qd.types.ndarray(), constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo, rigid_config: qd.template(),
+def kernel_get_suction_welded(
+    envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), out: qd.types.ndarray(),
+    constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
 ):
     for i in range(envs_idx.shape[0]):
         b, frame = envs_idx[i], links_idx[i]
         for e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[b]):
-            first = dyn_info.equalities.eq_obj1id[e, b]
-            second = dyn_info.equalities.eq_obj2id[e, b]
+            first, second = dyn_info.equalities.eq_obj1id[e, b], dyn_info.equalities.eq_obj2id[e, b]
             if ((first == frame or second == frame)
-                and dyn_info.equalities.eq_type[e, b] == gs.EQUALITY_TYPE.SOFT_WELD
-                and dyn_info.equalities.soft_weld_had_rows[e, b]):
-                sign = 1.0 if frame == first else -1.0
-                for axis in qd.static(range(6)):
-                    out[i, axis] = sign * dyn_info.equalities.soft_weld_force[e, b][axis]
+                and dyn_info.equalities.eq_type[e, b] == gs.EQUALITY_TYPE.SOFT_WELD):
+                out[i] = True
+
+
+@qd.kernel(fastcache=True)
+def kernel_get_suction_wrench(
+    envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), ghost_force: qd.types.ndarray(),
+    out: qd.types.ndarray(), constraint_state: array_class.ConstraintState,
+    dyn_state: array_class.DynState, dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
+):
+    for i in range(envs_idx.shape[0]):
+        b, frame = envs_idx[i], links_idx[i]
+        welded = False
+        force = qd.Vector.zero(gs.qd_float, 3)
+        torque = qd.Vector.zero(gs.qd_float, 3)
+        for e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[b]):
+            first, second = dyn_info.equalities.eq_obj1id[e, b], dyn_info.equalities.eq_obj2id[e, b]
+            if ((first == frame or second == frame)
+                and dyn_info.equalities.eq_type[e, b] == gs.EQUALITY_TYPE.SOFT_WELD):
+                welded = True
+                if dyn_info.equalities.soft_weld_had_rows[e, b]:
+                    sign = 1.0 if frame == first else -1.0
+                    for axis in qd.static(range(3)):
+                        force[axis] = sign * dyn_info.equalities.soft_weld_force[e, b][axis]
+                        torque[axis] = sign * dyn_info.equalities.soft_weld_force[e, b][axis + 3]
+        if not welded:
+            for axis in qd.static(range(3)):
+                force[axis] = ghost_force[b, axis]
+        quat = dyn_state.links.quat[frame, b]
+        force_local = gu.qd_inv_transform_by_quat(force, quat)
+        torque_local = gu.qd_inv_transform_by_quat(torque, quat)
+        for axis in qd.static(range(3)):
+            out[i, axis] = force_local[axis]
+            out[i, axis + 3] = torque_local[axis]
 
 
 @qd.func
@@ -242,36 +271,59 @@ def kernel_release_suction(
 
 
 @qd.kernel(fastcache=True)
-def kernel_suction_normal(
-    envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), max_cast_distance: qd.f32,
-    out: qd.types.ndarray(),
+def kernel_apply_suction_ghost_spring(
+    frame: qd.i32, max_cast_distance: qd.f32,
+    stiffness: qd.types.ndarray(), damping: qd.types.ndarray(), ghost_force: qd.types.ndarray(),
     tree_a: array_class.BVHTreeState, tree_env_a: qd.types.ndarray(),
     tree_b: array_class.BVHTreeState, tree_env_b: qd.types.ndarray(), has_tree_b: qd.template(),
-    dyn_state: array_class.DynState, dyn_info: array_class.DynInfo, rigid_config: qd.template(),
+    dyn_state: array_class.DynState, constraint_state: array_class.ConstraintState,
+    dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo, rigid_config: qd.template(),
 ):
-    for i in range(envs_idx.shape[0]):
-        b, frame = envs_idx[i], links_idx[i]
-        frame_info = [frame, b] if qd.static(rigid_config.batch_links_info) else frame
-        owner = dyn_info.links.entity_idx[frame_info]
-        quat = dyn_state.links.quat[frame, b]
-        origin = dyn_state.links.pos[frame, b] + gu.qd_transform_by_quat(
-            gs.qd_vec3([0.0, 0.0, -0.5 * max_cast_distance]), quat
-        )
-        direction = gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, 1.0]), quat)
-        face, distance, normal = bvh_ray_cast(
-            tree_env_a[b], b, origin, direction, max_cast_distance, dyn_state,
-            tree_a, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
-        )
-        if qd.static(has_tree_b):
-            other_face, other_distance, other_normal = bvh_ray_cast(
-                tree_env_b[b], b, origin, direction, distance, dyn_state,
-                tree_b, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
+    for b in range(ghost_force.shape[0]):
+        for axis in qd.static(range(3)):
+            ghost_force[b, axis] = 0.0
+        welded = False
+        for e in range(rigid_info.n_equalities[None], constraint_state.qd_n_equalities[b]):
+            first, second = dyn_info.equalities.eq_obj1id[e, b], dyn_info.equalities.eq_obj2id[e, b]
+            if ((first == frame or second == frame)
+                and dyn_info.equalities.eq_type[e, b] == gs.EQUALITY_TYPE.SOFT_WELD):
+                welded = True
+        if not welded:
+            frame_info = [frame, b] if qd.static(rigid_config.batch_links_info) else frame
+            owner = dyn_info.links.entity_idx[frame_info]
+            quat = dyn_state.links.quat[frame, b]
+            cup_pos = dyn_state.links.pos[frame, b]
+            origin = cup_pos + gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, -0.5 * max_cast_distance]), quat)
+            direction = gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, 1.0]), quat)
+            face, distance, normal = bvh_ray_cast(
+                tree_env_a[b], b, origin, direction, max_cast_distance, dyn_state,
+                tree_a, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
             )
-            if other_face >= 0:
-                face, distance, normal = other_face, other_distance, other_normal
-        if face >= 0:
-            if normal.dot(direction) > 0.0:
-                normal = -normal
-            local_normal = gu.qd_inv_transform_by_quat(normal, quat)
-            for axis in qd.static(range(3)):
-                out[i, axis] = local_normal[axis]
+            if qd.static(has_tree_b):
+                other_face, other_distance, other_normal = bvh_ray_cast(
+                    tree_env_b[b], b, origin, direction, distance, dyn_state,
+                    tree_b, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
+                )
+                if other_face >= 0:
+                    face, distance, normal = other_face, other_distance, other_normal
+            if face >= 0 and distance < 0.5 * max_cast_distance:
+                if normal.dot(direction) > 0.0:
+                    normal = -normal
+                # Normal depth, rather than ray depth, makes F = -grad(1/2 k x^2)
+                # on a fixed plane even when the cup ray meets it obliquely.
+                penetration = (0.5 * max_cast_distance - distance) * qd.max(-normal.dot(direction), 0.0)
+                target = dyn_info.geoms.link_idx[dyn_info.faces.geom_idx[face]]
+                point = cup_pos + penetration * normal
+                relative_velocity = (func_vel_at_point(frame, b, point, dyn_state.links)
+                                     - func_vel_at_point(target, b, point, dyn_state.links))
+                k, c = gs.qd_float(0.0), gs.qd_float(0.0)
+                for axis in qd.static(range(3)):
+                    k += normal[axis] * normal[axis] * stiffness[axis]
+                    c += normal[axis] * normal[axis] * damping[axis]
+                magnitude = qd.max(0.0, k * penetration - c * relative_velocity.dot(normal))
+                force = normal * magnitude
+                # Same world point ensures no artificial net couple between bodies.
+                func_apply_coupling_force(frame, b, point, force, dyn_state.links)
+                func_apply_coupling_force(target, b, point, -force, dyn_state.links)
+                for axis in qd.static(range(3)):
+                    ghost_force[b, axis] = force[axis]

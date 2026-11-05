@@ -254,10 +254,9 @@ Pruned from Simulation Interface (same logic — labels/paths still valid):
 
 ### Registered suction cups
 
-Register one handle per collision-free suction-frame link before building the
-scene. Link indices are global rigid-solver indices; keep fixed frame links when
-loading a robot. The solver requires collision and non-differentiable rigid
-constraints, and `max_dynamic_constraints` must accommodate the cups.
+Register each collision-free cup frame before building the scene. The solver
+updates its raycast ghost spring every physics substep, whether or not a weld is
+requested. Each handle operates on selected environments; `None` selects all.
 
 ```python
 solver = scene.sim.rigid_solver
@@ -269,25 +268,34 @@ cup = solver.add_suction_cup(
     max_cast_distance=0.03,
 )
 scene.build(n_envs=1024)
-
-normal = cup.get_normal_proj(envs_idx)  # [N, 3], cup frame; zero on miss
 cup.request_suction_cup_welding(envs_idx)
 scene.step()
-wrench = cup.get_wrench(envs_idx)       # [N, 6], world frame
+welded = cup.get_welded(envs_idx)  # [N] active-attachment booleans
+wrench = cup.get_wrench(envs_idx)  # [N, 6] in the cup frame
 cup.release_suction_cup(envs_idx)
 ```
 
-All operations select environments for this cup; `envs_idx=None` selects all.
-A ray starts half the cast distance behind the cup origin and goes along the
-cup's local +Z for the full cast distance. It excludes the cup's own entity and
-hits the nearest collision surface. A request that misses does nothing; a later
-request can retry. Active welds are unchanged by subsequent requests. A broken
-weld can be re-armed by another request. Release and scene reset remove welds.
+The ray starts half the cast distance behind the cup origin and travels along
+local +Z over the full distance. It ignores the cup's own entity and selects
+the nearest collision surface. A weld request creates or re-arms a breakable
+six-axis weld at the hit point; an active weld is unchanged. Release and scene
+reset remove welds. `get_welded` distinguishes an active weld, including one
+not yet solved, from absent or broken welds.
 
-Normals are fresh raycasts, oriented against the ray and rotated into the cup
-frame. Wrenches are force XYZ in N followed by direct torque XYZ in N m, acting
-on the cup, from the last solved physics substep. An absent, broken or unsolved
-weld returns `+inf`. Stiffness and damping are scalar or six values in linear
-then angular order (N/m, N s/m, N m/rad, N m s/rad); maximum wrench is scalar or
-six per-world-axis force/torque limits. Return tensors always retain the selected
-environment dimension, including for scenes built without parallel environments.
+When not welded, a hit behind the cup origin activates a one-sided spring.
+It projects linear stiffness and damping onto the surface normal, uses normal
+penetration and relative normal velocity, and applies equal and opposite forces
+at the same world point to the cup and hit link. The force cannot pull. It is
+not clamped by `max_wrench`, which controls weld breakage. The normal depth is
+ray depth times the absolute ray/normal dot product. On a fixed planar face
+with constant coefficients the undamped spring has potential `0.5*k*depth²`;
+damping removes energy. Ray-face switches, finite ray bounds, discontinuous
+weld requests/breaks, finite timesteps, and other solver forces can change total
+energy. Normal-projected anisotropic gains can also vary as the surface rotates.
+
+`get_wrench` returns the last substep's force XYZ (N) and direct torque XYZ
+(N m) in cup-local axes, always with an environment dimension. It reports the
+weld wrench while welded, or the ghost-spring force and zero direct torque while
+unwelded; no force or an unsolved weld yields zero. The ghost force is evaluated
+at the start of the last substep. Immediately after changing state or releasing,
+the next substep is needed for an updated ghost-spring measurement.

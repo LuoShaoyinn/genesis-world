@@ -6,7 +6,13 @@ import torch
 
 import genesis as gs
 
-from .constraint.weld import kernel_get_suction_wrench, kernel_request_suction_weld, kernel_release_suction, kernel_suction_normal
+from .constraint.weld import (
+    kernel_apply_suction_ghost_spring,
+    kernel_get_suction_welded,
+    kernel_get_suction_wrench,
+    kernel_release_suction,
+    kernel_request_suction_weld,
+)
 
 
 class SuctionCup:
@@ -22,6 +28,22 @@ class SuctionCup:
         self._link_idx = link_idx
         self._stiffness, self._damping, self._max_wrench = stiffness, damping, max_wrench
         self._max_cast_distance = max_cast_distance
+        self._ghost_force = None
+
+    def _build(self, batch_size):
+        self._ghost_force = torch.zeros((batch_size, 3), device=gs.device, dtype=gs.tc_float)
+
+    def _apply_ghost_spring(self, trees):
+        if not trees:
+            self._ghost_force.zero_()
+            return
+        first, second = trees[0], trees[-1]
+        kernel_apply_suction_ghost_spring(
+            self._link_idx, self._max_cast_distance, self._stiffness, self._damping, self._ghost_force,
+            first.bvh_state.tree, first.env_bvh_idx, second.bvh_state.tree, second.env_bvh_idx,
+            len(trees) == 2, self._solver.dyn_state, self._solver.constraint_solver.constraint_state,
+            self._solver.dyn_info, self._solver.rigid_info, self._solver.rigid_config,
+        )
 
     def _inputs(self, envs_idx, *, mutate=False):
         if not self._solver._scene.is_built:
@@ -86,37 +108,28 @@ class SuctionCup:
         kernel_release_suction(envs, links, self._solver.constraint_solver.constraint_state,
                                self._solver.dyn_info, self._solver.rigid_info)
 
-    def get_wrench(self, envs_idx=None):
-        """World-frame force (N) and direct torque (N m), shape [N, 6].
-
-        Returns +inf for absent, broken, or not-yet-solved welds. Values are
-        the most recently solved substep's wrench on this suction frame.
-        """
+    def get_welded(self, envs_idx=None):
+        """Return active attachment flags [N], including newly created welds."""
         envs, links = self._inputs(envs_idx)
-        out = torch.full((envs.numel(), 6), float("inf"), device=gs.device, dtype=gs.tc_float)
+        out = torch.zeros(envs.numel(), device=gs.device, dtype=torch.bool)
         if envs.numel():
-            kernel_get_suction_wrench(envs, links, out, self._solver.constraint_solver.constraint_state,
-                                      self._solver.dyn_info, self._solver.rigid_info, self._solver.rigid_config)
+            kernel_get_suction_welded(envs, links, out, self._solver.constraint_solver.constraint_state,
+                                      self._solver.dyn_info, self._solver.rigid_info)
         return out
 
-    def get_normal_proj(self, envs_idx=None):
-        """Fresh raycast normal in the cup's local frame, shape [N, 3].
+    def get_wrench(self, envs_idx=None):
+        """Latest cup-frame force (N) and direct torque (N m), shape [N, 6].
 
-        The surface normal points against the cast direction. A miss returns
-        [0, 0, 0]. The ray and range are identical to the welding request.
+        An unwelded cup reports its last ghost-spring force and zero torque;
+        a welded cup reports its last solved weld wrench. An absent or unsolved
+        force is zero. Wrenches are computed during a physics substep.
         """
         envs, links = self._inputs(envs_idx)
-        out = torch.zeros((envs.numel(), 3), device=gs.device, dtype=gs.tc_float)
-        if not envs.numel():
-            return out
-        trees = self._trees()
-        if trees:
-            first, second = trees[0], trees[-1]
-            kernel_suction_normal(
-                envs, links, self._max_cast_distance, out,
-                first.bvh_state.tree, first.env_bvh_idx, second.bvh_state.tree, second.env_bvh_idx,
-                len(trees) == 2, self._solver.dyn_state, self._solver.dyn_info, self._solver.rigid_config,
-            )
+        out = torch.zeros((envs.numel(), 6), device=gs.device, dtype=gs.tc_float)
+        if envs.numel():
+            kernel_get_suction_wrench(envs, links, self._ghost_force, out,
+                                      self._solver.constraint_solver.constraint_state,
+                                      self._solver.dyn_state, self._solver.dyn_info, self._solver.rigid_info)
         return out
 
 

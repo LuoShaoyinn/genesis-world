@@ -7,7 +7,9 @@ from genesis.engine.bvh import BVHTreeState
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo, RigidErrorCode
 from .data import ConstraintState
 import genesis.utils.geom as gu
-from genesis.utils.raycast_qd import bvh_ray_cast
+# Raycasting also imports the rigid solver. Resolve its functions at kernel
+# compilation time, after both modules have finished initializing.
+import genesis.utils.raycast_qd as raycast_qd
 from ..abd.forward_dynamics import func_vel_at_point
 from ..abd.misc import func_apply_coupling_force
 
@@ -107,12 +109,12 @@ def kernel_request_suction_weld(
             cup_quat = dyn_state.links.quat[frame, i_b]
             origin = cup_pos + gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, -0.5 * max_cast_distance]), cup_quat)
             direction = gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, 1.0]), cup_quat)
-            face, distance, normal = bvh_ray_cast(
+            face, distance, normal = raycast_qd.bvh_ray_cast(
                 tree_env_a[i_b], i_b, origin, direction, max_cast_distance, dyn_state,
                 tree_a, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
             )
             if qd.static(has_tree_b):
-                other_face, other_distance, other_normal = bvh_ray_cast(
+                other_face, other_distance, other_normal = raycast_qd.bvh_ray_cast(
                     tree_env_b[i_b], i_b, origin, direction, distance, dyn_state,
                     tree_b, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
                 )
@@ -297,12 +299,12 @@ def kernel_apply_suction_ghost_spring(
             cup_pos = dyn_state.links.pos[frame, b]
             origin = cup_pos + gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, -0.5 * max_cast_distance]), quat)
             direction = gu.qd_transform_by_quat(gs.qd_vec3([0.0, 0.0, 1.0]), quat)
-            face, distance, normal = bvh_ray_cast(
+            face, distance, normal = raycast_qd.bvh_ray_cast(
                 tree_env_a[b], b, origin, direction, max_cast_distance, dyn_state,
                 tree_a, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
             )
             if qd.static(has_tree_b):
-                other_face, other_distance, other_normal = bvh_ray_cast(
+                other_face, other_distance, other_normal = raycast_qd.bvh_ray_cast(
                     tree_env_b[b], b, origin, direction, distance, dyn_state,
                     tree_b, dyn_info, gs.EPS, 1, owner, rigid_config.batch_links_info, True,
                 )

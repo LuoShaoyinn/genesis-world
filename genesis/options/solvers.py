@@ -4,7 +4,7 @@ import numpy as np
 from pydantic import PrivateAttr, StrictBool, model_validator
 
 import genesis as gs
-from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, UnitVec4FType, Vec3FType
+from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, Vec3FType
 
 from .options import Options
 
@@ -21,14 +21,11 @@ class SimOptions(Options):
 
     Note
     ----
-    1. `SimOptions` specifies the global settings for the simulator. Some parameters exist both in `SimOptions` and
+    `SimOptions` specifies the global settings for the simulator. Some parameters exist both in `SimOptions` and
     `SolverOptions`. In this case, if such parameters are given in `SolverOptions`, it will override the one specified
     in `SimOptions` for this specific solver. For example, if `dt` is only given in `SimOptions`, it will be shared by
     all the solvers, while a solver given its own `dt` integrates over that interval instead, and the number of
     substeps of every solver follows from it.
-
-    2. In differentiable mode, `substeps_local` must be divisible by `substeps`, as external command is input per
-    `step`, but `substep`. If `requires_grad` is False, we can use arbitrary `substeps_local`.
 
     Parameters
     ----------
@@ -39,12 +36,8 @@ class SimOptions(Options):
         substeps buy accuracy and stability, at a runtime cost that grows linearly with the count in the worst case
         though sub-linearly in practice. Setting both this and a solver `dt` that implies a different count raises an
         exception. Defaults to 1.
-    substeps_local : int, optional
-        Number of substeps stored in GPU memory. Defaults to None. This is used for differentiable mode.
     gravity : tuple, optional
         Gravity force in N/kg. Defaults to (0.0, 0.0, -9.81).
-    floor_height : float, optional
-        Height of the floor in meters. Defaults to 0.0.
     requires_grad : bool, optional
         Whether to enable differentiable mode. Defaults to False.
     use_hydroelastic_contact : bool, optional
@@ -53,29 +46,8 @@ class SimOptions(Options):
 
     dt: PositiveFloat = 1e-2
     substeps: PositiveInt = 1
-    substeps_local: PositiveInt | None = None  # number of substeps stored in GPU memory
     gravity: Vec3FType = (0.0, 0.0, -9.81)
-    floor_height: float = 0.0
     requires_grad: StrictBool = False
-
-    _steps_local: int | None = PrivateAttr(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _resolve_substeps(cls, data: dict) -> dict:
-        if data.get("substeps_local") is None:
-            # use 1 to save gpu memory when not in differentiable mode
-            data["substeps_local"] = data.get("substeps", 1) if data.get("requires_grad", False) else 1
-        return data
-
-    def model_post_init(self, context: Any) -> None:
-        if self.requires_grad:
-            if self.substeps_local % self.substeps != 0:
-                gs.raise_exception("`substeps_local` must be divisible by `substeps` when `requires_grad` is True.")
-            else:
-                self._steps_local = int(self.substeps_local / self.substeps)
-        else:
-            self._steps_local = None
 
 
 class BaseCouplerOptions(Options):
@@ -158,7 +130,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     point_contact_stiffness : float, optional
         Stiffness for point contact. Defaults to 1e8.
     fem_floor_contact_type : str, optional
-        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
+        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none". The floor is the rigid
+        ground plane of the scene, which must be a single fixed plane facing up. A scene without one has no floor.
         TET would be the default choice for most cases.
         VERT would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_fem_self_tet_contact : bool, optional
@@ -166,7 +139,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     rigid_rigid_type : str, optional
         Type of contact between rigid bodies. Defaults to "tet". Can be "tet", "vert", or "none".
     rigid_floor_contact_type : str, optional
-        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
+        Type of contact against the floor, as for `fem_floor_contact_type`. Defaults to "tet". Can be "tet", "vert",
+        or "none".
         Tet would be the default choice for most cases.
         Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_rigid_fem_contact : bool, optional
@@ -414,23 +388,6 @@ class KinematicOptions(Options):
     batch_joints_info: StrictBool = False
     batch_dofs_info: StrictBool = False
     IK_max_targets: PositiveInt = 6
-
-
-class ToolOptions(TimeBasedMixin):
-    """
-    Options configuring the ToolSolver.
-
-    Note
-    ----
-    ToolEntity is a simplified form of RigidEntity. It supports one way tool->other coupling, but has *no* internal dynamics and can only be created from a single mesh. This is a temporal workaround for differentiable rigid-soft interaction. This solver will be removed once differentiable mode is supported by the RigidSolver.
-
-    Parameters
-    ----------
-    floor_height : float, optional
-        Height of the floor in meters. Defaults to 0.0.
-    """
-
-    floor_height: float | None = None
 
 
 class RigidOptions(GravityMixin, TimeBasedMixin):
@@ -897,8 +854,6 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     ----------
     damping : float, optional
         Damping factor. Defaults to 0.0.
-    floor_height : float, optional
-        Height of the floor in meters. If none, it will inherit from `SimOptions`. Defaults to None.
     use_implicit_solver : bool, optional
         Whether to use the implicit solver. Defaults to False.
         Implicit solver is a more stable solver for FEM. It can be used with a large time step.
@@ -911,7 +866,9 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     newton_dx_threshold : float, optional
         Threshold for the Newton solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
     pcg_threshold : float, optional
-        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
+        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True, without
+        `requires_grad`: a differentiable scene solves to the precision of the simulation instead, which its gradients
+        need, at the cost of more iterations.
     linesearch_c : float, optional
         Line search sufficient decrease parameter. Defaults to 1e-4. Only used when `use_implicit_solver` is True.
     linesearch_tau : float, optional
@@ -925,7 +882,6 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     """
 
     damping: NonNegativeFloat = 0.0
-    floor_height: float | None = None
     use_implicit_solver: StrictBool = False
     n_newton_iterations: PositiveInt = 1
     n_pcg_iterations: PositiveInt = 500
@@ -937,21 +893,3 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_vertex_constraints: StrictBool = False
-
-
-class SFOptions(TimeBasedMixin):
-    """
-    Options configuring the SFSolver.
-    """
-
-    res: PositiveInt = 128
-    solver_iters: PositiveInt = 500
-    decay: PositiveFloat = 0.99
-
-    T_low: float = 1.0
-    T_high: float = 0.0
-
-    inlet_pos: Vec3FType = (0.6, 0.0, 0.1)
-    inlet_vel: Vec3FType = (0.0, 0.0, 1.0)
-    inlet_quat: UnitVec4FType = (1.0, 0.0, 0.0, 0.0)
-    inlet_s: PositiveFloat = 400.0

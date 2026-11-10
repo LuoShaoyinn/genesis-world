@@ -1,5 +1,5 @@
-# pylint: disable=no-value-for-parameter
-
+from collections.abc import Iterator, Sequence
+from enum import IntEnum, auto
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -10,32 +10,473 @@ import igl
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
-from genesis.engine.boundaries import FloorBoundary
+import genesis.utils.simt as su
 from genesis.engine.entities.fem_entity import FEMEntity
 from genesis.engine.materials import FEM
-from genesis.engine.states.solvers import FEMSolverState
-from genesis.utils.geom import qd_transform_by_quat, qd_transform_quat_by_quat
-from genesis.utils.misc import qd_to_torch
+from genesis.engine.materials.FEM.elastic import (
+    FEMModel,
+    func_linear_corotated_energy,
+    func_linear_corotated_energy_gradient,
+    func_linear_corotated_hessian_product,
+    func_linear_corotated_rotation,
+    func_linear_corotated_rotation_grad,
+    func_linear_energy,
+    func_linear_energy_gradient,
+    func_linear_hessian_product,
+    func_linear_stress,
+    func_stable_neohookean_energy,
+    func_stable_neohookean_stress,
+)
+from genesis.engine.materials.FEM.muscle import (
+    func_muscle_fiber_dir,
+    func_muscle_fiber_dir_grad,
+    func_muscle_fiber_stress,
+    func_muscle_stress,
+)
+from genesis.engine.solvers.rigid.data import LinksState
+from genesis.engine.state_change import StateChange, mutates
+from genesis.engine.states.solvers import SolverCheckpoint
+from genesis.grad.bridge import custom_backward, no_grad
+from genesis.options.solvers import FEMOptions
+from genesis.utils.data import (
+    ENVS,
+    FRAMES,
+    Config,
+    ConfigItem,
+    Data,
+    DataItem,
+    DataKind,
+    Size,
+    eoa,
+    field,
+    iter_data,
+)
+from genesis.utils.geom import qd_inv_quat, qd_transform_by_quat, qd_transform_quat_by_quat
+from genesis.utils.misc import broadcast_tensor, get_gpu_core_count, qd_isfinite, qd_to_numpy, qd_zero_grad
 
-from .base_solver import GravityMixin, Solver, TimeBasedMixin
+from .base_solver import (
+    VFACES,
+    VVERTS,
+    ErrorCode,
+    GravityMixin,
+    Solver,
+    TimeBasedMixin,
+    kernel_get_values,
+    kernel_set_actu,
+)
 
 if TYPE_CHECKING:
-    from genesis.engine.entities import FEMEntity
+    from genesis.engine.scene import Scene
+    from genesis.engine.simulator import Simulator
+
+# Lanes of a GPU subgroup tile that gather together the element corners of a vertex (see 'vertices_corners_idx')
+LOG2_CORNER_LANES = 2
+# Threads of the GPU block that sums the terms of an environment over its vertices and elements in a fixed order
+ENV_BLOCK_DIM = 256
 
 
-@qd.data_oriented
+class FEMErrorCode(ErrorCode):
+    """The error flags the finite element method (FEM) solver writes in its errno (see 'Solver.register_errors')."""
+
+    INVALID_VERTEX_NAN = auto()
+
+
+class FEMSolveStage(IntEnum):
+    """The stages of the implicit solve that the host launches one by one (see 'FEMSolver._solve_on_host')."""
+
+    INIT_NEWTON = auto()
+    NEWTON_HEAD = auto()
+    PCG_ITER = auto()
+    INIT_LINESEARCH = auto()
+    LINESEARCH_ITER = auto()
+    SKIP_LINESEARCH = auto()
+    END_NEWTON = auto()
+    INIT_ADJOINT = auto()
+    SEED_ADJOINT = auto()
+
+
+VERTICES = Size("vertices")
+ELEMENTS = Size("elements")
+SURFACES = Size("surfaces")
+SURFACE_VERTICES = Size("surface_vertices")
+SURFACE_ELEMENTS = Size("surface_elements")
+
+# The arrays of the implicit solve, which the explicit solver leaves out
+IMPLICIT = "implicit"
+# The rotation of the elements of the linear corotated model, and the fiber directions of the muscles under the
+# implicit solver.
+COROTATED = "corotated"
+MUSCLE_FIBERS = "muscle_fibers"
+# The corners of the elements gathered by vertex, which the GPU kernels walk (see 'vertices_corners_idx')
+CORNER_BLOCKS = "corner_blocks"
+
+
+class FEMVertices(Data, kind=DataKind.STATE, shape=(FRAMES, VERTICES, ENVS)):
+    """
+    Runtime state of the finite element method (FEM) vertices, one value per frame of a step, vertex and environment.
+    """
+
+    pos: qd.Tensor = field((float, 3), grad=True)
+    vel: qd.Tensor = field((float, 3), grad=True)
+
+
+class FEMElements(Data, kind=DataKind.STATE, shape=(FRAMES, ELEMENTS, ENVS)):
+    """
+    Runtime state of the finite element method (FEM) elements, one value per frame of a step, element and environment.
+
+    It holds their actuation.
+    """
+
+    actu: qd.Tensor = field(float, grad=True)
+
+
+class FEMElementsEnergy(Data, kind=DataKind.SCRATCH, shape=(ELEMENTS, ENVS)):
+    """
+    The energy density of each element at the end of a substep of the implicit solver, and its gradient with respect to
+    the deformation gradient plus the stress of the Rayleigh stiffness damping.
+    """
+
+    energy: qd.Tensor = field(float)
+    gradient: qd.Tensor = field((float, (3, 3)))
+
+
+class FEMElementsMaterial(Data, kind=DataKind.DERIVED, shape=(ELEMENTS, ENVS)):
+    """
+    The data the materials compute for each element from the deformation at the start of a substep.
+
+    `rotation` is the rotation the linear corotated model linearizes about, and `fiber_dir` the direction of the fibers
+    of a muscle, along which the implicit solver applies its active stress.
+    """
+
+    rotation: qd.Tensor = field((float, (3, 3)), labels=COROTATED)
+    fiber_dir: qd.Tensor = field((float, 3), labels=MUSCLE_FIBERS)
+
+
+class FEMVerticesEnergy(Data, kind=DataKind.SCRATCH, shape=(VERTICES, ENVS)):
+    """
+    The inertia of each vertex at the end of a substep of the implicit solver, and the force on it there.
+
+    The adjoint of the forces holds the solution of the adjoint solve (see 'FEMSolver._implicit_solve_grad'), which the
+    inertia carries back to the state at the start of the substep.
+    """
+
+    inertia: qd.Tensor = field((float, 3), grad=True)
+    force: qd.Tensor = field((float, 3), grad=True)
+
+
+class FEMVerticesSolve(Data, kind=DataKind.SCRATCH, shape=(VERTICES, ENVS)):
+    """
+    The preconditioned conjugate gradient (PCG) solve and the line search of the implicit solver, for each vertex.
+
+    `diag3x3` is the diagonal 3-by-3 block of the Hessian, `prec` its inverse, the block Jacobi preconditioner, `x`
+    the solution, `r` the residual, `z` the preconditioned residual, `p` the search direction, `Ap` the product of the
+    Hessian with it, and `x_prev` the position the line search starts from.
+    """
+
+    diag3x3: qd.Tensor = field((float, (3, 3)))
+    prec: qd.Tensor = field((float, (3, 3)))
+    x: qd.Tensor = field((float, 3))
+    r: qd.Tensor = field((float, 3))
+    z: qd.Tensor = field((float, 3))
+    p: qd.Tensor = field((float, 3))
+    Ap: qd.Tensor = field((float, 3))
+    x_prev: qd.Tensor = field((float, 3))
+
+
+class FEMEnvsSolve(Data, kind=DataKind.SCRATCH, shape=(ENVS,)):
+    """
+    The progress and scalars of the implicit solve of each environment.
+
+    They are whether its Newton iterations, its preconditioned conjugate gradient (PCG) solve and its line search go on,
+    the scalars of the PCG solve, the squared residual below which the PCG solve of a differentiable scene stops (see
+    'pcg_threshold_rel'), and the energy, step and slope of the line search.
+    """
+
+    is_active: qd.Tensor = field(bool)
+    is_pcg_active: qd.Tensor = field(bool)
+    is_linesearch_active: qd.Tensor = field(bool)
+    rTr: qd.Tensor = field(float)
+    rTz: qd.Tensor = field(float)
+    rTr_threshold: qd.Tensor = field(float)
+    prev_energy: qd.Tensor = field(float)
+    step_size: qd.Tensor = field(float)
+    m: qd.Tensor = field(float)
+
+
+class FEMSolveLoops(Data, kind=DataKind.SCRATCH, shape=()):
+    """
+    The iterations left to each loop of the implicit solve, and the flags that keep the loops running on the device as
+    long as an environment iterates on (see 'kernel_batch_solve').
+
+    The flags are ndarrays on every backend, since graph.do_while takes the same ndarray on every call.
+    """
+
+    n_newton_left: qd.Tensor = field(int)
+    n_pcg_left: qd.Tensor = field(int)
+    n_linesearch_left: qd.Tensor = field(int)
+    newton_counter: qd.Tensor = field(qd.i32, ndarray=True)
+    pcg_counter: qd.Tensor = field(qd.i32, ndarray=True)
+    linesearch_counter: qd.Tensor = field(qd.i32, ndarray=True)
+
+
+class FEMVVertsRender(Data, kind=DataKind.SCRATCH, shape=(VVERTS, ENVS)):
+    """The visual vertices as drawn, each one at the position of the simulated vertex it stands for."""
+
+    pos: qd.Tensor = field((float, 3))
+
+
+class FEMState(Data, kind=DataKind.STATE):
+    """Runtime state of the finite element method (FEM) solver."""
+
+    vertices: FEMVertices
+    elements: FEMElements
+    elements_material: FEMElementsMaterial
+    elements_energy: FEMElementsEnergy = field(labels=IMPLICIT)
+    vertices_energy: FEMVerticesEnergy = field(labels=IMPLICIT)
+    vertices_solve: FEMVerticesSolve = field(labels=IMPLICIT)
+    envs_solve: FEMEnvsSolve = field(labels=IMPLICIT)
+    solve_loops: FEMSolveLoops = field(labels=IMPLICIT)
+    vverts_render: FEMVVertsRender
+
+
+class FEMElementsInfo(Data, kind=DataKind.CONSTANT, shape=(ELEMENTS,)):
+    """
+    Model parameters of the FEM elements, one value per element.
+
+    `el2v` holds the vertices of an element, `mu` and `lam` its Lame parameters, `mass_scaled` its mass multiplied by
+    the volume scale of the solver, `B` the inverse of its deformation gradient at rest, `V` its rest volume, `model`
+    the constitutive model of its material, `is_muscle` whether its material is a muscle, of active stiffness
+    `muscle_stiffness`, whose fibers follow `muscle_direction` and its group `muscle_group`.
+    """
+
+    el2v: qd.Tensor = field((int, 4))
+    mu: qd.Tensor = field(float)
+    lam: qd.Tensor = field(float)
+    mass_scaled: qd.Tensor = field(float)
+    B: qd.Tensor = field((float, (3, 3)))
+    V: qd.Tensor = field(float)
+    friction_mu: qd.Tensor = field(float)
+    model: qd.Tensor = field(int)
+    is_muscle: qd.Tensor = field(bool)
+    muscle_stiffness: qd.Tensor = field(float)
+    muscle_group: qd.Tensor = field(int, kind=DataKind.INFO)
+    muscle_direction: qd.Tensor = field((float, 3), kind=DataKind.INFO)
+
+
+class FEMVerticesInfo(Data, kind=DataKind.CONSTANT, shape=(VERTICES,)):
+    """
+    Model parameters of the finite element method (FEM) vertices.
+
+    They are their mass, its inverse, its ratio to the squared substep and friction.
+    """
+
+    mass: qd.Tensor = field(float)
+    mass_inv: qd.Tensor = field(float)
+    mass_over_dt2: qd.Tensor = field(float)
+    friction_mu: qd.Tensor = field(float)
+
+
+class FEMSurfacesInfo(Data, kind=DataKind.CONSTANT, shape=(SURFACES,)):
+    """
+    The surface triangles of the finite element method (FEM) entities, for coupling.
+
+    They hold their vertices and the element each one bounds.
+    """
+
+    tri2v: qd.Tensor = field((int, 3))
+    tri2el: qd.Tensor = field(int)
+
+
+class FEMInfo(Data, kind=DataKind.CONSTANT):
+    """
+    Model parameters of the FEM solver.
+
+    The visual vertices stand for the simulated vertex `vverts_vert_idx` each, with the texture coordinates
+    `vverts_uvs`, and the visual faces join them. `damping_decay` is the factor by which the explicit solver damps the
+    velocities over a substep, `damping_alpha_dt` and `damping_beta_over_dt` the Rayleigh mass and stiffness damping of
+    the implicit solver over a substep, `damping_beta_factor` the latter plus one, `vol_scale` the factor the masses of
+    the elements are scaled by for numerical robustness and `fiber_length_eps` the small number added to the squared
+    length of a muscle fiber before taking its root. The iteration budgets and thresholds of the implicit solve follow.
+    A differentiable scene solves to round-off, relative to the first residual of the substep (`pcg_threshold_rel`),
+    since its backward pass is the adjoint of the root of the solve. `has_inverted_elements` flags the elements added
+    with their vertices in the wrong order.
+
+    The topology of the elements, which the couplings and the GPU kernels walk, follows. `surface_vertices` and
+    `surface_elements` list the vertices of the surface triangles and the elements touching them, `surface_vert_mass`
+    the lumped mass of the surface at each of its vertices. The incident triangles of surface vertex i_sv are
+    `surface_vertices_tri_idx[surface_vertices_tri_start[i_sv]:surface_vertices_tri_start[i_sv + 1]]`, in increasing
+    triangle index, with the scaled mass of the element each one bounds. The corners of the elements are listed vertex
+    by vertex then element by element in `vertices_corners_idx`, each one packed as 4 times its element plus its local
+    index, those of vertex i_v starting at `vertices_corners_start[i_v]`: a vertex gathers the terms of its corners in
+    this order, so the implicit solve and the internal force getter sum them without atomics.
+    """
+
+    elements: FEMElementsInfo
+    vertices: FEMVerticesInfo
+    surfaces: FEMSurfacesInfo
+    vverts_vert_idx: qd.Tensor = field(int, shape=(VVERTS,))
+    vverts_uvs: qd.Tensor = field((float, 2), shape=(VVERTS,))
+    vfaces_indices: qd.Tensor = field((int, 3), shape=(VFACES,))
+    gravity: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.INFO)
+    substep_dt: qd.Tensor = field(float, shape=())
+    dt2: qd.Tensor = field(float, shape=())
+    dt2_inv: qd.Tensor = field(float, shape=())
+    damping_decay: qd.Tensor = field(float, shape=())
+    damping_alpha_dt: qd.Tensor = field(float, shape=())
+    damping_beta_over_dt: qd.Tensor = field(float, shape=())
+    damping_beta_factor: qd.Tensor = field(float, shape=())
+    vol_scale: qd.Tensor = field(float, shape=())
+    fiber_length_eps: qd.Tensor = field(float, shape=())
+    n_newton_iterations: qd.Tensor = field(int, shape=(), labels=IMPLICIT)
+    n_pcg_iterations: qd.Tensor = field(int, shape=(), labels=IMPLICIT)
+    n_linesearch_iterations: qd.Tensor = field(int, shape=(), labels=IMPLICIT)
+    pcg_threshold: qd.Tensor = field(float, shape=(), labels=IMPLICIT)
+    pcg_threshold_rel: qd.Tensor = field(float, shape=(), labels=IMPLICIT)
+    linesearch_c: qd.Tensor = field(float, shape=(), labels=IMPLICIT)
+    linesearch_tau: qd.Tensor = field(float, shape=(), labels=IMPLICIT)
+    has_inverted_elements: qd.Tensor = field(bool, shape=(), kind=DataKind.SCRATCH)
+    surface_vertices: qd.Tensor = field(int, shape=(SURFACE_VERTICES,))
+    surface_vert_mass: qd.Tensor = field(float, shape=(SURFACE_VERTICES,))
+    surface_vertices_tri_start: qd.Tensor = field(int, shape=(SURFACE_VERTICES + 1,))
+    surface_vertices_tri_idx: qd.Tensor = field(int, shape=(3 * SURFACES,))
+    surface_vertices_tri_mass_scaled: qd.Tensor = field(float, shape=(3 * SURFACES,))
+    surface_elements: qd.Tensor = field(int, shape=(SURFACE_ELEMENTS,))
+    vertices_corners_start: qd.Tensor = field(int, shape=(VERTICES + 1,), labels=CORNER_BLOCKS)
+    vertices_corners_idx: qd.Tensor = field(int, shape=(4 * ELEMENTS,), labels=CORNER_BLOCKS)
+
+
+# TODO: constraints set after a saved state survive 'scene.reset' (see MPMParticleConstraints in mpm_solver.py)
+class FEMVertexConstraints(Data, kind=DataKind.INFO, shape=(VERTICES, ENVS)):
+    """
+    The constraints of the FEM vertices, one per vertex and environment.
+
+    A constrained vertex is set to `target_pos`, or pulled toward it by a critically damped spring of stiffness
+    `stiffness` for a soft constraint, the target following the rigid link `link_idx` when there is one, at the offset
+    `link_offset_pos` from where the link stood at `link_init_quat`.
+    """
+
+    is_constrained: qd.Tensor = field(bool)
+    target_pos: qd.Tensor = field((float, 3))
+    is_soft_constraint: qd.Tensor = field(bool)
+    stiffness: qd.Tensor = field(float)
+    link_idx: qd.Tensor = field(int)
+    link_offset_pos: qd.Tensor = field((float, 3))
+    link_init_quat: qd.Tensor = field((float, 4))
+
+
+class FEMConfig(Config):
+    """The compile-time configuration of the kernels of the finite element method (FEM) solver."""
+
+    use_implicit_solver: bool
+    requires_grad: bool
+    enable_vertex_constraints: bool
+    # Threads of the block summing the terms of an environment: 1 on CPU, ENV_BLOCK_DIM on GPU
+    env_block_dim: int
+    # See LOG2_CORNER_LANES
+    log2_corner_lanes: int
+    # Whether one block of threads runs the whole PCG solve of an environment (see 'FEMSolver.build')
+    is_pcg_solved_per_env_block: bool
+    has_linesearch: bool
+    has_damping_alpha: bool
+    has_damping_beta: bool
+    # The constitutive models the elements use, the one they all share or -1 (see 'FEMSolver.build'), and whether some
+    # element is a muscle.
+    has_linear: bool
+    has_stable_neohookean: bool
+    has_linear_corotated: bool
+    shared_model: int
+    has_muscle: bool
+
+    @property
+    def n_block_tiles(self) -> int:
+        # Subgroup tiles of the block, of 32 threads each (see 'func_block_sum')
+        return (self.env_block_dim + 31) // 32
+
+
+class FEMData(Data):
+    """Every array of the FEM solver but its vertex constraints, allocated from the solver once its scene is built.
+
+    `n_surface_vertices` and `n_surface_elements` are the numbers of vertices and elements on the surface of the
+    entities, which the solver derives from their topology.
+    """
+
+    fem_info: FEMInfo
+    fem_state: FEMState
+    errno: qd.Tensor = field(int, shape=(ENVS,), kind=DataKind.STATE)
+
+    def __init__(self, solver: "FEMSolver", n_surface_vertices: int, n_surface_elements: int):
+        config = solver.fem_config
+        is_implicit = config.use_implicit_solver
+        info_values = {}
+        unused = {(FEMData.fem_info, FEMData.fem_state): True}
+        if solver.is_active:
+            substep_dt = solver.substep_dt
+            info_values = dict(
+                substep_dt=substep_dt,
+                dt2=substep_dt**2,
+                dt2_inv=1.0 / (substep_dt**2),
+                damping_decay=np.exp(-substep_dt * solver._damping),
+                damping_alpha_dt=solver._damping_alpha * substep_dt,
+                damping_beta_over_dt=solver._damping_beta / substep_dt,
+                damping_beta_factor=solver._damping_beta / substep_dt + 1.0,
+                vol_scale=solver._vol_scale,
+                fiber_length_eps=1e-12,
+            )
+            if is_implicit:
+                info_values.update(
+                    n_newton_iterations=solver._n_newton_iterations,
+                    n_pcg_iterations=solver._n_pcg_iterations,
+                    n_linesearch_iterations=solver._n_linesearch_iterations,
+                    pcg_threshold=solver._pcg_threshold,
+                    pcg_threshold_rel=(1e-6 if gs.qd_float == qd.f32 else 1e-14) ** 2,
+                    linesearch_c=solver._linesearch_c,
+                    linesearch_tau=solver._linesearch_tau,
+                )
+            unused = {
+                IMPLICIT: not is_implicit,
+                COROTATED: not config.has_linear_corotated,
+                MUSCLE_FIBERS: not (is_implicit and config.has_muscle),
+                CORNER_BLOCKS: config.env_block_dim == 1,
+            }
+        super().__init__(
+            sizes=dict(
+                envs=solver._B,
+                frames=solver.n_frames,
+                vertices=solver.n_vertices,
+                elements=solver.n_elements,
+                vverts=solver.n_vverts,
+                surfaces=solver.n_surfaces,
+                vfaces=solver.n_vfaces,
+                surface_vertices=n_surface_vertices,
+                surface_elements=n_surface_elements,
+            ),
+            values=dict(fem_info=info_values),
+            env_first={
+                (FEMData.fem_state.vertices, FEMData.fem_state.elements, FEMData.fem_state.vverts_render): False,
+                (
+                    FEMData.fem_state.elements_material,
+                    FEMData.fem_state.elements_energy,
+                    FEMData.fem_state.vertices_energy,
+                    FEMData.fem_state.vertices_solve,
+                ): True,
+            },
+            unused=unused,
+            requires_grad=solver._requires_grad,
+        )
+
+
 class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
     material_cls = FEM.Base
+    is_differentiable = True
+    has_frames = True
+
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
-    def __init__(self, scene, sim, options):
+    def __init__(self, scene: "Scene", sim: "Simulator", options: FEMOptions) -> None:
         super().__init__(scene, sim, options)
 
-        # options
-        self._floor_height = options.floor_height
         self._damping = options.damping
         self._use_implicit_solver = options.use_implicit_solver
         self._n_newton_iterations = options.n_newton_iterations
@@ -50,339 +491,177 @@ class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
         self._enable_vertex_constraints = options.enable_vertex_constraints
 
         # use scaled volume for better numerical stability, similar to p_vol_scale in mpm
-        self._vol_scale = float(1e4)
+        self._vol_scale = 1e4
 
-        # materials
-        self._mats = list()
-        self._mats_idx = list()
-        self._mats_update_stress = list()
-        self._mats_compute_energy_gradient_hessian = list()
-        self._mats_compute_energy = list()
-
-        # boundary
-        self.setup_boundary()
-
-        # lazy initialization
-        self._constraints_initialized = False
-
-    def setup_boundary(self):
-        self.boundary = FloorBoundary(height=self._floor_height)
-
-    def init_batch_fields(self):
-        self.batch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
-        self.batch_pcg_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
-        self.batch_linesearch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
-
-        pcg_state = qd.types.struct(
-            rTr=gs.qd_float,
-            rTz=gs.qd_float,
-            rTr_new=gs.qd_float,
-            rTz_new=gs.qd_float,
-            pTAp=gs.qd_float,
-            alpha=gs.qd_float,
-            beta=gs.qd_float,
-        )
-        self.pcg_state = pcg_state.field(shape=(self._B,), needs_grad=False, layout=qd.Layout.SOA)
-
-        linesearch_state = qd.types.struct(
-            prev_energy=gs.qd_float,
-            energy=gs.qd_float,
-            step_size=gs.qd_float,
-            m=gs.qd_float,
-        )
-        self.linesearch_state = linesearch_state.field(shape=(self._B,), needs_grad=False, layout=qd.Layout.SOA)
-
-    def init_element_fields(self):
-        # element state in vertices
-        element_state_v = qd.types.struct(
-            pos=gs.qd_vec3,  # position
-            vel=gs.qd_vec3,  # velocity
-        )
-
-        # element state in elements
-        element_state_el = qd.types.struct(
-            actu=gs.qd_float,  # actuation
-        )
-
-        # element state without gradient
-        element_state_el_ng = qd.types.struct(
-            active=gs.qd_bool,
-        )
-
-        # element info (properties that remain static through time)
-        element_info = qd.types.struct(
-            el2v=gs.qd_ivec4,  # vertex index of an element
-            mu=gs.qd_float,  # lame parameters (1)
-            lam=gs.qd_float,  # lame parameters (2)
-            mass_scaled=gs.qd_float,  # scaled element mass. The real mass is mass_scaled / self._vol_scale
-            mat_idx=gs.qd_int,  # material model index
-            B=gs.qd_mat3,  # inverse of the deformation gradient at rest state
-            V=gs.qd_float,  # rest volume of the element
-            V_scaled=gs.qd_float,  # scaled rest volume of the element
-            friction_mu=gs.qd_float,  # friction coefficient for contact
-            # for muscle
-            muscle_group=gs.qd_int,
-            muscle_direction=gs.qd_vec3,
-        )
-
-        # element state for energy
-        element_state_el_energy = qd.types.struct(
-            energy=gs.qd_float,  # energy density for the element
-            gradient=gs.qd_mat3,  # gradient density for the element, del energy / del F
-        )
-
-        element_state_v_energy = qd.types.struct(
-            inertia=gs.qd_vec3,  # inertia for the vertex
-            force=gs.qd_vec3,
-        )
-
-        element_v_info = qd.types.struct(
-            mass=gs.qd_float,  # mass of the vertex
-            mass_inv=gs.qd_float,  # inverse mass of the vertex
-            mass_over_dt2=gs.qd_float,  # scaled mass of the vertex over dt^2
-            friction_mu=gs.qd_float,  # friction coefficient for contact
-        )
-
-        pcg_state_v = qd.types.struct(
-            diag3x3=gs.qd_mat3,  # diagonal 3-by-3 block of the hessian
-            prec=gs.qd_mat3,  # preconditioner
-            x=gs.qd_vec3,  # solution vector
-            r=gs.qd_vec3,  # residual vector
-            z=gs.qd_vec3,  # preconditioned residual vector
-            p=gs.qd_vec3,  # search direction vector
-            Ap=gs.qd_vec3,  # matrix-vector product
-        )
-
-        linesearch_state_v = qd.types.struct(
-            x_prev=gs.qd_vec3,  # solution vector
-        )
-
-        # construct field
-        self.elements_v = element_state_v.field(
-            shape=(self.sim.substeps_local + 1, self.n_vertices, self._B),
-            needs_grad=True,
-            layout=qd.Layout.SOA,
-        )
-        self.elements_el = element_state_el.field(
-            shape=(self.sim.substeps_local + 1, self.n_elements, self._B),
-            needs_grad=True,
-            layout=qd.Layout.SOA,
-        )
-        self.elements_el_ng = element_state_el_ng.field(
-            shape=(self.sim.substeps_local + 1, self.n_elements, self._B),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-        self.elements_i = element_info.field(
-            shape=(self.n_elements),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-        self.elements_el_energy = element_state_el_energy.field(
-            shape=(self._B, self.n_elements),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-        self.elements_el_hessian = qd.field(shape=(self._B, 3, 3, self.n_elements), dtype=gs.qd_mat3)
-
-        self.elements_v_energy = element_state_v_energy.field(
-            shape=(self._B, self.n_vertices),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-        self.elements_v_info = element_v_info.field(
-            shape=(self.n_vertices),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-        self.pcg_state_v = pcg_state_v.field(
-            shape=(self._B, self.n_vertices),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-        self.linesearch_state_v = linesearch_state_v.field(
-            shape=(self._B, self.n_vertices),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-    def init_surface_fields(self):
-        n_surfaces_max = self.n_surfaces
-
-        # surface info (for coupling)
-        surface_state = qd.types.struct(
-            tri2v=gs.qd_ivec3,  # vertex index of a triangle
-            tri2el=gs.qd_int,  # element index of a triangle
-            active=gs.qd_bool,
-        )
-
-        self.surface = surface_state.field(
-            shape=(n_surfaces_max),
-            needs_grad=False,
-            layout=qd.Layout.SOA,
-        )
-
-    def init_vvert_fields(self):
-        """Allocate the render geometry of every visual geom of every entity, laid out back-to-back.
-
-        Several vverts may stand for a single simulated vertex, so each one carries its own UVs and gathers its
-        position through 'vert_idx' (see 'FEMVisGeom'). A contiguous layout lets a renderer consume positions, UVs and
-        topology as three flat arrays.
-        """
-        struct_vvert_info = qd.types.struct(
-            vert_idx=gs.qd_int,  # simulated vertex standing for this vvert
-        )
-        self.vverts_info = struct_vvert_info.field(shape=(max(self._n_vverts, 1),), layout=qd.Layout.SOA)
-
-        # environment-offset vvert positions
-        struct_vvert_state_render = qd.types.struct(
-            pos=gs.qd_vec3,
-        )
-        self.vverts_render = struct_vvert_state_render.field(
-            shape=(max(self._n_vverts, 1), self._B), layout=qd.Layout.SOA
-        )
-
-        # static, shared across all batch envs
-        self.vverts_uvs = qd.field(dtype=gs.qd_vec2, shape=(max(self._n_vverts, 1),))
-
-        # static, in the solver's global vvert space
-        self.vfaces_indices = qd.field(dtype=gs.qd_ivec3, shape=(max(self._n_vfaces, 1),))
-
-    def _init_surface_info(self):
-        self.vertices_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_vertices,))
-        self.elements_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_elements,))
-        self.compute_surface_vertices()
-        self.compute_surface_elements()
-        vertices_on_surface_np = self.vertices_on_surface.to_numpy()
-        elements_on_surface_np = self.elements_on_surface.to_numpy()
-        (surface_vertices_np,) = vertices_on_surface_np.nonzero()
-        self.surface_vertices = qd.field(
-            dtype=qd.i32,
-            shape=(len(surface_vertices_np),),
-            needs_grad=False,
-        )
-        self.surface_vertices.from_numpy(surface_vertices_np.astype(np.int32, copy=False))
-        (surface_elements_np,) = elements_on_surface_np.nonzero()
-        self.surface_elements = qd.field(
-            dtype=qd.i32,
-            shape=(len(surface_elements_np),),
-            needs_grad=False,
-        )
-        self.surface_elements.from_numpy(surface_elements_np.astype(np.int32, copy=False))
-
-        surface_triangles_np = self.surface.tri2v.to_numpy()
-        pos_np = self.elements_v.pos.to_numpy()[0, :, 0, :][surface_vertices_np]
-        surface_vertices_mapping = np.full(self.n_vertices, -1, dtype=np.int32)
-        surface_vertices_mapping[surface_vertices_np] = np.arange(len(surface_vertices_np))
-        mass = igl.massmatrix(pos_np, surface_vertices_mapping[surface_triangles_np])
-        surface_vert_mass_np = mass.diagonal().astype(gs.np_float, copy=False)
-        self.surface_vert_mass = qd.field(
-            dtype=gs.qd_float,
-            shape=(len(surface_vertices_np),),
-            needs_grad=False,
-        )
-        self.surface_vert_mass.from_numpy(surface_vert_mass_np)
-
-    @qd.kernel
-    def compute_surface_vertices(self):
-        for i_v in range(self.n_vertices):
-            self.vertices_on_surface[i_v] = False
-
-        for i_s in range(self.n_surfaces):
-            tri2v = self.surface[i_s].tri2v
-            for i in qd.static(range(3)):
-                self.vertices_on_surface[tri2v[i]] = True
-
-    @qd.kernel
-    def compute_surface_elements(self):
-        for i_e in range(self.n_elements):
-            i_v = self.elements_i[i_e].el2v
-            self.elements_on_surface[i_e] = (
-                self.vertices_on_surface[i_v[0]]
-                or self.vertices_on_surface[i_v[1]]
-                or self.vertices_on_surface[i_v[2]]
-                or self.vertices_on_surface[i_v[3]]
-            )
-
-    def init_ckpt(self):
-        self._ckpt = dict()
-
-    def init_constraints(self):
-        self._constraints_initialized = True
-
-        vertex_constraint_info = qd.types.struct(
-            is_constrained=gs.qd_bool,  # boolean flag indicating if vertex is constrained
-            target_pos=gs.qd_vec3,  # target position for the constraint
-            is_soft_constraint=gs.qd_bool,  # use spring for soft constraints
-            stiffness=gs.qd_float,  # spring stiffness
-            link_idx=gs.qd_int,  # index of the rigid link (-1 if not linked)
-            link_offset_pos=gs.qd_vec3,  # offset position of link
-            link_init_quat=gs.qd_vec4,  # offset rotation of link
-        )
-
-        # FIXME: AOS, which does not match other Genesis structs. Old, untested code. We prefer not to touch for now.
-        self.vertex_constraints = vertex_constraint_info.field(
-            shape=(self.n_vertices, self._B), needs_grad=False, layout=qd.Layout.AOS
-        )
-
-        self.vertex_constraints.is_constrained.fill(False)
-        self.vertex_constraints.link_idx.fill(-1)
-
-    def reset_grad(self):
-        self.elements_v.grad.fill(0)
-        self.elements_el.grad.fill(0)
-        self._queried_states.clear()
-
-        for entity in self._entities:
-            entity.reset_grad()
+        self.fem_state: FEMState | None = None
+        self.fem_info: FEMInfo | None = None
+        self.fem_config: FEMConfig | None = None
+        # Allocated on first use, a placeholder until then (see 'init_constraints')
+        self.vertex_constraints: FEMVertexConstraints | None = None
+        self._is_constraints_initialized = False
+        self.data_manager: FEMData | None = None
 
     def build(self):
         super().build()
 
-        self.n_envs = self.sim.n_envs
         self._B = self.sim._B
 
-        # elements and bodies
-        self._n_elements_max = self.n_elements
-        self._n_vertices_max = self.n_vertices
-        self._n_vverts = self.n_vverts
-        self._n_vfaces = self.n_vfaces
+        # The implicit solve adds up every term in a fixed order, so it is reproducible bitwise. On CPU, one thread runs
+        # each environment, the environments filling the cores. On GPU, the lanes of a subgroup tile gather the terms
+        # of a vertex and a block of threads sums those of an environment.
+        env_block_dim = 1 if gs.backend == gs.cpu else ENV_BLOCK_DIM
 
-        if self.n_elements_max > 0:
-            self.tet_wrong_order = qd.field(dtype=gs.qd_bool, shape=(), needs_grad=False)
+        # The entities holding elements, whose models and muscles the kernels dispatch on, a cloth entity holding
+        # surface triangles alone.
+        entities_volume = [entity for entity in self._entities if not isinstance(entity.material, FEM.Cloth)]
+        materials = [entity.material for entity in entities_volume]
+        models = {material.model_id for material in materials}
+        # One block of threads runs the whole PCG solve of an environment once the blocks of all environments occupy
+        # every core of the device: each environment then keeps its data close to its block and steps without kernel
+        # boundaries. With fewer environments, the device-side loop spreads each environment over the whole device.
+        is_pcg_solved_per_env_block = (
+            self._use_implicit_solver and env_block_dim > 1 and self._B * ENV_BLOCK_DIM >= get_gpu_core_count()
+        )
+        self.fem_config = FEMConfig(
+            use_implicit_solver=self._use_implicit_solver,
+            requires_grad=self._requires_grad,
+            enable_vertex_constraints=self._enable_vertex_constraints,
+            env_block_dim=env_block_dim,
+            log2_corner_lanes=LOG2_CORNER_LANES,
+            is_pcg_solved_per_env_block=is_pcg_solved_per_env_block,
+            has_linesearch=self._n_linesearch_iterations > 0,
+            has_damping_alpha=self._damping_alpha > 0.0,
+            has_damping_beta=self._damping_beta > gs.EPS,
+            has_linear=FEMModel.LINEAR in models,
+            has_stable_neohookean=FEMModel.STABLE_NEOHOOKEAN in models,
+            has_linear_corotated=FEMModel.LINEAR_COROTATED in models,
+            # The elements sharing a model skip the test of their own, except in the solve of an environment per block:
+            # the test changes the registers the compiler gives that kernel, and the number of blocks sharing a
+            # multiprocessor with them, which runs faster with the test there.
+            shared_model=next(iter(models)) if len(models) == 1 and not is_pcg_solved_per_env_block else -1,
+            has_muscle=any([isinstance(material, FEM.Muscle) for material in materials]),
+        )
 
-            # batch fields
-            self.init_batch_fields()
+        is_active = self.is_active
+        # The topology of the elements (see FEMInfo), from the entities
+        surface_triangles = np.concatenate(
+            [
+                np.zeros((0, 3), dtype=gs.np_int),
+                *[entity.surface_triangles + entity.v_start for entity in self._entities],
+            ]
+        )
+        el2v = np.concatenate(
+            [np.zeros((0, 4), dtype=gs.np_int), *[entity.elems + entity.v_start for entity in entities_volume]]
+        )
+        elements_idx = np.concatenate(
+            [
+                np.zeros((0,), dtype=gs.np_int),
+                *[np.arange(entity.el_start, entity.el_start + entity.n_elements) for entity in entities_volume],
+            ]
+        )
+        is_vertex_on_surface = np.zeros(self.n_vertices, dtype=bool)
+        is_vertex_on_surface[surface_triangles] = True
+        (surface_vertices,) = is_vertex_on_surface.nonzero()
+        surface_elements = elements_idx[is_vertex_on_surface[el2v].any(axis=1)]
+        self.data_manager = FEMData(self, len(surface_vertices), len(surface_elements))
+        self.fem_state = self.data_manager.fem_state
+        self.fem_info = self.data_manager.fem_info
+        self.register_errors(
+            self.data_manager.errno,
+            {
+                FEMErrorCode.INVALID_VERTEX_NAN: (
+                    "NaN detected in FEM states. Try reducing the time step size or adjusting simulation parameters."
+                ),
+            },
+        )
+        self.vertex_constraints = FEMVertexConstraints(unused=True)
 
-            self.init_element_fields()
-            self.init_surface_fields()
-            self.init_vvert_fields()
-            self.init_ckpt()
-
+        if is_active:
             for entity in self._entities:
                 entity._add_to_solver()
-
-        for mat in self._mats:
-            mat.build(self)
-
-        if self.n_elements_max > 0:
-            self._init_surface_info()
-            if self.tet_wrong_order[None]:
-                raise RuntimeError(
-                    "The order of vertices in the tetrahedral elements is not correct. "
-                    "Please check the input mesh or the FEM solver implementation."
+            if qd_to_numpy(self.fem_info.has_inverted_elements):
+                gs.raise_exception(
+                    "The vertices of some tetrahedral elements are ordered incorrectly. Check the input mesh."
                 )
 
-        if self.n_vertices_max > 0 and self._enable_vertex_constraints and not self._constraints_initialized:
-            self.init_constraints()
+            n_vertices = self.n_vertices
+            pos = qd_to_numpy(self.fem_state.vertices.pos, row_mask=0, col_mask=0, keepdim=False, transpose=True)[
+                surface_vertices
+            ]
+            surface_vertices_mapping = np.full(n_vertices, -1, dtype=gs.np_int)
+            surface_vertices_mapping[surface_vertices] = np.arange(len(surface_vertices))
+            surface_tris_sv_idx = surface_vertices_mapping[surface_triangles]
+            # The incident triangles of each surface vertex in increasing triangle index (stable sort of the corners)
+            corners_order = np.argsort(surface_tris_sv_idx, axis=None, kind="stable")
+            corners_tri_idx = corners_order // 3
+            tri2el = qd_to_numpy(self.fem_info.surfaces.tri2el)
+            topology_values = [
+                (self.fem_info.surface_vertices, surface_vertices),
+                (self.fem_info.surface_vert_mass, igl.massmatrix(pos, surface_tris_sv_idx).diagonal()),
+                (
+                    self.fem_info.surface_vertices_tri_start,
+                    np.searchsorted(surface_tris_sv_idx.take(corners_order), np.arange(len(surface_vertices) + 1)),
+                ),
+                (self.fem_info.surface_vertices_tri_idx, corners_tri_idx),
+                (
+                    self.fem_info.surface_vertices_tri_mass_scaled,
+                    qd_to_numpy(self.fem_info.elements.mass_scaled)[tri2el[corners_tri_idx]],
+                ),
+                (self.fem_info.surface_elements, surface_elements),
+            ]
+            if self.fem_config.env_block_dim > 1:
+                # The corners of every element, those of Cloth ones included since their vertices are counted too
+                elements_el2v = qd_to_numpy(self.fem_info.elements.el2v)
+                topology_values += [
+                    (
+                        self.fem_info.vertices_corners_start,
+                        np.searchsorted(np.sort(elements_el2v, axis=None), np.arange(n_vertices + 1)),
+                    ),
+                    (self.fem_info.vertices_corners_idx, np.argsort(elements_el2v, axis=None, kind="stable")),
+                ]
+            # An empty array keeps the single slot every array is sized to at least, which no kernel reads
+            for array, values in topology_values:
+                if len(values) == 0:
+                    continue
+                array.from_numpy(values.astype(gs.np_float if array.dtype == gs.qd_float else gs.np_int, copy=False))
 
-        # Kernels of this solver take the solver itself, so gravity has to be a field for them.
-        self._build_gravity(as_field=True)
+            if self._enable_vertex_constraints:
+                self.init_constraints()
+
+        self._build_gravity(self.fem_info.gravity)
+
+    def init_constraints(self) -> None:
+        """Allocate the vertex constraints, none constrained."""
+        self._is_constraints_initialized = True
+        self.vertex_constraints = FEMVertexConstraints(
+            sizes=dict(vertices=self.n_vertices, envs=self._B), env_first=False
+        )
+        kernel_clear_vertex_constraints(self.vertex_constraints)
+
+    def load_checkpoint(
+        self,
+        checkpoint: SolverCheckpoint,
+        *,
+        boundary_only: bool = False,
+        envs_idx: int | Sequence[int] | np.ndarray | torch.Tensor | None = None,
+    ) -> None:
+        # The constraints are allocated on first use, so a record holds them only if they existed when it was made: a
+        # record holding them allocates them before they are written back, and one without them leaves none.
+        is_constrained_record = checkpoint.arrays.get("vertex_constraints.is_constrained")
+        if (
+            is_constrained_record is not None
+            and is_constrained_record.ndim > 0
+            and not self._is_constraints_initialized
+        ):
+            self.init_constraints()
+        super().load_checkpoint(checkpoint, boundary_only=boundary_only, envs_idx=envs_idx)
+        if is_constrained_record is not None and is_constrained_record.ndim == 0 and self._is_constraints_initialized:
+            kernel_clear_vertex_constraints(self.vertex_constraints)
+
+    def reset_grad(self) -> None:
+        if self._requires_grad:
+            qd_zero_grad(self.fem_state.vertices)
+            qd_zero_grad(self.fem_state.elements)
 
     @property
     def is_active(self):
@@ -393,22 +672,6 @@ class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
     def add_entity(
         self, idx, material, morph, surface, visualize_contact=False, name: str | None = None, desc=None
     ) -> "FEMEntity":
-        # add material's update methods if not matching any existing material
-        exist = False
-        for mat in self._mats:
-            if material == mat:
-                material.idx = mat.idx
-                exist = True
-                break
-        self._mats.append(material)
-        if not exist:
-            material.idx = len(self._mats_idx)
-            self._mats_idx.append(material.idx)
-            self._mats_update_stress.append(material.update_stress)
-            self._mats_compute_energy_gradient_hessian.append(material.compute_energy_gradient_hessian)
-            self._mats_compute_energy.append(material.compute_energy)
-
-        # create entity
         entity = FEMEntity(
             scene=self._scene,
             solver=self,
@@ -423,684 +686,188 @@ class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
             vface_start=self.n_vfaces,
             name=name,
         )
-
         self._entities.append(entity)
         return entity
 
-    # ------------------------------------------------------------------------------------
-    # ----------------------------------- simulation -------------------------------------
-    # ------------------------------------------------------------------------------------
+    def add_elements(
+        self,
+        material: FEM.Elastic,
+        v_start: int,
+        el_start: int,
+        s_start: int,
+        verts: np.ndarray,
+        elems: np.ndarray,
+        tri2v: np.ndarray,
+        tri2el: np.ndarray,
+    ) -> None:
+        """Add the vertices, elements and surface triangles of an entity at rest, with its material parameters."""
+        is_muscle = isinstance(material, FEM.Muscle)
+        kernel_add_elements(
+            v_start,
+            el_start,
+            s_start,
+            model=int(material.model_id),
+            mu=material.mu,
+            lam=material.lam,
+            rho=material.rho,
+            friction_mu=material.friction_mu,
+            muscle_stiffness=material.stiffness if is_muscle else 0.0,
+            verts=verts,
+            elems=elems,
+            tri2v=tri2v,
+            tri2el=tri2el,
+            fem_state=self.fem_state,
+            fem_info=self.fem_info,
+            is_muscle=is_muscle,
+        )
 
-    @qd.kernel
-    def init_pos_and_vel(self, f: qd.i32):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f, i_v, i_b].pos
-            self.elements_v[f + 1, i_v, i_b].vel = self.elements_v[f, i_v, i_b].vel
-
-    @qd.kernel
-    def compute_vel(self, f: qd.i32):
-        for i_e, i_b in qd.ndrange(self.n_elements, self._B):
-            i_v0, i_v1, i_v2, i_v3 = self.elements_i[i_e].el2v
-            pos_v0 = self.elements_v[f, i_v0, i_b].pos
-            pos_v1 = self.elements_v[f, i_v1, i_b].pos
-            pos_v2 = self.elements_v[f, i_v2, i_b].pos
-            pos_v3 = self.elements_v[f, i_v3, i_b].pos
-            D = qd.Matrix.cols([pos_v0 - pos_v3, pos_v1 - pos_v3, pos_v2 - pos_v3])
-
-            V_scaled = self.elements_i[i_e].V_scaled
-            B = self.elements_i[i_e].B
-            F = D @ B
-            J = F.determinant()
-
-            stress = qd.Matrix.zero(gs.qd_float, 3, 3)
-            for mat_idx in qd.static(self._mats_idx):
-                if self.elements_i[i_e].mat_idx == mat_idx:
-                    stress = self._mats_update_stress[mat_idx](
-                        mu=self.elements_i[i_e].mu,
-                        lam=self.elements_i[i_e].lam,
-                        J=J,
-                        F=F,
-                        actu=self.elements_el[f, i_e, i_b].actu,
-                        m_dir=self.elements_i[i_e].muscle_direction,
-                    )
-
-            verts = self.elements_i[i_e].el2v
-            mass_scaled = self.elements_i[i_e].mass_scaled
-            H_scaled = -V_scaled * stress @ B.transpose()
-            for k in qd.static(range(3)):
-                force_scaled = qd.Vector([H_scaled[j, k] for j in range(3)])
-
-                # store so forces can be read out
-                self.elements_v_energy[i_b, verts[k]].force = force_scaled
-
-                dv = self.substep_dt * force_scaled / mass_scaled
-                self.elements_v[f + 1, verts[k], i_b].vel += dv
-                self.elements_v[f + 1, verts[3], i_b].vel -= dv
-
-    @qd.kernel
-    def apply_uniform_force(self, f: qd.i32):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            # NOTE: damping should only be applied to velocity from internal force and thus come first here
-            #       given the immediate previous function call is compute_internal_vel --> however, shouldn't
-            #       be done at dv only and need to wait for all elements updated (cannot be in the compute_internal_vel kernel)
-            #       however, this inevitably damp the gravity.
-            self.elements_v[f + 1, i_v, i_b].vel *= qd.exp(-self.substep_dt * self.damping)
-            # Add gravity (avoiding damping on gravity)
-            self.elements_v[f + 1, i_v, i_b].vel += self.substep_dt * self._gravity[i_b]
-
-    @qd.kernel
-    def compute_pos(self, f: qd.i32):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            self.elements_v[f + 1, i_v, i_b].pos = (
-                self.substep_dt * self.elements_v[f + 1, i_v, i_b].vel + self.elements_v[f, i_v, i_b].pos
-            )
-
-    @qd.kernel
-    def precompute_material_data(self, f: qd.i32):
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            J, F = self._compute_ele_J_F(f, i_e, i_b)  # use last time step's pos to compute
-            for mat_idx in qd.static(self._mats_idx):
-                if self.elements_i[i_e].mat_idx == mat_idx:
-                    self._mats[mat_idx].pre_compute(J=J, F=F, i_e=i_e, i_b=i_b)
-
-    @qd.kernel
-    def init_pos_and_inertia(self, f: qd.i32):
-        dt2 = self.substep_dt**2
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            if qd.static(self._enable_vertex_constraints):
-                if self.vertex_constraints.is_constrained[i_v, i_b]:
-                    self.elements_v[f + 1, i_v, i_b].pos = self.vertex_constraints.target_pos[i_v, i_b]
-                    self.elements_v_energy[i_b, i_v].inertia = self.vertex_constraints.target_pos[i_v, i_b]
-                else:
-                    self.elements_v_energy[i_b, i_v].inertia = (
-                        self.elements_v[f, i_v, i_b].pos
-                        + self.elements_v[f, i_v, i_b].vel * self.substep_dt
-                        + self._gravity[i_b] * dt2
-                    )
-                    self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f, i_v, i_b].pos
-            else:
-                self.elements_v_energy[i_b, i_v].inertia = (
-                    self.elements_v[f, i_v, i_b].pos
-                    + self.elements_v[f, i_v, i_b].vel * self.substep_dt
-                    + self._gravity[i_b] * dt2
-                )
-                self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f, i_v, i_b].pos
-
-    @qd.func
-    def _compute_ele_J_F(self, f: qd.i32, i_e: qd.i32, i_b: qd.i32):
+    def add_cloth(self, v_start: int, s_start: int, verts: np.ndarray, tri2v: np.ndarray, tri2el: np.ndarray) -> None:
         """
-        Compute the determinant (J) and deformation gradient (F) for an element.
+        Add cloth vertices and surface triangles to the solver, for position tracking and coupling only.
+
+        Cloth elements and mass are owned by the incremental potential contact (IPC) coupler, so the vertex info holds
+        placeholder values and each surface triangle references itself as element.
         """
-        i_v0, i_v1, i_v2, i_v3 = self.elements_i[i_e].el2v
-        pos_v0 = self.elements_v[f, i_v0, i_b].pos
-        pos_v1 = self.elements_v[f, i_v1, i_b].pos
-        pos_v2 = self.elements_v[f, i_v2, i_b].pos
-        pos_v3 = self.elements_v[f, i_v3, i_b].pos
-        D = qd.Matrix.cols([pos_v0 - pos_v3, pos_v1 - pos_v3, pos_v2 - pos_v3])
+        kernel_add_cloth(v_start, s_start, verts, tri2v, tri2el, self.fem_state, self.fem_info)
 
-        B = self.elements_i[i_e].B
-        F = D @ B
-        J = F.determinant()
-
-        return J, F
-
-    @qd.kernel
-    def compute_ele_hessian_gradient(self, f: qd.i32):
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_active[i_b]:
-                continue
-
-            J, F = self._compute_ele_J_F(f + 1, i_e, i_b)
-
-            for mat_idx in qd.static(self._mats_idx):
-                if self.elements_i[i_e].mat_idx == mat_idx:
-                    if self._mats[mat_idx]._hessian_ready:
-                        (
-                            self.elements_el_energy[i_b, i_e].energy,
-                            self.elements_el_energy[i_b, i_e].gradient,
-                        ) = self._mats[mat_idx].compute_energy_gradient(
-                            mu=self.elements_i[i_e].mu,
-                            lam=self.elements_i[i_e].lam,
-                            J=J,
-                            F=F,
-                            actu=self.elements_el[f, i_e, i_b].actu,
-                            m_dir=self.elements_i[i_e].muscle_direction,
-                            i_e=i_e,
-                            i_b=i_b,
-                        )
-                    else:
-                        (
-                            self.elements_el_energy[i_b, i_e].energy,
-                            self.elements_el_energy[i_b, i_e].gradient,
-                        ) = self._mats[mat_idx].compute_energy_gradient_hessian(
-                            mu=self.elements_i[i_e].mu,
-                            lam=self.elements_i[i_e].lam,
-                            J=J,
-                            F=F,
-                            actu=self.elements_el[f, i_e, i_b].actu,
-                            m_dir=self.elements_i[i_e].muscle_direction,
-                            i_e=i_e,
-                            i_b=i_b,
-                            hessian_field=self.elements_el_hessian,
-                        )
-
-    @qd.func
-    def _func_compute_element_mapping_matrix(self, i_vs, B, i_b):
-        """
-        Compute the element mapping matrix S for an element.
-        """
-        S = qd.Matrix.zero(gs.qd_float, 4, 3)
-        S[:3, :] = B
-        S[3, :] = -B[0, :] - B[1, :] - B[2, :]
-
-        if qd.static(self._enable_vertex_constraints):
-            for i in qd.static(range(4)):
-                if self.vertex_constraints.is_constrained[i_vs[i], i_b]:
-                    S[i, :] = qd.Vector.zero(gs.qd_float, 3)
-        return S
-
-    @qd.func
-    def _func_compute_ele_energy(self, f: qd.i32):
-        """
-        Compute the energy for each element in the batch. Should only be used in linesearch.
-        """
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-
-            J, F = self._compute_ele_J_F(f + 1, i_e, i_b)
-
-            for mat_idx in qd.static(self._mats_idx):
-                if self.elements_i[i_e].mat_idx == mat_idx:
-                    self.elements_el_energy[i_b, i_e].energy = self._mats[mat_idx].compute_energy(
-                        mu=self.elements_i[i_e].mu,
-                        lam=self.elements_i[i_e].lam,
-                        J=J,
-                        F=F,
-                        actu=self.elements_el[f, i_e, i_b].actu,
-                        m_dir=self.elements_i[i_e].muscle_direction,
-                        i_e=i_e,
-                        i_b=i_b,
-                    )
-
-            # add linearized damping energy
-            if self._damping_beta > gs.EPS:
-                damping_beta_over_dt = self._damping_beta / self._substep_dt
-                i_vs = self.elements_i[i_e].el2v
-                B = self.elements_i[i_e].B
-                S = self._func_compute_element_mapping_matrix(i_vs, B, i_b)
-
-                x_diff = qd.Vector.zero(gs.qd_float, 12)
-                for i in qd.static(range(4)):
-                    x_diff[i * 3 : i * 3 + 3] = (
-                        self.elements_v[f + 1, i_vs[i], i_b].pos - self.elements_v[f, i_vs[i], i_b].pos
-                    )
-                St_x_diff = qd.Vector.zero(gs.qd_float, 9)
-                for i, j in qd.static(qd.ndrange(3, 4)):
-                    St_x_diff[i * 3 : i * 3 + 3] += S[j, i] * x_diff[j * 3 : j * 3 + 3]
-
-                H_St_x_diff = qd.Vector.zero(gs.qd_float, 9)
-                for i, j in qd.static(qd.ndrange(3, 3)):
-                    H_St_x_diff[i * 3 : i * 3 + 3] += (
-                        self.elements_el_hessian[i_b, i, j, i_e] @ St_x_diff[j * 3 : j * 3 + 3]
-                    )
-
-                self.elements_el_energy[i_b, i_e].energy += 0.5 * damping_beta_over_dt * St_x_diff.dot(H_St_x_diff)
-
-    @qd.kernel
-    def accumulate_vertex_force_preconditioner(self, f: qd.i32):
-        damping_alpha_dt = self._damping_alpha * self._substep_dt
-        damping_alpha_factor = damping_alpha_dt + 1.0
-        damping_beta_over_dt = self._damping_beta / self._substep_dt
-        damping_beta_factor = damping_beta_over_dt + 1.0
-        # inertia
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_active[i_b]:
-                continue
-            self.elements_v_energy[i_b, i_v].force = -self.elements_v_info[i_v].mass_over_dt2 * (
-                (self.elements_v[f + 1, i_v, i_b].pos - self.elements_v_energy[i_b, i_v].inertia)
-                + (self.elements_v[f + 1, i_v, i_b].pos - self.elements_v[f, i_v, i_b].pos) * damping_alpha_dt
-            )
-            self.pcg_state_v[i_b, i_v].diag3x3 = qd.Matrix.zero(gs.qd_float, 3, 3)
-            for i in qd.static(range(3)):
-                self.pcg_state_v[i_b, i_v].diag3x3[i, i] = (
-                    self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor
-                )
-
-        # elastic
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_active[i_b]:
-                continue
-            V = self.elements_i[i_e].V
-            B = self.elements_i[i_e].B
-            gradient = self.elements_el_energy[i_b, i_e].gradient
-            i_vs = self.elements_i[i_e].el2v
-            S = self._func_compute_element_mapping_matrix(i_vs, B, i_b)
-            force = -V * gradient @ S.transpose()
-
-            # atomic
-            for i in qd.static(range(4)):
-                self.elements_v_energy[i_b, i_vs[i]].force += force[:, i]
-
-            if self._damping_beta > gs.EPS:
-                x_diff = qd.Vector.zero(gs.qd_float, 12)
-                for i in qd.static(range(4)):
-                    x_diff[i * 3 : i * 3 + 3] = (
-                        self.elements_v[f + 1, i_vs[i], i_b].pos - self.elements_v[f, i_vs[i], i_b].pos
-                    )
-                St_x_diff = qd.Vector.zero(gs.qd_float, 9)
-                for i, j in qd.static(qd.ndrange(3, 4)):
-                    St_x_diff[i * 3 : i * 3 + 3] += S[j, i] * x_diff[j * 3 : j * 3 + 3]
-
-                H_St_x_diff = qd.Vector.zero(gs.qd_float, 9)
-                for i, j in qd.static(qd.ndrange(3, 3)):
-                    H_St_x_diff[i * 3 : i * 3 + 3] += (
-                        self.elements_el_hessian[i_b, i, j, i_e] @ St_x_diff[j * 3 : j * 3 + 3]
-                    )
-                S_H_St_x_diff = qd.Vector.zero(gs.qd_float, 12)
-                for i, j in qd.static(qd.ndrange(4, 3)):
-                    S_H_St_x_diff[i * 3 : i * 3 + 3] += S[i, j] * H_St_x_diff[j * 3 : j * 3 + 3]
-                for i in qd.static(range(4)):
-                    self.elements_v_energy[i_b, i_vs[i]].force += (
-                        -damping_beta_over_dt * V * S_H_St_x_diff[i * 3 : i * 3 + 3]
-                    )
-
-            # diagonal 3-by-3 block of hessian
-            for k, i, j in qd.ndrange(4, 3, 3):
-                self.pcg_state_v[i_b, i_vs[k]].diag3x3 += (
-                    V * damping_beta_factor * S[k, i] * S[k, j] * self.elements_el_hessian[i_b, i, j, i_e]
-                )
-
-        # inverse
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_active[i_b]:
-                continue
-            # Use 3-by-3 diagonal block inverse for preconditioner
-            self.pcg_state_v[i_b, i_v].prec = self.pcg_state_v[i_b, i_v].diag3x3.inverse()
-
-            # Other options for preconditioner:
-            # Uncomment one of the following lines to test different preconditioners
-            # Use identity for preconditioner
-            # self.pcg_state_v[i_b, i_v].prec = qd.Matrix.identity(gs.qd_float, 3)
-
-            # Use diagonal for preconditioner
-            # self.pcg_state_v[i_b, i_v].prec = qd.Matrix([[1 / self.pcg_state_v[i_b, i_v].diag3x3[0, 0], 0, 0],
-            #                                            [0, 1 / self.pcg_state_v[i_b, i_v].diag3x3[1, 1], 0],
-            #                                            [0, 0, 1 / self.pcg_state_v[i_b, i_v].diag3x3[2, 2]]])
-
-    @qd.func
-    def compute_Ap(self):
-        damping_alpha_dt = self._damping_alpha * self._substep_dt
-        damping_alpha_factor = damping_alpha_dt + 1.0
-        damping_beta_over_dt = self._damping_beta / self._substep_dt
-        damping_beta_factor = damping_beta_over_dt + 1.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state_v[i_b, i_v].Ap = (
-                self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor * self.pcg_state_v[i_b, i_v].p
-            )
-
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            V = self.elements_i[i_e].V
-            B = self.elements_i[i_e].B
-            i_vs = self.elements_i[i_e].el2v
-            S = self._func_compute_element_mapping_matrix(i_vs, B, i_b)
-
-            p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
-
-            for i, j in qd.static(qd.ndrange(3, 4)):
-                p9[i * 3 : i * 3 + 3] = p9[i * 3 : i * 3 + 3] + S[j, i] * self.pcg_state_v[i_b, i_vs[j]].p
-
-            new_p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
-
-            for i, j in qd.static(qd.ndrange(3, 3)):
-                new_p9[i * 3 : i * 3 + 3] = (
-                    new_p9[i * 3 : i * 3 + 3] + self.elements_el_hessian[i_b, i, j, i_e] @ p9[j * 3 : j * 3 + 3]
-                )
-
-            # atomic
-            for i in qd.static(range(4)):
-                self.pcg_state_v[i_b, i_vs[i]].Ap += (
-                    (S[i, 0] * new_p9[0:3] + S[i, 1] * new_p9[3:6] + S[i, 2] * new_p9[6:9]) * V * damping_beta_factor
-                )
-
-    @qd.kernel
-    def init_pcg_solve(self):
-        for i_b in range(self._B):
-            self.batch_pcg_active[i_b] = self.batch_active[i_b]
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state[i_b].rTr = 0.0
-            self.pcg_state[i_b].rTz = 0.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state_v[i_b, i_v].x = 0
-            self.pcg_state_v[i_b, i_v].r = self.elements_v_energy[i_b, i_v].force
-            self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
-            self.pcg_state_v[i_b, i_v].p = self.pcg_state_v[i_b, i_v].z
-            qd.atomic_add(self.pcg_state[i_b].rTr, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
-            qd.atomic_add(self.pcg_state[i_b].rTz, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self._pcg_threshold
-
-    @qd.kernel
-    def one_pcg_iter(self):
-        self.compute_Ap()
-
-        # compute pTAp
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state[i_b].pTAp = 0.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            qd.atomic_add(self.pcg_state[i_b].pTAp, self.pcg_state_v[i_b, i_v].p.dot(self.pcg_state_v[i_b, i_v].Ap))
-
-        # compute alpha and update x, r, z, rTr, rTz
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
-            self.pcg_state[i_b].rTr_new = 0.0
-            self.pcg_state[i_b].rTz_new = 0.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state_v[i_b, i_v].x += self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].p
-            self.pcg_state_v[i_b, i_v].r -= self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].Ap
-            self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
-            qd.atomic_add(self.pcg_state[i_b].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
-            qd.atomic_add(self.pcg_state[i_b].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
-
-        # check convergence
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr_new > self._pcg_threshold
-
-        # update beta, rTr, rTz
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state[i_b].beta = self.pcg_state[i_b].rTz_new / self.pcg_state[i_b].rTz
-            self.pcg_state[i_b].rTr = self.pcg_state[i_b].rTr_new
-            self.pcg_state[i_b].rTz = self.pcg_state[i_b].rTz_new
-
-        # update p
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state_v[i_b, i_v].p = (
-                self.pcg_state_v[i_b, i_v].z + self.pcg_state[i_b].beta * self.pcg_state_v[i_b, i_v].p
-            )
-
-    def pcg_solve(self):
-        self.init_pcg_solve()
-        for i in range(self._n_pcg_iterations):
-            self.one_pcg_iter()
-
-    @qd.kernel
-    def init_linesearch(self, f: qd.i32):
-        for i_b in range(self._B):
-            self.batch_linesearch_active[i_b] = self.batch_active[i_b]
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.linesearch_state[i_b].prev_energy = 0.0
-            self.linesearch_state[i_b].step_size = 1.0
-            self.linesearch_state[i_b].m = 0.0
-
-        # Inertia, x_prev, m
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            diff = self.elements_v[f + 1, i_v, i_b].pos - self.elements_v_energy[i_b, i_v].inertia
-            self.linesearch_state[i_b].prev_energy += 0.5 * self.elements_v_info[i_v].mass_over_dt2 * diff.dot(diff)
-            self.linesearch_state_v[i_b, i_v].x_prev = self.elements_v[f + 1, i_v, i_b].pos
-            self.linesearch_state[i_b].m -= self.pcg_state_v[i_b, i_v].x.dot(self.elements_v_energy[i_b, i_v].force)
-        # Elastic
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.linesearch_state[i_b].prev_energy += self.elements_el_energy[i_b, i_e].energy * self.elements_i[i_e].V
-
-    @qd.kernel
-    def one_linesearch_iter(self, f: qd.i32):
-        for i_b in range(self._B):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.linesearch_state[i_b].energy = 0.0
-
-        # update pos and compute Inertia energy
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.elements_v[f + 1, i_v, i_b].pos = (
-                self.linesearch_state_v[i_b, i_v].x_prev
-                + self.linesearch_state[i_b].step_size * self.pcg_state_v[i_b, i_v].x
-            )
-            diff = self.elements_v[f + 1, i_v, i_b].pos - self.elements_v_energy[i_b, i_v].inertia
-            self.linesearch_state[i_b].energy += 0.5 * self.elements_v_info[i_v].mass_over_dt2 * diff.dot(diff)
-            # damping
-            if self._damping_alpha > 0.0:
-                damping_alpha_dt = self._damping_alpha * self._substep_dt
-                diff = self.elements_v[f + 1, i_v, i_b].pos - self.elements_v[f, i_v, i_b].pos
-                self.linesearch_state[i_b].energy += (
-                    0.5 * self.elements_v_info[i_v].mass_over_dt2 * diff.dot(diff) * damping_alpha_dt
-                )
-
-        # compute elastic energy
-        self._func_compute_ele_energy(f)
-        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.linesearch_state[i_b].energy += self.elements_el_energy[i_b, i_e].energy * self.elements_i[i_e].V
-
-        # check condition
-        for i_b in range(self._B):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.batch_linesearch_active[i_b] = (
-                self.linesearch_state[i_b].energy
-                > self.linesearch_state[i_b].prev_energy
-                + self._linesearch_c * self.linesearch_state[i_b].step_size * self.linesearch_state[i_b].m
-            )
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            self.linesearch_state[i_b].step_size *= self._linesearch_tau
-
-    @qd.kernel
-    def skip_linesearch(self, f: qd.i32):
-        # Inertia, x_prev, m
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_active[i_b]:
-                continue
-            self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f + 1, i_v, i_b].pos + self.pcg_state_v[i_b, i_v].x
-
-    def linesearch(self, f: qd.i32):
-        """
-        Note
-        ------
-        https://en.wikipedia.org/wiki/Backtracking_line_search#Algorithm
-        """
-        if self._n_linesearch_iterations <= 0:
-            self.skip_linesearch(f)
-            return
-        self.init_linesearch(f)
-        for i in range(self._n_linesearch_iterations):
-            self.one_linesearch_iter(f)
-
-    def batch_solve(self, f: qd.i32):
-        self.batch_active.fill(True)
-
-        for i in range(self._n_newton_iterations):
-            # compute element energy and gradient
-            self.compute_ele_hessian_gradient(f)
-
-            # If the hessian is invariant, we only need to compute it once
-            for mat_idx in self._mats_idx:
-                if self._mats[mat_idx].hessian_invariant:
-                    self._mats[mat_idx]._hessian_ready = True
-
-            # accumulate vertex force and preconditioner
-            self.accumulate_vertex_force_preconditioner(f)
-
-            # solve for the vertex positions
-            self.pcg_solve()
-
-            # line search
-            self.linesearch(f)
-
-    @qd.kernel
-    def setup_pos_vel(self, f: qd.i32):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            # set pos and vel
-            self.elements_v[f + 1, i_v, i_b].vel = (
-                self.elements_v[f + 1, i_v, i_b].pos - self.elements_v[f, i_v, i_b].pos
-            ) / self.substep_dt
+    def add_vverts(
+        self,
+        vvert_start: int,
+        vface_start: int,
+        v_start: int,
+        verts_idx: np.ndarray,
+        uvs: np.ndarray,
+        vfaces: np.ndarray,
+    ) -> None:
+        """Add the visual vertices and faces of a visual geom, the former standing for the given simulated vertices."""
+        kernel_add_vverts(vvert_start, vface_start, v_start, verts_idx, uvs, vfaces, self.fem_info)
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ stepping --------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def substep_pre_coupling(self, f):
-        if self.is_active:
-            # Skip FEM solver step if using IPCCoupler (IPC handles FEM simulation)
-            from genesis.engine.couplers import IPCCoupler
+    def substep_pre_coupling(self, f: int) -> None:
+        if not self.is_active:
+            return
+        # The IPC coupler simulates the FEM entities itself. Imported here to avoid a circular dependency, the couplers
+        # depending on the solvers.
+        from genesis.engine.couplers import IPCCoupler
 
-            if isinstance(self.sim._coupler, IPCCoupler):
-                pass  # IPC coupler handles FEM simulation
-            elif self._use_implicit_solver:
-                self.precompute_material_data(f)
-                self.init_pos_and_inertia(f)
-                self.batch_solve(f)
-                self.setup_pos_vel(f)
+        if isinstance(self._sim.coupler, IPCCoupler):
+            return
+        links_state = self._sim.rigid_solver.dyn_state.links
+        if self._use_implicit_solver:
+            kernel_precompute_material_data(f, self.fem_state, self.fem_info, self.fem_config)
+            kernel_init_pos_and_inertia(
+                f, self.fem_state, links_state, self.fem_info, self.vertex_constraints, self.fem_config
+            )
+            # The solve is reversed through the adjoint of its root, which spares reversing its iterations
+            with custom_backward(self._implicit_solve_grad, f):
+                if self._requires_grad and gs.use_ndarray:
+                    self._solve_on_host(f, is_adjoint=False)
+                else:
+                    loops = self.fem_state.solve_loops
+                    kernel_batch_solve(
+                        f,
+                        loops.newton_counter,
+                        loops.pcg_counter,
+                        loops.linesearch_counter,
+                        self.fem_state,
+                        self.fem_info,
+                        self.vertex_constraints,
+                        self.fem_config,
+                    )
+            kernel_setup_pos_vel(f, self.fem_state, self.fem_info)
+        else:
+            kernel_init_pos_and_vel(f, self.fem_state)
+            kernel_compute_vel(f, self.fem_state, self.fem_info, self.fem_config)
+            kernel_apply_uniform_force(f, self.fem_state, self.fem_info)
+            if self._is_constraints_initialized:
+                kernel_apply_soft_constraints(f, self.fem_state, links_state, self.fem_info, self.vertex_constraints)
+
+    def substep_post_coupling(self, f: int) -> None:
+        if not self.is_active:
+            return
+        kernel_compute_pos(f, self.fem_state, self.fem_info, self.fem_config, self._errno)
+        if self._is_constraints_initialized and not self._use_implicit_solver:
+            kernel_apply_hard_constraints(
+                f, self.fem_state, self._sim.rigid_solver.dyn_state.links, self.vertex_constraints, self._errno
+            )
+
+    def _implicit_solve_grad(self, f: int) -> None:
+        """
+        Back-propagate the adjoint of the end positions of a substep of the implicit solver to its inputs.
+
+        The end positions x+ are the root of the forces R(x+; x, v, actu), whose Jacobian with respect to x+ is minus
+        the Hessian H of the incremental energy, symmetric and constant since every material the implicit solver
+        supports has an energy quadratic in x+. The adjoint solve H lambda = g of the adjoint g of x+ runs the
+        preconditioned conjugate gradient (PCG) of the solve, then the autodiff of the forces seeded with lambda adds
+        lambda^T dR/d(input) to the adjoint of every input but the data the materials compute from the start of the
+        substep, which autodiff takes as constant and the closed-form reverse of the materials carries to the start
+        positions instead. A constrained vertex has no force, so its target takes its adjoint plus the pull of lambda.
+        """
+        if gs.use_ndarray:
+            self._solve_on_host(f, is_adjoint=True)
+        else:
+            args = (self.fem_state, self.fem_info, self.vertex_constraints, self.fem_config)
+            kernel_solve_adjoint(f, self.fem_state.solve_loops.pcg_counter, *args)
+        kernel_compute_implicit_force.grad(f, self.fem_state, self.fem_info, self.vertex_constraints, self.fem_config)
+        kernel_material_data_grad(f, self.fem_state, self.fem_info, self.vertex_constraints, self.fem_config)
+
+    def _solve_on_host(self, f: int, is_adjoint: bool) -> None:
+        # FIXME: quadrants#946 - a graph refuses ndarrays owning a gradient, so the loops of 'kernel_batch_solve' run
+        # on the host for such scenes, reading the flag of each loop after every iteration.
+        loops = self.fem_state.solve_loops
+        args = (
+            loops.pcg_counter,
+            loops.linesearch_counter,
+            self.fem_state,
+            self.fem_info,
+            self.vertex_constraints,
+            self.fem_config,
+        )
+        # The stages go as native ints, since a template argument other than a native scalar is weakly referenced
+        if not is_adjoint:
+            kernel_solve_stage(f, *args, stage=int(FEMSolveStage.INIT_NEWTON))
+        # Each loop runs its body once before testing its flag, as a graph do-while does
+        for _ in range(1 if is_adjoint else max(self._n_newton_iterations, 1)):
+            stage = FEMSolveStage.INIT_ADJOINT if is_adjoint else FEMSolveStage.NEWTON_HEAD
+            kernel_solve_stage(f, *args, stage=int(stage))
+            is_looping = True
+            while is_looping:
+                kernel_solve_stage(f, *args, stage=int(FEMSolveStage.PCG_ITER))
+                is_looping = not self.fem_config.is_pcg_solved_per_env_block and qd_to_numpy(loops.pcg_counter)
+            if is_adjoint:
+                kernel_solve_stage(f, *args, stage=int(FEMSolveStage.SEED_ADJOINT))
+            elif self.fem_config.has_linesearch:
+                kernel_solve_stage(f, *args, stage=int(FEMSolveStage.INIT_LINESEARCH))
+                is_looping = True
+                while is_looping:
+                    kernel_solve_stage(f, *args, stage=int(FEMSolveStage.LINESEARCH_ITER))
+                    is_looping = qd_to_numpy(loops.linesearch_counter)
             else:
-                self.init_pos_and_vel(f)
-                self.compute_vel(f)
-                self.apply_uniform_force(f)
-                if self._constraints_initialized:
-                    self.apply_soft_constraints(f)
+                kernel_solve_stage(f, *args, stage=int(FEMSolveStage.SKIP_LINESEARCH))
+            if not is_adjoint:
+                kernel_solve_stage(f, *args, stage=int(FEMSolveStage.END_NEWTON))
 
-    def substep_pre_coupling_grad(self, f):
-        if self.is_active:
-            if self._use_implicit_solver:
-                gs.raise_exception("Gradient computation is not supported for implicit solver.")
-            self.apply_uniform_force.grad(f)
-            self.compute_vel.grad(f)
-            self.init_pos_and_vel.grad(f)
-
-    def substep_post_coupling(self, f):
-        if self.is_active:
-            self.compute_pos(f)
-            if self._constraints_initialized and not self._use_implicit_solver:
-                self.apply_hard_constraints(f)
-
-    def substep_post_coupling_grad(self, f):
-        if self.is_active:
-            self.compute_pos.grad(f)
-
-    @qd.kernel
-    def copy_frame(self, source: qd.i32, target: qd.i32):
-        # Copy pos/vel for all vertices and all batch indices
-        for i_v, i_b in qd.ndrange(self.n_vertices_max, self._B):
-            self.elements_v[target, i_v, i_b].pos = self.elements_v[source, i_v, i_b].pos
-            self.elements_v[target, i_v, i_b].vel = self.elements_v[source, i_v, i_b].vel
-
-        # Copy 'active' for all elements and all batch indices
-        for i_e, i_b in qd.ndrange(self.n_elements_max, self._B):
-            self.elements_el_ng[target, i_e, i_b].active = self.elements_el_ng[source, i_e, i_b].active
-
-    @qd.kernel
-    def copy_grad(self, source: qd.i32, target: qd.i32):
-        # Copy gradients for vertices
-        for i_v, i_b in qd.ndrange(self.n_vertices_max, self._B):
-            self.elements_v.grad[target, i_v, i_b].pos = self.elements_v.grad[source, i_v, i_b].pos
-            self.elements_v.grad[target, i_v, i_b].vel = self.elements_v.grad[source, i_v, i_b].vel
-
-        # Copy 'active' for elements
-        for i_e, i_b in qd.ndrange(self.n_elements_max, self._B):
-            self.elements_el_ng[target, i_e, i_b].active = self.elements_el_ng[source, i_e, i_b].active
-
-    @qd.kernel
-    def reset_grad_till_frame(self, f: qd.i32):
-        # Zero out v.grad in frame 0..(f-1) for all vertices, all batch indices
-        for frame_i, vert_i, i_b in qd.ndrange(f, self.n_vertices_max, self._B):
-            self.elements_v.grad[frame_i, vert_i, i_b].pos = 0
-            self.elements_v.grad[frame_i, vert_i, i_b].vel = 0
-
-        # Zero out elements_el.grad in frame 0..(f-1) for all elements, all batch indices
-        for frame_i, elem_i, i_b in qd.ndrange(f, self.n_elements_max, self._B):
-            self.elements_el.grad[frame_i, elem_i, i_b].actu = 0
+    def copy_frame(self, source: int, target: int) -> None:
+        kernel_copy_frame(source, target, self.fem_state)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- gradient ---------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def add_grad_from_state(self, state):
-        if self.is_active:
-            if state.pos.grad is not None:
-                assert state.pos.grad.is_contiguous()
-                self._kernel_add_grad_from_pos(self._sim.cur_substep_local, state.pos.grad)
-
-            if state.vel.grad is not None:
-                assert state.vel.grad.is_contiguous()
-                self._kernel_add_grad_from_vel(self._sim.cur_substep_local, state.vel.grad)
-
-    def save_ckpt(self, ckpt_name):
-        if self.is_active:
-            if ckpt_name not in self._ckpt:
-                self._ckpt[ckpt_name] = {
-                    "pos": torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float, device=gs.device),
-                    "vel": torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float, device=gs.device),
-                    "active": torch.zeros((self._B, self.n_elements), dtype=gs.tc_int, device=gs.device),
-                }
-
-            self._kernel_get_state(
-                0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"], self._ckpt[ckpt_name]["active"]
-            )
-
-            self.copy_frame(self.sim.substeps_local, 0)
-
-    def load_ckpt(self, ckpt_name):
-        self.copy_frame(0, self._sim.substeps_local)
-        self.copy_grad(0, self._sim.substeps_local)
-
-        if self._sim.requires_grad:
-            self.reset_grad_till_frame(self._sim.substeps_local)
-
-            self._kernel_set_state(
-                0,
-                self._ckpt[ckpt_name]["pos"],
-                self._ckpt[ckpt_name]["vel"],
-                self._ckpt[ckpt_name]["active"],
-            )
-
-            for entity in self._entities:
-                entity.load_ckpt(ckpt_name=ckpt_name)
+    @property
+    def data(self) -> Iterator[DataItem | ConfigItem]:
+        yield from iter_data(self.data_manager, "fem_info")
+        yield from iter_data(self.data_manager, "fem_state")
+        yield from iter_data(self, "vertex_constraints")
+        yield from iter_data(self.data_manager, "errno", DataKind.STATE)
+        yield from iter_data(self, "fem_config")
 
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
-
-    def set_state(self, f, state, envs_idx=None):
-        if self.is_active:
-            self._kernel_set_state(f, state.pos, state.vel, state.active)
-
-    def get_state(self, f):
-        if self.is_active:
-            state = FEMSolverState(self._scene)
-            self._kernel_get_state(f, state.pos, state.vel, state.active)
-            self._queried_states.append(state)
-        else:
-            state = None
-        return state
 
     def get_state_render(self, f):
         """
@@ -1112,474 +879,1887 @@ class FEMSolver(GravityMixin, TimeBasedMixin, Solver):
             (vverts_pos, vverts_uvs, vfaces_indices) - environment-offset render vertex positions with shape
             (n_vverts, B), their UV coordinates, and the render triangles in global render vertex space.
         """
-        if not self.is_active or self._n_vverts == 0:
+        if not self.is_active or self.n_vverts == 0:
             return None, None, None
 
-        self._kernel_get_state_render(f)
-        return self.vverts_render.pos, self.vverts_uvs, self.vfaces_indices
+        kernel_update_vverts_render(f, self.fem_state, self.fem_info)
+        return self.fem_state.vverts_render.pos, self.fem_info.vverts_uvs, self.fem_info.vfaces_indices
 
     def get_forces(self):
         """
-        Get forces on all vertices.
+        Get the internal elastic force on every vertex, computed from the current state.
 
-        Returns:
-            torch.Tensor : shape (B, n_vertices, 3) where B is batch size
+        The force of each element follows the material model of the solver in use, and the forces of a body sum to zero.
+        Damping, gravity and contact forces are left out. With the incremental potential contact (IPC) coupler, which
+        simulates the FEM entities itself, it raises an exception.
+
+        Returns
+        -------
+        forces : torch.Tensor
+            The force on each vertex of each environment.
         """
         if not self.is_active:
             return None
+        # Imported here to avoid a circular dependency (see 'substep_pre_coupling')
+        from genesis.engine.couplers import IPCCoupler
 
-        return qd_to_torch(self.elements_v_energy.force, copy=True)
+        # The IPC coupler simulates the FEM entities with its own models, and leaves the elements of Cloth ones empty.
+        if isinstance(self._sim.coupler, IPCCoupler):
+            gs.raise_exception("The internal forces of FEM entities are not available with the IPC coupler.")
 
-    @qd.kernel
-    def _kernel_add_elements(
-        self,
-        f: qd.i32,
-        mat_idx: qd.i32,
-        mat_mu: qd.f32,
-        mat_lam: qd.f32,
-        mat_rho: qd.f32,
-        mat_friction_mu: qd.f32,
-        v_start: qd.i32,
-        el_start: qd.i32,
-        s_start: qd.i32,
-        verts: qd.types.ndarray(),
-        elems: qd.types.ndarray(),
-        tri2v: qd.types.ndarray(),
-        tri2el: qd.types.ndarray(),
-    ):
-        n_verts_local = verts.shape[0]
-        for i_v, i_b in qd.ndrange(n_verts_local, self._B):
-            i_global = i_v + v_start
-            for j in qd.static(range(3)):
-                self.elements_v[f, i_global, i_b].pos[j] = verts[i_v, j]
-            self.elements_v[f, i_global, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+        # Between two steps, the state sits in frame 0 (see 'Solver.has_frames'). The linear corotated model takes the
+        # rotation of each element from this state.
+        if self._use_implicit_solver:
+            kernel_precompute_material_data(
+                f=0, fem_state=self.fem_state, fem_info=self.fem_info, fem_config=self.fem_config
+            )
+        forces = torch.zeros((self._B, self.n_vertices, 3), dtype=gs.tc_float, device=gs.device)
+        kernel_get_forces(
+            f=0,
+            forces=forces,
+            fem_state=self.fem_state,
+            fem_info=self.fem_info,
+            vertex_constraints=self.vertex_constraints,
+            fem_config=self.fem_config,
+        )
+        return forces
 
-        for i_v in range(n_verts_local):
-            i_global = i_v + v_start
-            self.elements_v_info[i_global].mass = 0.0
-            self.elements_v_info[i_global].mass_over_dt2 = 0.0
-            self.elements_v_info[i_global].friction_mu = mat_friction_mu
+    @gs.assert_built
+    @mutates(StateChange.GEOMETRY)
+    def set_verts_pos(self, poss, verts_idx=None, envs_idx=None):
+        """
+        Set the position of some vertices.
 
-        dt2_inv = 1.0 / (self.substep_dt**2)
-        n_elems_local = elems.shape[0]
-        for i_e in range(n_elems_local):
-            i_global = i_e + el_start
+        Parameters
+        ----------
+        poss : array_like, shape ([M,] [N,] 3)
+            Target position of each vertex.
+        verts_idx : None | int | array_like, shape ([M,] N), optional
+            Global index of the vertices, once for every environment or one row per environment. If None, all vertices
+            will be considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
+        """
+        self._write_data(
+            self.fem_state.vertices.pos, poss, verts_idx, self.n_vertices, "verts_idx", envs_idx, element_shape=(3,)
+        )
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
 
-            a = self.elements_v[f, elems[i_e, 0] + v_start, 0].pos
-            b = self.elements_v[f, elems[i_e, 1] + v_start, 0].pos
-            c = self.elements_v[f, elems[i_e, 2] + v_start, 0].pos
-            d = self.elements_v[f, elems[i_e, 3] + v_start, 0].pos
-            B_inv = qd.Matrix.cols([a - d, b - d, c - d])
-            self.elements_i[i_global].B = B_inv.inverse()
-            det = B_inv.determinant()
-            # Determinant should be consistently smaller than 0
-            if det >= 0.0:
-                self.tet_wrong_order[None] = True
-            V = qd.abs(det) / 6.0
-            self.elements_i[i_global].V = V
-            V_scaled = V * self._vol_scale
-            self.elements_i[i_global].V_scaled = V_scaled
+    def get_verts_pos(self, verts_idx=None, envs_idx=None):
+        """Get the position of some vertices, the same in every environment (see 'set_verts_pos')."""
+        tensor = self._read_data(self.fem_state.vertices.pos, envs_idx, verts_idx, copy=True)
+        return tensor[0] if self._scene.n_envs == 0 else tensor
 
-            for j in qd.static(range(4)):
-                self.elements_i[i_global].el2v[j] = elems[i_e, j] + v_start
-            self.elements_i[i_global].mat_idx = mat_idx
-            self.elements_i[i_global].mu = mat_mu
-            self.elements_i[i_global].lam = mat_lam
-            self.elements_i[i_global].friction_mu = mat_friction_mu
-            self.elements_i[i_global].mass_scaled = mat_rho * V_scaled
-            for j in qd.static(range(4)):
-                mass = 0.25 * mat_rho * V
-                self.elements_v_info[self.elements_i[i_global].el2v[j]].mass += mass
-                self.elements_v_info[self.elements_i[i_global].el2v[j]].mass_over_dt2 += mass * dt2_inv
-            self.elements_i[i_global].muscle_group = 0
-            self.elements_i[i_global].muscle_direction = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+    def get_verts_vel(self, verts_idx=None, envs_idx=None):
+        """Get the velocity of some vertices, the same in every environment (see 'set_verts_pos')."""
+        tensor = self._read_data(self.fem_state.vertices.vel, envs_idx, verts_idx, copy=True)
+        return tensor[0] if self._scene.n_envs == 0 else tensor
 
-        for i_v in range(n_verts_local):
-            i_global = i_v + v_start
-            self.elements_v_info[i_global].mass_inv = 1.0 / self.elements_v_info[i_global].mass
+    @gs.assert_built
+    @mutates(StateChange.DYNAMICS)
+    def set_verts_vel(self, vels, verts_idx=None, envs_idx=None):
+        """Set the velocity of some vertices (see 'set_verts_pos')."""
+        self._write_data(
+            self.fem_state.vertices.vel, vels, verts_idx, self.n_vertices, "verts_idx", envs_idx, element_shape=(3,)
+        )
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
 
-        for i_e, i_b in qd.ndrange(n_elems_local, self._B):
-            i_global = i_e + el_start
-            self.elements_el[f, i_global, i_b].actu = 0.0
-            self.elements_el_ng[f, i_global, i_b].active = True
+    @gs.assert_built
+    @mutates()
+    def set_elements_actu(self, actus, elements_idx=None, envs_idx=None, *, n_groups=1):
+        """
+        Set the actuation of some elements, each element taking the actuation of its muscle group.
 
-        for i_s in range(tri2v.shape[0]):
-            i_global = i_s + s_start
-            for j in qd.static(range(3)):
-                self.surface[i_global].tri2v[j] = tri2v[i_s, j] + v_start
-            self.surface[i_global].tri2el = tri2el[i_s] + el_start
-            self.surface[i_global].active = True
+        Parameters
+        ----------
+        actus : array_like, shape ([M,] [N,] [n_groups,])
+            Actuation of each muscle group, for each element.
+        elements_idx : None | int | array_like, shape ([M,] N), optional
+            Global index of the elements (see 'set_verts_pos'). If None, all elements will be considered.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
+        n_groups : int, optional
+            The number of muscle groups. Defaults to 1.
+        """
+        actus, elements_idx, envs_idx = self._sanitize_io_variables(
+            actus, elements_idx, self.n_elements, "elements_idx", envs_idx, (n_groups,), batched_idx=True
+        )
+        kernel_set_actu(
+            elements_idx, envs_idx, actus, self.fem_info.elements.muscle_group, self.fem_state.elements.actu
+        )
 
-    @qd.kernel
-    def _kernel_add_cloth(
-        self,
-        f: qd.i32,
-        v_start: qd.i32,
-        s_start: qd.i32,
-        verts: qd.types.ndarray(),
-        tri2v: qd.types.ndarray(),
+    @mutates(StateChange.MODEL)
+    def set_elements_muscle_group(self, muscle_group, elements_idx=None):
+        """Set the muscle group of some elements, shared by every environment."""
+        self._write_data(
+            self.fem_info.elements.muscle_group,
+            muscle_group,
+            elements_idx,
+            self.n_elements,
+            "elements_idx",
+            dtype=gs.tc_int,
+            is_batched=False,
+        )
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
+
+    @mutates(StateChange.MODEL)
+    def set_elements_muscle_direction(self, muscle_direction, elements_idx=None):
+        """Set the unit direction of the muscle fibers of some elements, shared by every environment."""
+        self._write_data(
+            self.fem_info.elements.muscle_direction,
+            muscle_direction,
+            elements_idx,
+            self.n_elements,
+            "elements_idx",
+            element_shape=(3,),
+            is_batched=False,
+        )
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
+
+    def get_elements_el2v(self, elements_idx=None):
+        """Get the global index of the four vertices of some elements."""
+        return self._read_data(self.fem_info.elements.el2v, None, elements_idx, copy=True, is_batched=False)
+
+    @gs.assert_built
+    @mutates(StateChange.MODEL)
+    def set_vertex_constraints(
+        self, verts_idx=None, target_poss=None, link_idx=-1, is_soft_constraint=False, stiffness=0.0, envs_idx=None
     ):
         """
-        Add cloth vertices and surface triangles to the solver, for position tracking and coupling only.
+        Constrain some vertices to target positions, or to follow a rigid link.
 
-        Cloth elements and mass are owned by the IPC coupler, so the vertex info holds placeholder values and each
-        surface triangle references itself as element.
+        Parameters
+        ----------
+        verts_idx : None | int | array_like, shape ([M,] N), optional
+            Global index of the vertices (see 'set_verts_pos'). If None, all vertices will be considered.
+        target_poss : None | array_like, shape ([M,] [N,] 3), optional
+            Target position of each vertex. If None, the current positions are used. Defaults to None.
+        link_idx : int, optional
+            Global index of the rigid link the vertices follow, keeping their offset to it, or -1 for none.
+        is_soft_constraint : bool, optional
+            Whether to pull the vertices toward their targets with critically damped springs, rather than setting their
+            position and zeroing their velocity. A spring applies the force -k (x - x_t) - 2 sqrt(k m) (v - v_t) to a
+            vertex of mass m, x_t and v_t being the position and velocity of its target. The implicit solver holds the
+            vertices at their targets instead. Defaults to False.
+        stiffness : float, optional
+            Stiffness k of the springs of a soft constraint, in N/m. Defaults to 0.0.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
-        n_verts_local = verts.shape[0]
-        for i_v, i_b in qd.ndrange(n_verts_local, self._B):
-            i_global = i_v + v_start
-            for j in qd.static(range(3)):
-                self.elements_v[f, i_global, i_b].pos[j] = verts[i_v, j]
-            self.elements_v[f, i_global, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+        if self._use_implicit_solver and not self._enable_vertex_constraints:
+            gs.raise_exception(
+                "This feature is disabled. Please set 'enable_vertex_constraints=True' when using FEM implicit solver."
+            )
+        # Imported here to avoid a circular dependency (see 'substep_pre_coupling')
+        from genesis.engine.couplers import IPCCoupler
 
-        for i_v in range(n_verts_local):
-            i_global = i_v + v_start
-            self.elements_v_info[i_global].mass = 1.0
-            self.elements_v_info[i_global].mass_over_dt2 = 0.0
-            self.elements_v_info[i_global].friction_mu = 0.0
+        if isinstance(self._sim.coupler, IPCCoupler):
+            gs.raise_exception("Vertex constraints are not supported by the IPC coupler.")
+        if not self._is_constraints_initialized:
+            self.init_constraints()
 
-        for i_s in range(tri2v.shape[0]):
-            i_global = i_s + s_start
-            for j in qd.static(range(3)):
-                self.surface[i_global].tri2v[j] = tri2v[i_s, j] + v_start
-            self.surface[i_global].tri2el = i_global
-            self.surface[i_global].active = True
+        is_target_current = target_poss is None
+        target_poss, verts_idx, envs_idx = self._sanitize_io_variables(
+            target_poss, verts_idx, self.n_vertices, "verts_idx", envs_idx, (3,), batched_idx=True
+        )
+        if is_target_current:
+            kernel_get_values(verts_idx, envs_idx, target_poss, self.fem_state.vertices.pos, self.has_frames)
 
-    @qd.kernel
-    def _kernel_set_elements_pos(
-        self,
-        f: qd.i32,
-        element_v_start: qd.i32,
-        n_vertices: qd.i32,
-        pos: qd.types.ndarray(),
-    ):
-        for i_v, i_b in qd.ndrange(n_vertices, self._B):
-            i_global = i_v + element_v_start
-            for k in qd.static(range(3)):
-                self.elements_v[f, i_global, i_b].pos[k] = pos[i_b, i_v, k]
+        if link_idx < 0:
+            link_init_pos = torch.zeros((len(envs_idx), 3), dtype=gs.tc_float, device=gs.device)
+            link_init_quat = torch.zeros((len(envs_idx), 4), dtype=gs.tc_float, device=gs.device)
+        else:
+            rigid_solver = self._sim.rigid_solver
+            links_envs_idx = envs_idx if self._scene.n_envs > 0 else None
+            # The attachment is a configuration of the constraint, which carries no gradient
+            with torch.no_grad():
+                link_init_pos = rigid_solver.get_links_pos(links_idx=link_idx, envs_idx=links_envs_idx)[..., 0, :]
+                link_init_quat = rigid_solver.get_links_quat(links_idx=link_idx, envs_idx=links_envs_idx)[..., 0, :]
+            link_init_pos = broadcast_tensor(link_init_pos, gs.tc_float, (len(envs_idx), 3)).contiguous()
+            link_init_quat = broadcast_tensor(link_init_quat, gs.tc_float, (len(envs_idx), 4)).contiguous()
 
-    @qd.kernel
-    def _kernel_set_elements_pos_grad(
-        self,
-        f: qd.i32,
-        element_v_start: qd.i32,
-        n_vertices: qd.i32,
-        pos_grad: qd.types.ndarray(),
-    ):
-        for i_v, i_b in qd.ndrange(n_vertices, self._B):
-            i_global = i_v + element_v_start
-            for k in qd.static(range(3)):
-                self.elements_v.grad[f, i_global, i_b].pos[k] = pos_grad[i_b, i_v, k]
+        kernel_set_vertex_constraints(
+            verts_idx,
+            envs_idx,
+            link_idx,
+            stiffness,
+            target_poss,
+            link_init_pos,
+            link_init_quat,
+            self.fem_state,
+            self.vertex_constraints,
+            is_soft_constraint,
+        )
 
-    @qd.kernel
-    def _kernel_set_elements_vel(
-        self,
-        f: qd.i32,
-        element_v_start: qd.i32,
-        n_vertices: qd.i32,
-        vel: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-    ):
-        for i_v, i_b in qd.ndrange(n_vertices, self._B):
-            i_global = i_v + element_v_start
-            for k in qd.static(range(3)):
-                self.elements_v[f, i_global, i_b].vel[k] = vel[i_b, i_v, k]
+    @mutates(StateChange.MODEL)
+    def update_constraint_targets(self, target_poss, verts_idx=None, envs_idx=None):
+        """Update the target position of some constrained vertices (see 'set_vertex_constraints')."""
+        if target_poss is None:
+            gs.raise_exception("The target positions of the constraints must be specified.")
+        if not self._is_constraints_initialized:
+            gs.logger.warning("Ignoring update_constraint_targets; constraints have not been initialized.")
+            return
+        self._write_data(
+            self.vertex_constraints.target_pos,
+            target_poss,
+            verts_idx,
+            self.n_vertices,
+            "verts_idx",
+            envs_idx=envs_idx,
+            element_shape=(3,),
+            is_framed=False,
+        )
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
 
-    @qd.kernel
-    def _kernel_set_elements_vel_grad(
-        self,
-        f: qd.i32,
-        element_v_start: qd.i32,
-        n_vertices: qd.i32,
-        vel_grad: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-    ):
-        for i_v, i_b in qd.ndrange(n_vertices, self._B):
-            i_global = i_v + element_v_start
-            for k in qd.static(range(3)):
-                self.elements_v.grad[f, i_global, i_b].vel[k] = vel_grad[i_b, i_v, k]
-
-    @qd.kernel
-    def _kernel_set_elements_actu(
-        self,
-        f: qd.i32,
-        element_el_start: qd.i32,
-        n_elements: qd.i32,
-        n_groups: qd.i32,
-        actu: qd.types.ndarray(),  # shape [B, n_elements, n_groups]
-    ):
-        for i_e, j_g, i_b in qd.ndrange(n_elements, n_groups, self._B):
-            i_global = i_e + element_el_start
-            if self.elements_i[i_global].muscle_group == j_g:
-                self.elements_el[f, i_global, i_b].actu = actu[i_b, j_g]
-
-    @qd.kernel
-    def _kernel_set_elements_actu_grad(
-        self,
-        f: qd.i32,
-        element_el_start: qd.i32,
-        n_elements: qd.i32,
-        actu_grad: qd.types.ndarray(),  # shape [B, n_elements]
-    ):
-        for i_e, i_b in qd.ndrange(n_elements, self._B):
-            i_global = i_e + element_el_start
-            self.elements_el.grad[f, i_global, i_b].actu = actu_grad[i_b, i_e]
-
-    @qd.kernel
-    def _kernel_set_active(
-        self,
-        f: qd.i32,
-        element_el_start: qd.i32,
-        n_elements: qd.i32,
-        active: qd.types.ndarray(),  # shape [B, n_elements]
-    ):
-        for i_e, i_b in qd.ndrange(n_elements, self._B):
-            i_global = i_e + element_el_start
-            self.elements_el_ng[f, i_global, i_b].active = active[i_b, i_e]
-
-    @qd.kernel
-    def _kernel_set_muscle_group(
-        self,
-        element_el_start: qd.i32,
-        n_elements: qd.i32,
-        muscle_group: qd.types.ndarray(),
-    ):
-        for i_e in range(n_elements):
-            i_global = i_e + element_el_start
-            self.elements_i[i_global].muscle_group = muscle_group[i_e]
-
-    @qd.kernel
-    def _kernel_set_muscle_direction(
-        self,
-        element_el_start: qd.i32,
-        n_elements: qd.i32,
-        muscle_direction: qd.types.ndarray(),
-    ):
-        for i_e in range(n_elements):
-            i_global = i_e + element_el_start
-            for j in qd.static(range(3)):
-                self.elements_i[i_global].muscle_direction[j] = muscle_direction[i_e, j]
-
-    @qd.kernel
-    def _kernel_get_el2v(
-        self,
-        element_el_start: qd.i32,
-        element_v_start: qd.i32,
-        el2v: qd.types.ndarray(),
-        n_elements: qd.i32,
-    ):
-        for i_e_ in range(n_elements):
-            i_e = i_e_ + element_el_start
-            for j in qd.static(range(4)):
-                el2v[i_e_, j] = self.elements_i[i_e].el2v[j] - element_v_start
-
-    @qd.kernel
-    def _kernel_get_state(
-        self,
-        f: qd.i32,
-        pos: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-        vel: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-        active: qd.types.ndarray(),  # shape [B, n_elements]
-    ):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            for j in qd.static(range(3)):
-                pos[i_b, i_v, j] = self.elements_v[f, i_v, i_b].pos[j]
-                vel[i_b, i_v, j] = self.elements_v[f, i_v, i_b].vel[j]
-
-        for i_e, i_b in qd.ndrange(self.n_elements, self._B):
-            active[i_b, i_e] = self.elements_el_ng[f, i_e, i_b].active
-
-    @qd.kernel
-    def _kernel_get_state_render(self, f: qd.i32):
-        for i_vv, i_b in qd.ndrange(self._n_vverts, self._B):
-            i_v = self.vverts_info[i_vv].vert_idx
-            for j in qd.static(range(3)):
-                self.vverts_render[i_vv, i_b].pos[j] = qd.cast(self.elements_v[f, i_v, i_b].pos[j], qd.f32)
-
-    @qd.kernel
-    def _kernel_add_vverts(
-        self,
-        vvert_start: qd.i32,
-        vface_start: qd.i32,
-        v_start: qd.i32,
-        verts_idx: qd.types.ndarray(),
-        uvs: qd.types.ndarray(element_dim=1),
-        vfaces: qd.types.ndarray(element_dim=1),
-    ):
-        n_vverts_local = verts_idx.shape[0]
-        for i_vv_ in range(n_vverts_local):
-            self.vverts_info[i_vv_ + vvert_start].vert_idx = verts_idx[i_vv_] + v_start
-
-        n_uvs = uvs.shape[0]
-        for i_vv_ in range(n_uvs):
-            self.vverts_uvs[i_vv_ + vvert_start] = uvs[i_vv_]
-
-        n_vfaces_local = vfaces.shape[0]
-        for i_vf_ in range(n_vfaces_local):
-            self.vfaces_indices[i_vf_ + vface_start] = vfaces[i_vf_] + vvert_start
-
-    @qd.kernel
-    def _kernel_set_state(
-        self,
-        f: qd.i32,
-        pos: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-        vel: qd.types.ndarray(),  # shape [B, n_vertices, 3]
-        active: qd.types.ndarray(),  # shape [B, n_elements]
-    ):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            for j in qd.static(range(3)):
-                self.elements_v[f, i_v, i_b].pos[j] = pos[i_b, i_v, j]
-                self.elements_v[f, i_v, i_b].vel[j] = vel[i_b, i_v, j]
-
-        for i_e, i_b in qd.ndrange(self.n_elements, self._B):
-            self.elements_el_ng[f, i_e, i_b].active = active[i_b, i_e]
-
-    @qd.kernel
-    def _kernel_add_grad_from_pos(self, f: qd.i32, pos_grad: qd.types.ndarray()):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            for j in qd.static(range(3)):
-                self.elements_v.grad[f, i_v, i_b].pos[j] += pos_grad[i_b, i_v, j]
-
-    @qd.kernel
-    def _kernel_add_grad_from_vel(self, f: qd.i32, vel_grad: qd.types.ndarray()):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            for j in qd.static(range(3)):
-                self.elements_v.grad[f, i_v, i_b].vel[j] += vel_grad[i_b, i_v, j]
+    @mutates(StateChange.MODEL)
+    def remove_vertex_constraints(self, verts_idx=None, envs_idx=None):
+        """Remove the constraints of some vertices (see 'set_vertex_constraints'), of all of them if None."""
+        if not self._is_constraints_initialized:
+            gs.logger.warning("Ignoring remove_vertex_constraints; constraints have not been initialized.")
+            return
+        _, verts_idx, envs_idx = self._sanitize_io_variables(
+            None, verts_idx, self.n_vertices, "verts_idx", envs_idx, batched_idx=True, skip_allocation=True
+        )
+        kernel_remove_vertex_constraints(verts_idx, envs_idx, self.vertex_constraints)
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
 
     @property
-    def floor_height(self):
-        return self._floor_height
-
-    @property
-    def damping(self):
+    def damping(self) -> float:
         return self._damping
 
     @property
-    def n_vertices(self):
+    def n_vertices(self) -> int:
         return sum([entity.n_vertices for entity in self._entities])
 
     @property
-    def n_elements(self):
+    def n_elements(self) -> int:
         return sum([entity.n_elements for entity in self._entities])
 
     @property
-    def n_surfaces(self):
+    def n_surfaces(self) -> int:
         return sum([entity.n_surfaces for entity in self.entities])
 
     @property
-    def n_vverts(self):
+    def n_vverts(self) -> int:
         return sum([entity.n_vverts for entity in self._entities])
 
     @property
-    def n_vfaces(self):
+    def n_vfaces(self) -> int:
         return sum([entity.n_vfaces for entity in self._entities])
 
     @property
-    def n_vertices_max(self):
-        return self._n_vertices_max
-
-    @property
-    def n_elements_max(self):
-        return self._n_elements_max
-
-    @property
-    def vol_scale(self):
+    def vol_scale(self) -> float:
         return self._vol_scale
 
     @property
-    def n_surface_vertices(self):
-        return self.surface_vertices.shape[0]
+    def n_surface_vertices(self) -> int:
+        return self.fem_info.surface_vertices.shape[0]
 
     @property
-    def n_surface_elements(self):
-        return self.surface_elements.shape[0]
+    def n_surface_elements(self) -> int:
+        return self.fem_info.surface_elements.shape[0]
 
-    # ------------------------------------------------------------------------------------
-    # -------------------------------- vertex constraints --------------------------------
-    # ------------------------------------------------------------------------------------
 
-    @qd.kernel
-    def _kernel_update_linked_vertex_constraints(
-        self,
-        links_state: array_class.LinksState,
+# ------------------------------------------------------------------------------------
+# ------------------------------------ materials -------------------------------------
+# ------------------------------------------------------------------------------------
+
+# The materials of the elements are dispatched at compile time on the constitutive models present in the scene (see
+# FEMConfig), each element taking the branch of its own model at runtime. Compiling a model into a kernel outside the
+# models it supports raises as the kernel compiles.
+
+
+@qd.func
+def func_element_model(i_e: int, fem_info: FEMInfo, fem_config: qd.template()):
+    """Return the constitutive model of an element, a compile-time constant when all the elements share it."""
+    model = gs.qd_int(fem_config.shared_model)
+    if qd.static(fem_config.shared_model < 0):
+        model = fem_info.elements.model[i_e]
+    return model
+
+
+@qd.func
+def func_element_stress(
+    i_e: int, J: float, F: qd.types.matrix(3, 3), actu: float, fem_info: FEMInfo, fem_config: qd.template()
+):
+    """Return the first Piola-Kirchhoff stress of an element under the explicit solver."""
+    mu = fem_info.elements.mu[i_e]
+    lam = fem_info.elements.lam[i_e]
+    model = func_element_model(i_e, fem_info, fem_config)
+    stress = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(fem_config.has_linear):
+        if model == FEMModel.LINEAR:
+            stress = func_linear_stress(mu, lam, F)
+    if qd.static(fem_config.has_stable_neohookean):
+        if model == FEMModel.STABLE_NEOHOOKEAN:
+            stress = func_stable_neohookean_stress(mu, lam, J, F)
+    if qd.static(fem_config.has_linear_corotated):
+        gs.raise_exception("Linear corotated stress update is not implemented yet.")
+    if qd.static(fem_config.has_muscle):
+        if fem_info.elements.is_muscle[i_e]:
+            stress += func_muscle_stress(
+                fem_info.elements.muscle_stiffness[i_e],
+                actu,
+                F,
+                fem_info.elements.muscle_direction[i_e],
+                fem_info.fiber_length_eps[None],
+            )
+    return stress
+
+
+@qd.func
+def func_element_energy_gradient(
+    i_e: int,
+    i_b: int,
+    F: qd.types.matrix(3, 3),
+    actu: float,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """Return the energy density of an element and its gradient with respect to the deformation gradient."""
+    mu = fem_info.elements.mu[i_e]
+    lam = fem_info.elements.lam[i_e]
+    model = func_element_model(i_e, fem_info, fem_config)
+    energy = gs.qd_float(0.0)
+    gradient = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(fem_config.has_linear):
+        if model == FEMModel.LINEAR:
+            energy, gradient = func_linear_energy_gradient(mu, lam, F)
+    if qd.static(fem_config.has_stable_neohookean):
+        gs.raise_exception("Gradient computation is not implemented for stable_neohookean model.")
+    if qd.static(fem_config.has_linear_corotated):
+        if model == FEMModel.LINEAR_COROTATED:
+            energy, gradient = func_linear_corotated_energy_gradient(
+                mu, lam, fem_state.elements_material.rotation[i_e, i_b], F
+            )
+    if qd.static(fem_config.has_muscle):
+        if fem_info.elements.is_muscle[i_e]:
+            stress = func_muscle_fiber_stress(
+                fem_info.elements.muscle_stiffness[i_e],
+                actu,
+                fem_info.elements.muscle_direction[i_e],
+                fem_state.elements_material.fiber_dir[i_e, i_b],
+            )
+            energy = energy + (stress * F).sum()
+            gradient = gradient + stress
+    return energy, gradient
+
+
+@qd.func
+def func_element_energy(
+    i_e: int,
+    i_b: int,
+    J: float,
+    F: qd.types.matrix(3, 3),
+    actu: float,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """Return the energy density of an element."""
+    mu = fem_info.elements.mu[i_e]
+    lam = fem_info.elements.lam[i_e]
+    model = func_element_model(i_e, fem_info, fem_config)
+    energy = gs.qd_float(0.0)
+    if qd.static(fem_config.has_linear):
+        if model == FEMModel.LINEAR:
+            energy = func_linear_energy(mu, lam, F)
+    if qd.static(fem_config.has_stable_neohookean):
+        if model == FEMModel.STABLE_NEOHOOKEAN:
+            energy = func_stable_neohookean_energy(mu, lam, J, F)
+    if qd.static(fem_config.has_linear_corotated):
+        if model == FEMModel.LINEAR_COROTATED:
+            energy = func_linear_corotated_energy(mu, lam, fem_state.elements_material.rotation[i_e, i_b], F)
+    if qd.static(fem_config.has_muscle):
+        if fem_info.elements.is_muscle[i_e]:
+            fiber_dir = fem_state.elements_material.fiber_dir[i_e, i_b]
+            energy = energy + fem_info.elements.muscle_stiffness[i_e] * actu * fiber_dir.dot(
+                F @ fem_info.elements.muscle_direction[i_e]
+            )
+    return energy
+
+
+@qd.func
+def func_element_hessian_product(
+    i_e: int,
+    i_b: int,
+    dF: qd.types.matrix(3, 3),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """
+    Return the product of the Hessian of the energy density of an element with a change of its deformation.
+
+    The implicit solver takes this product in place of the Hessian itself.
+    """
+    mu = fem_info.elements.mu[i_e]
+    lam = fem_info.elements.lam[i_e]
+    model = func_element_model(i_e, fem_info, fem_config)
+    dP = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(fem_config.has_linear):
+        if model == FEMModel.LINEAR:
+            dP = func_linear_hessian_product(mu, lam, dF)
+    if qd.static(fem_config.has_stable_neohookean):
+        gs.raise_exception("Hessian computation is not implemented for stable_neohookean model.")
+    if qd.static(fem_config.has_linear_corotated):
+        if model == FEMModel.LINEAR_COROTATED:
+            # The Hessian depends on the rotation of the element alone, taken at the start of the substep
+            dP = func_linear_corotated_hessian_product(mu, lam, fem_state.elements_material.rotation[i_e, i_b], dF)
+    return dP
+
+
+@qd.func
+def func_element_precompute(
+    i_e: int,
+    i_b: int,
+    F: qd.types.matrix(3, 3),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """Compute the data the material of an element takes from its deformation at the start of a substep."""
+    if qd.static(fem_config.has_linear_corotated):
+        if func_element_model(i_e, fem_info, fem_config) == FEMModel.LINEAR_COROTATED:
+            fem_state.elements_material.rotation[i_e, i_b] = func_linear_corotated_rotation(F)
+    if qd.static(fem_config.has_muscle):
+        if fem_info.elements.is_muscle[i_e]:
+            fem_state.elements_material.fiber_dir[i_e, i_b] = func_muscle_fiber_dir(
+                F, fem_info.elements.muscle_direction[i_e], fem_info.fiber_length_eps[None]
+            )
+
+
+@qd.func
+def func_element_precompute_grad(
+    i_e: int,
+    i_b: int,
+    F_start: qd.types.matrix(3, 3),
+    F: qd.types.matrix(3, 3),
+    dF_damping: qd.types.matrix(3, 3),
+    gradient_grad: qd.types.matrix(3, 3),
+    actu: float,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """
+    Return the adjoint of the deformation gradient at the start of a substep that the data of the material carries.
+
+    It is the reverse of 'func_element_precompute', from the adjoint `gradient_grad` of the energy gradient at the end
+    of the substep, which the data enters along with the change `dF_damping` of the deformation gradient driving the
+    stiffness damping.
+    """
+    F_start_grad = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(fem_config.has_linear_corotated):
+        if func_element_model(i_e, fem_info, fem_config) == FEMModel.LINEAR_COROTATED:
+            F_start_grad = func_linear_corotated_rotation_grad(
+                fem_info.elements.mu[i_e],
+                fem_info.elements.lam[i_e],
+                fem_state.elements_material.rotation[i_e, i_b],
+                F_start,
+                F,
+                dF_damping,
+                gradient_grad,
+            )
+    if qd.static(fem_config.has_muscle):
+        if fem_info.elements.is_muscle[i_e]:
+            F_start_grad = F_start_grad + func_muscle_fiber_dir_grad(
+                fem_info.elements.muscle_stiffness[i_e],
+                actu,
+                F_start,
+                fem_info.elements.muscle_direction[i_e],
+                gradient_grad,
+                fem_info.fiber_length_eps[None],
+            )
+    return F_start_grad
+
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------- elements -------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_element_J_F(f: int, i_e: int, i_b: int, fem_state: FEMState, fem_info: FEMInfo):
+    """Return the determinant J and the deformation gradient F of an element at a frame."""
+    i_vs = fem_info.elements.el2v[i_e]
+    pos_v3 = fem_state.vertices.pos[f, i_vs[3], i_b]
+    D = qd.Matrix.cols([fem_state.vertices.pos[f, i_vs[i_k], i_b] - pos_v3 for i_k in qd.static(range(3))])
+    F = D @ fem_info.elements.B[i_e]
+    J = F.determinant()
+    return J, F
+
+
+@qd.func
+def func_element_internal_force(
+    f: int, i_e: int, i_b: int, fem_state: FEMState, fem_info: FEMInfo, fem_config: qd.template()
+):
+    """
+    Return the elastic force of an element on each of its vertices, one per column, from the stress its solver uses.
+
+    The columns sum to zero, so the forces conserve momentum once each vertex divides its own by its own mass.
+    """
+    J, F = func_element_J_F(f, i_e, i_b, fem_state, fem_info)
+    actu = fem_state.elements.actu[f, i_e, i_b]
+    stress = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(fem_config.use_implicit_solver):
+        _, stress = func_element_energy_gradient(i_e, i_b, F, actu, fem_state, fem_info, fem_config)
+    else:
+        stress = func_element_stress(i_e, J, F, actu, fem_info, fem_config)
+    H = -fem_info.elements.V[i_e] * stress @ fem_info.elements.B[i_e].transpose()
+    return qd.Matrix.cols([H[:, 0], H[:, 1], H[:, 2], -H[:, 0] - H[:, 1] - H[:, 2]])
+
+
+@qd.func
+def func_element_displacement(f: int, i_e: int, i_b: int, fem_state: FEMState, fem_info: FEMInfo):
+    """Return the displacement of each vertex of an element over a substep, one per column."""
+    i_vs = fem_info.elements.el2v[i_e]
+    return qd.Matrix.cols(
+        [
+            fem_state.vertices.pos[f + 1, i_vs[i_k], i_b] - fem_state.vertices.pos[f, i_vs[i_k], i_b]
+            for i_k in qd.static(range(4))
+        ]
+    )
+
+
+@qd.func
+def func_element_mapping_matrix(
+    i_e: int, i_b: int, fem_info: FEMInfo, vertex_constraints: FEMVertexConstraints, fem_config: qd.template()
+):
+    """
+    Return the matrix S mapping the displacement of the vertices of an element to the change of its deformation
+    gradient, the rows of the constrained vertices zeroed.
+    """
+    B = fem_info.elements.B[i_e]
+    S = qd.Matrix.zero(gs.qd_float, 4, 3)
+    S[:3, :] = B
+    S[3, :] = -B[0, :] - B[1, :] - B[2, :]
+    if qd.static(fem_config.enable_vertex_constraints):
+        i_vs = fem_info.elements.el2v[i_e]
+        for i_k in qd.static(range(4)):
+            if vertex_constraints.is_constrained[i_vs[i_k], i_b]:
+                S[i_k, :] = qd.Vector.zero(gs.qd_float, 3)
+    return S
+
+
+@qd.func
+def func_elastic_product(
+    i_e: int,
+    i_b: int,
+    S: qd.types.matrix(4, 3),
+    x: qd.types.matrix(3, 4),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+):
+    """
+    Return the change of the deformation gradient of an element along a displacement, and its energy Hessian product.
+
+    `x` holds the displacement of each vertex of the element in its columns, and `S` maps it to the deformation gradient
+    (see 'func_element_mapping_matrix'). The second returned matrix is the product of the Hessian of the energy density
+    of the element with the first one.
+    """
+    dF = x @ S
+    dP = func_element_hessian_product(i_e, i_b, dF, fem_state, fem_info, fem_config)
+    return dF, dP
+
+
+@qd.func
+def func_element_energy_gradient_damped(
+    f: int,
+    i_e: int,
+    i_b: int,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Return the energy density of an element at the end of a substep of the implicit solver, and its damped gradient.
+
+    The gradient is taken with respect to the deformation gradient, plus the stress of the Rayleigh stiffness damping
+    for the displacement over the substep.
+    """
+    # The placeholders of the values left unused are named apart, since autodiff gives a reused name one type alone
+    J, F = func_element_J_F(f=f + 1, i_e=i_e, i_b=i_b, fem_state=fem_state, fem_info=fem_info)
+    actu = fem_state.elements.actu[f, i_e, i_b]
+    energy, gradient = func_element_energy_gradient(i_e, i_b, F, actu, fem_state, fem_info, fem_config)
+    if qd.static(fem_config.has_damping_beta):
+        S = func_element_mapping_matrix(i_e, i_b, fem_info, vertex_constraints, fem_config)
+        x = func_element_displacement(f, i_e, i_b, fem_state, fem_info)
+        dF, dP = func_elastic_product(i_e, i_b, S, x, fem_state, fem_info, fem_config)
+        gradient = gradient + fem_info.damping_beta_over_dt[None] * dP
+    return energy, gradient
+
+
+@qd.func
+def func_vertex_inertia_force(
+    f: int,
+    i_v: int,
+    i_b: int,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Return the force of the inertia and of the Rayleigh mass damping on a vertex at the end of a substep of the
+    implicit solver.
+
+    A constrained vertex sits at its target, which the damping of its jump would otherwise pull it from.
+    """
+    pos = fem_state.vertices.pos[f + 1, i_v, i_b]
+    force = -fem_info.vertices.mass_over_dt2[i_v] * (
+        (pos - fem_state.vertices_energy.inertia[i_v, i_b])
+        + (pos - fem_state.vertices.pos[f, i_v, i_b]) * fem_info.damping_alpha_dt[None]
+    )
+    if qd.static(fem_config.enable_vertex_constraints):
+        if vertex_constraints.is_constrained[i_v, i_b]:
+            force = qd.Vector.zero(gs.qd_float, 3)
+    return force
+
+
+@qd.func
+def func_constraint_target(i_v: int, i_b: int, links_state: LinksState, vertex_constraints: FEMVertexConstraints):
+    """
+    Return the target of a constrained vertex.
+
+    The target of a vertex following a link is computed from the pose of the link wherever it is used, so that the
+    gradient flows from the link to the vertex.
+    """
+    target_pos = vertex_constraints.target_pos[i_v, i_b]
+    i_l = vertex_constraints.link_idx[i_v, i_b]
+    if i_l >= 0:
+        offset_quat = qd_transform_quat_by_quat(
+            qd_inv_quat(vertex_constraints.link_init_quat[i_v, i_b]), links_state.quat[i_l, i_b]
+        )
+        offset_pos = qd_transform_by_quat(vertex_constraints.link_offset_pos[i_v, i_b], offset_quat)
+        target_pos = links_state.pos[i_l, i_b] + offset_pos
+    return target_pos
+
+
+# ------------------------------------------------------------------------------------
+# --------------------------------- explicit solver ----------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.kernel(fastcache=True)
+def kernel_init_pos_and_vel(f: int, fem_state: FEMState):
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.pos))):
+        fem_state.vertices.pos[f + 1, i_v, i_b] = fem_state.vertices.pos[f, i_v, i_b]
+        fem_state.vertices.vel[f + 1, i_v, i_b] = fem_state.vertices.vel[f, i_v, i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_compute_vel(f: int, fem_state: FEMState, fem_info: FEMInfo, fem_config: qd.template()):
+    """Add the velocity the elastic forces of the elements give their vertices over a substep."""
+    for i_e, i_b in qd.ndrange(*fem_state.elements.actu.shape[1:], axes=qd.static(eoa(fem_state.elements.actu))):
+        force = func_element_internal_force(f, i_e, i_b, fem_state, fem_info, fem_config)
+        i_vs = fem_info.elements.el2v[i_e]
+        for i_k in qd.static(range(4)):
+            i_v = i_vs[i_k]
+            dv = fem_info.substep_dt[None] * fem_info.vertices.mass_inv[i_v] * force[:, i_k]
+            qd.atomic_add(fem_state.vertices.vel[f + 1, i_v, i_b], dv)
+
+
+@qd.kernel(fastcache=True)
+def kernel_apply_uniform_force(f: int, fem_state: FEMState, fem_info: FEMInfo):
+    """Damp the velocities of the vertices over a substep, then add gravity to them, which the damping leaves out."""
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.vel))):
+        vel = fem_state.vertices.vel[f + 1, i_v, i_b] * fem_info.damping_decay[None]
+        fem_state.vertices.vel[f + 1, i_v, i_b] = vel + fem_info.substep_dt[None] * fem_info.gravity[i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_compute_pos(f: int, fem_state: FEMState, fem_info: FEMInfo, fem_config: qd.template(), errno: qd.Tensor):
+    """
+    Advance the positions of the vertices over a substep by their velocity.
+
+    Every solver and coupler path ends a substep here, so the positions it integrates are checked once. The hard
+    constraints overwrite some of them afterward, and check their targets (see 'kernel_apply_hard_constraints').
+    """
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.pos))):
+        pos = fem_info.substep_dt[None] * fem_state.vertices.vel[f + 1, i_v, i_b] + fem_state.vertices.pos[f, i_v, i_b]
+        fem_state.vertices.pos[f + 1, i_v, i_b] = pos
+        if not qd_isfinite(pos):
+            errno[i_b] = errno[i_b] | FEMErrorCode.INVALID_VERTEX_NAN
+    # With gradients, the substeps of a step run in successive frames, which carry over the actuation set in frame 0
+    if qd.static(fem_config.requires_grad):
+        for i_e, i_b in qd.ndrange(*fem_state.elements.actu.shape[1:], axes=qd.static(eoa(fem_state.elements.actu))):
+            fem_state.elements.actu[f + 1, i_e, i_b] = fem_state.elements.actu[f, i_e, i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_apply_hard_constraints(
+    f: int, fem_state: FEMState, links_state: LinksState, vertex_constraints: FEMVertexConstraints, errno: qd.Tensor
+):
+    """Set the vertices under a hard constraint to their target, at rest."""
+    for i_v, i_b in qd.ndrange(
+        *vertex_constraints.is_constrained.shape, axes=qd.static(eoa(vertex_constraints.is_constrained))
     ):
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            vc = self.vertex_constraints[i_v, i_b]
-            if vc.is_constrained and vc.link_idx >= 0:
-                i_l = vc.link_idx
-                pos = links_state.pos[i_l, i_b]
-                quat = links_state.quat[i_l, i_b]
+        if vertex_constraints.is_constrained[i_v, i_b] and not vertex_constraints.is_soft_constraint[i_v, i_b]:
+            target_pos = func_constraint_target(i_v, i_b, links_state, vertex_constraints)
+            fem_state.vertices.pos[f + 1, i_v, i_b] = target_pos
+            fem_state.vertices.vel[f + 1, i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            if not qd_isfinite(target_pos):
+                errno[i_b] = errno[i_b] | FEMErrorCode.INVALID_VERTEX_NAN
 
-                offset_pos = vc.link_offset_pos
-                offset_quat = qd_transform_quat_by_quat(vc.link_init_quat, quat)
-                self.vertex_constraints[i_v, i_b].target_pos = pos + qd_transform_by_quat(offset_pos, offset_quat)
 
-    @qd.kernel
-    def apply_hard_constraints(self, f: qd.i32):
-        """Apply hard constraints by directly overriding positions and velocities."""
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            vc = self.vertex_constraints[i_v, i_b]
-            if vc.is_constrained and not vc.is_soft_constraint:
-                self.elements_v[f + 1, i_v, i_b].pos = vc.target_pos
-                self.elements_v[f + 1, i_v, i_b].vel.fill(0.0)
-
-    @qd.kernel
-    def apply_soft_constraints(self, f: qd.i32):
-        """Apply soft constraints as spring forces for explicit solver."""
-        for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
-            vc = self.vertex_constraints[i_v, i_b]
-            if vc.is_constrained and vc.is_soft_constraint:
-                pos_error = self.elements_v[f, i_v, i_b].pos - vc.target_pos
-                vel_error = self.elements_v[f + 1, i_v, i_b].vel - self.elements_v[f, i_v, i_b].vel
-                spring_force = -vc.stiffness * pos_error
-                damping_force = -2.0 * qd.math.sqrt(vc.stiffness) * vel_error
-
-                dv = self.substep_dt * (spring_force + damping_force)
-                self.elements_v[f + 1, i_v, i_b].vel += dv
-
-    @qd.kernel
-    def _kernel_set_vertex_constraints(
-        self,
-        f: qd.i32,
-        verts_idx: qd.types.ndarray(),  # shape [n_selected_envs, n_verts]
-        envs_idx: qd.types.ndarray(),  # shape [n_selected_envs]
-        link_idx: qd.i32,
-        is_soft_constraint: qd.i32,
-        stiffness: qd.f32,
-        target_poss: qd.types.ndarray(),  # shape [n_selected_envs, n_verts, 3]
-        link_init_pos: qd.types.ndarray(),  # shape [n_selected_envs, 3]
-        link_init_quat: qd.types.ndarray(),  # shape [n_selected_envs, 4]
+@qd.kernel(fastcache=True)
+def kernel_apply_soft_constraints(
+    f: int, fem_state: FEMState, links_state: LinksState, fem_info: FEMInfo, vertex_constraints: FEMVertexConstraints
+):
+    """Pull the vertices of the soft constraints toward their targets with critically damped springs."""
+    for i_v, i_b in qd.ndrange(
+        *vertex_constraints.is_constrained.shape, axes=qd.static(eoa(vertex_constraints.is_constrained))
     ):
-        for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
-            i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b_, i_v_]
-            self.vertex_constraints[i_v, i_b].is_constrained = True
-            self.vertex_constraints[i_v, i_b].is_soft_constraint = qd.cast(is_soft_constraint, gs.qd_bool)
-            self.vertex_constraints[i_v, i_b].stiffness = stiffness
-            self.vertex_constraints[i_v, i_b].link_idx = link_idx
+        if vertex_constraints.is_constrained[i_v, i_b] and vertex_constraints.is_soft_constraint[i_v, i_b]:
+            target_pos = func_constraint_target(i_v, i_b, links_state, vertex_constraints)
+            target_vel = qd.Vector.zero(gs.qd_float, 3)
+            i_l = vertex_constraints.link_idx[i_v, i_b]
+            if i_l >= 0:
+                target_vel = links_state.cd_vel[i_l, i_b] + links_state.cd_ang[i_l, i_b].cross(
+                    target_pos - links_state.root_COM[i_l, i_b]
+                )
 
-            cur_pos = self.elements_v[f, i_v, i_b].pos
-            for j in qd.static(range(3)):
-                self.vertex_constraints[i_v, i_b].target_pos[j] = target_poss[i_b_, i_v_, j]
-                self.vertex_constraints[i_v, i_b].link_offset_pos[j] = cur_pos[j] - link_init_pos[i_b_, j]
-            for j in qd.static(range(4)):
-                self.vertex_constraints[i_v, i_b].link_init_quat[j] = link_init_quat[i_b_, j]
+            # The spring is integrated by backward Euler, the position moving with the velocity it gives, which keeps
+            # it stable whatever its stiffness. The rigid solver has already stepped, so the link places the target at
+            # the end of the substep: m (v' - v) = dt (-k (x + dt v' - x_t) - c (v' - v_t)).
+            stiffness = vertex_constraints.stiffness[i_v, i_b]
+            mass = fem_info.vertices.mass[i_v]
+            damping = 2.0 * qd.math.sqrt(stiffness * mass)
+            dt = fem_info.substep_dt[None]
+            dt_damping_stiffness = dt * damping + dt**2 * stiffness
+            vel = fem_state.vertices.vel[f + 1, i_v, i_b]
+            pos_error = fem_state.vertices.pos[f, i_v, i_b] - target_pos
+            vel_delta = -(dt_damping_stiffness * vel + dt * stiffness * pos_error - dt * damping * target_vel) / (
+                mass + dt_damping_stiffness
+            )
+            # An accumulation, which autodiff reverses exactly, the kernel reading the velocity it updates
+            qd.atomic_add(fem_state.vertices.vel[f + 1, i_v, i_b], vel_delta)
 
-    @qd.kernel
-    def _kernel_update_constraint_targets(
-        self, verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), new_target_poss: qd.types.ndarray()
+
+# ------------------------------------------------------------------------------------
+# --------------------------------- implicit solver ----------------------------------
+# ------------------------------------------------------------------------------------
+
+
+# The backward pass of the solve reverses the data along with the forces it enters (see '_implicit_solve_grad')
+@no_grad
+@qd.kernel(fastcache=True)
+def kernel_precompute_material_data(f: int, fem_state: FEMState, fem_info: FEMInfo, fem_config: qd.template()):
+    """Compute the data the materials take from the deformation of the elements at the start of a substep."""
+    for i_e, i_b in qd.ndrange(*fem_state.elements.actu.shape[1:], axes=qd.static(eoa(fem_state.elements.actu))):
+        _, F = func_element_J_F(f, i_e, i_b, fem_state, fem_info)
+        func_element_precompute(i_e, i_b, F, fem_state, fem_info, fem_config)
+
+
+@qd.kernel(fastcache=True)
+def kernel_init_pos_and_inertia(
+    f: int,
+    fem_state: FEMState,
+    links_state: LinksState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Start the positions of the vertices at the end of a substep of the implicit solver from those at its start, and
+    compute their inertia, a constrained vertex being set to its target.
+
+    Every environment enters the Newton iterations of the substep that follows.
+    """
+    for i_b in range(fem_state.envs_solve.is_active.shape[0]):
+        fem_state.envs_solve.is_active[i_b] = True
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.pos))):
+        is_free = True
+        if qd.static(fem_config.enable_vertex_constraints):
+            if vertex_constraints.is_constrained[i_v, i_b]:
+                target_pos = func_constraint_target(i_v, i_b, links_state, vertex_constraints)
+                fem_state.vertices.pos[f + 1, i_v, i_b] = target_pos
+                fem_state.vertices_energy.inertia[i_v, i_b] = target_pos
+                is_free = False
+        if is_free:
+            fem_state.vertices_energy.inertia[i_v, i_b] = (
+                fem_state.vertices.pos[f, i_v, i_b]
+                + fem_state.vertices.vel[f, i_v, i_b] * fem_info.substep_dt[None]
+                + fem_info.gravity[i_b] * fem_info.dt2[None]
+            )
+            fem_state.vertices.pos[f + 1, i_v, i_b] = fem_state.vertices.pos[f, i_v, i_b]
+
+
+@qd.func
+def func_block_sum(i_t: int, values, sh_sum: qd.Tensor, fem_config: qd.template()):
+    """
+    Return the sum of the values over the threads of the block of an environment, the same bitwise on every run.
+
+    The subgroup tiles of the block sum first, then every thread adds up the tile sums in order. On CPU, the block is a
+    single thread.
+    """
+    # Threads of the GPU subgroup tile whose sum 'qd_block_sum' computes
+    TILE_DIM = qd.static(32)
+
+    totals = values
+    if qd.static(fem_config.env_block_dim > 1):
+        for i in qd.static(range(values.n)):
+            value_tile = su.qd_block_sum(values[i])
+            if i_t % TILE_DIM == 0:
+                sh_sum[i, i_t // TILE_DIM] = value_tile
+        qd.simt.block.sync()
+        totals = qd.Vector.zero(gs.qd_float, values.n)
+        for i_tile in range(fem_config.n_block_tiles):
+            totals = totals + qd.Vector([sh_sum[i, i_tile] for i in qd.static(range(values.n))])
+        qd.simt.block.sync()
+    return totals
+
+
+@qd.func
+def func_accumulate_vertex(
+    f: int,
+    i_b: int,
+    i_v: int,
+    i_lane: int,
+    forces: qd.Tensor,
+    envs_is_active: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+    gather_Ap: qd.template(),
+    gather_internal_force: qd.template(),
+    clip_vertex: qd.template(),
+):
+    """
+    Sum the elastic terms of a vertex in a fixed order.
+
+    The internal force alone goes into `forces` for every environment if asked, else Ap alone or the force and diagonal
+    block of the active environments. On CPU, the thread of an environment walks the corners of all its elements in
+    element order and adds each term to its vertex. On GPU, the lanes of a vertex stride its corners (see
+    'vertices_corners_idx'), then add up their sums in a fixed order, every lane of a subgroup tile taking part and the
+    lanes past the last vertex doing nothing when `clip_vertex` is set.
+    """
+    is_serial = qd.static(fem_config.env_block_dim == 1)
+    n_lanes = qd.static(1 if is_serial else 2**fem_config.log2_corner_lanes)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    n_elements = fem_info.elements.V.shape[0]
+    damping_alpha_dt = fem_info.damping_alpha_dt[None]
+    damping_beta_factor = fem_info.damping_beta_factor[None]
+    I_3 = qd.Matrix.identity(gs.qd_float, 3)
+    vec_elastic = qd.Vector.zero(gs.qd_float, 3)
+    mat_elastic = qd.Matrix.zero(gs.qd_float, 3, 3)
+    is_active = True
+    if qd.static(not gather_internal_force):
+        is_active = envs_is_active[i_b]
+    if qd.static(clip_vertex):
+        is_active = is_active and i_v < n_vertices
+    if is_active:
+        i_c_start = 0
+        n_corners = 4 * n_elements
+        if qd.static(is_serial and not gather_internal_force):
+            for i_v_ in range(n_vertices):
+                if qd.static(gather_Ap):
+                    fem_state.vertices_solve.Ap[i_v_, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                else:
+                    fem_state.vertices_energy.force[i_v_, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                    fem_state.vertices_solve.diag3x3[i_v_, i_b] = qd.Matrix.zero(gs.qd_float, 3, 3)
+        if qd.static(not is_serial):
+            i_c_start = fem_info.vertices_corners_start[i_v]
+            n_corners = fem_info.vertices_corners_start[i_v + 1] - i_c_start
+
+        # On CPU the corners of an element follow each other, sharing its mapping matrix, stress or force
+        S = qd.Matrix.zero(gs.qd_float, 4, 3)
+        stress = qd.Matrix.zero(gs.qd_float, 3, 3)
+        force_internal = qd.Matrix.zero(gs.qd_float, 3, 4)
+        for i_c_ in range((n_corners + n_lanes - 1) // n_lanes):
+            i_c = i_c_ * n_lanes + i_lane
+            if i_c < n_corners:
+                i_corner = i_c
+                if qd.static(not is_serial):
+                    i_corner = fem_info.vertices_corners_idx[i_c_start + i_c]
+                i_e = i_corner // 4
+                i_k = i_corner % 4
+                V = fem_info.elements.V[i_e]
+                i_vs = fem_info.elements.el2v[i_e]
+                is_new_element = True
+                if qd.static(is_serial):
+                    is_new_element = i_k == 0
+                if is_new_element:
+                    if qd.static(gather_internal_force):
+                        force_internal = func_element_internal_force(f, i_e, i_b, fem_state, fem_info, fem_config)
+                    else:
+                        S = func_element_mapping_matrix(i_e, i_b, fem_info, vertex_constraints, fem_config)
+                    if qd.static(gather_Ap):
+                        p = qd.Matrix.cols([fem_state.vertices_solve.p[i_vs[i], i_b] for i in qd.static(range(4))])
+                        _, dP = func_elastic_product(i_e, i_b, S, p, fem_state, fem_info, fem_config)
+                        stress = V * damping_beta_factor * dP
+                S_k = S[i_k, :]
+
+                vec_corner = qd.Vector.zero(gs.qd_float, 3)
+                mat_corner = qd.Matrix.zero(gs.qd_float, 3, 3)
+                if qd.static(gather_internal_force):
+                    vec_corner = force_internal[:, i_k]
+                elif qd.static(gather_Ap):
+                    vec_corner = stress @ S_k
+                else:
+                    vec_corner = -V * fem_state.elements_energy.gradient[i_e, i_b] @ S_k
+                    # Column j of the block is the force a unit displacement of the vertex along axis j induces on it
+                    corner_k = qd.Matrix.identity(gs.qd_float, 4)[i_k, :]
+                    for j in range(3):
+                        _, dP = func_elastic_product(
+                            i_e, i_b, S, I_3[:, j].outer_product(corner_k), fem_state, fem_info, fem_config
+                        )
+                        mat_corner = mat_corner + (V * damping_beta_factor * dP @ S_k).outer_product(I_3[:, j])
+
+                if qd.static(is_serial):
+                    i_v_k = i_vs[i_k]
+                    if qd.static(gather_internal_force):
+                        for j in qd.static(range(3)):
+                            forces[i_b, i_v_k, j] = forces[i_b, i_v_k, j] + vec_corner[j]
+                    elif qd.static(gather_Ap):
+                        fem_state.vertices_solve.Ap[i_v_k, i_b] = fem_state.vertices_solve.Ap[i_v_k, i_b] + vec_corner
+                    else:
+                        force = fem_state.vertices_energy.force[i_v_k, i_b] + vec_corner
+                        fem_state.vertices_energy.force[i_v_k, i_b] = force
+                        diag3x3 = fem_state.vertices_solve.diag3x3[i_v_k, i_b] + mat_corner
+                        fem_state.vertices_solve.diag3x3[i_v_k, i_b] = diag3x3
+                else:
+                    vec_elastic = vec_elastic + vec_corner
+                    mat_elastic = mat_elastic + mat_corner
+    if qd.static(not is_serial):
+        for i in qd.static(range(3)):
+            vec_elastic[i] = su.qd_block_sum(vec_elastic[i], fem_config.log2_corner_lanes)
+            if qd.static(not gather_Ap and not gather_internal_force):
+                for j in qd.static(range(3)):
+                    mat_elastic[i, j] = su.qd_block_sum(mat_elastic[i, j], fem_config.log2_corner_lanes)
+
+    if qd.static(gather_internal_force):
+        # The first lane of a vertex writes its sum, which the walk over the corners adds up directly on CPU
+        if qd.static(not is_serial):
+            if i_lane == 0:
+                for j in qd.static(range(3)):
+                    forces[i_b, i_v, j] = vec_elastic[j]
+    elif is_active:
+        # The inertia terms of the vertices this thread owns add to their elastic sums
+        n_owned = 1 if i_lane == 0 else 0
+        if qd.static(is_serial):
+            n_owned = n_vertices
+        for i_o in range(n_owned):
+            i_v_o = i_v
+            if qd.static(is_serial):
+                i_v_o = i_o
+                vec_elastic = fem_state.vertices_energy.force[i_v_o, i_b]
+                mat_elastic = fem_state.vertices_solve.diag3x3[i_v_o, i_b]
+                if qd.static(gather_Ap):
+                    vec_elastic = fem_state.vertices_solve.Ap[i_v_o, i_b]
+            mass_over_dt2 = fem_info.vertices.mass_over_dt2[i_v_o]
+            if qd.static(gather_Ap):
+                p = fem_state.vertices_solve.p[i_v_o, i_b]
+                fem_state.vertices_solve.Ap[i_v_o, i_b] = mass_over_dt2 * (damping_alpha_dt + 1.0) * p + vec_elastic
+            else:
+                force_inertia = func_vertex_inertia_force(
+                    f, i_v_o, i_b, fem_state, fem_info, vertex_constraints, fem_config
+                )
+                fem_state.vertices_energy.force[i_v_o, i_b] = force_inertia + vec_elastic
+                diag3x3 = mat_elastic + mass_over_dt2 * (damping_alpha_dt + 1.0) * I_3
+                fem_state.vertices_solve.diag3x3[i_v_o, i_b] = diag3x3
+                # 3-by-3 block Jacobi preconditioner
+                fem_state.vertices_solve.prec[i_v_o, i_b] = diag3x3.inverse()
+
+
+@qd.func
+def func_accumulate_vertices(
+    f: int,
+    forces: qd.Tensor,
+    envs_is_active: qd.Tensor,
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+    gather_Ap: qd.template(),
+    gather_internal_force: qd.template(),
+    update_loop_flag: qd.template(),
+):
+    """Sum the elastic terms of every vertex of every environment (see 'func_accumulate_vertex')."""
+    is_serial = qd.static(fem_config.env_block_dim == 1)
+    n_lanes = qd.static(1 if is_serial else 2**fem_config.log2_corner_lanes)
+    # The thread count is an expression of the array shapes, which fields make a compile-time constant. A local computed
+    # before the loop would be stored by a serial task of its own and read back as a runtime bound.
+    for i_flat in range(
+        fem_state.vertices.pos.shape[2] * (1 if is_serial else fem_info.vertices.mass.shape[0] * n_lanes)
     ):
-        for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
-            i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b_, i_v_]
-            for j in qd.static(range(3)):
-                self.vertex_constraints[i_v, i_b].target_pos[j] = new_target_poss[i_b_, i_v_, j]
+        n_vertices = fem_info.vertices.mass.shape[0]
+        n_env_threads = 1
+        if qd.static(not is_serial):
+            n_env_threads = n_vertices * n_lanes
+        # A PCG iteration starts here: its loop flag drops until an environment iterates on (see 'kernel_batch_solve')
+        if qd.static(gather_Ap and update_loop_flag):
+            if i_flat == 0:
+                pcg_counter[()] = 0
+                fem_state.solve_loops.n_pcg_left[()] = fem_state.solve_loops.n_pcg_left[()] - 1
+        i_b = i_flat // n_env_threads
+        i_lane = i_flat % n_lanes
+        i_v = i_flat // n_lanes % n_vertices
+        func_accumulate_vertex(
+            f,
+            i_b,
+            i_v,
+            i_lane,
+            forces,
+            envs_is_active,
+            fem_state,
+            fem_info,
+            vertex_constraints,
+            fem_config,
+            gather_Ap,
+            gather_internal_force,
+            clip_vertex=False,
+        )
 
-    @qd.kernel
-    def _kernel_remove_specific_constraints(self, verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray()):
-        for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
-            i_b = envs_idx[i_b_]
-            i_v = verts_idx[i_b_, i_v_]
-            self.vertex_constraints[i_v, i_b].is_constrained = False
+
+@qd.func
+def func_init_pcg_env(
+    f: int,
+    i_b: int,
+    i_t: int,
+    sh_sum: qd.Tensor,
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+    is_adjoint: qd.template(),
+):
+    """
+    Compute the first residual of the PCG solve of an environment, by the threads of its block (see 'func_block_sum').
+
+    It is the forces at the end of the substep, or for the adjoint solve the adjoint of the positions there (see
+    'FEMSolver._implicit_solve_grad' for that solve).
+    """
+    n_threads = qd.static(fem_config.env_block_dim)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    is_active = fem_state.envs_solve.is_active[i_b]
+    rTr = gs.qd_float(0.0)
+    rTz = gs.qd_float(0.0)
+    if is_active:
+        for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+            i_v = i_v_ * n_threads + i_t
+            if i_v < n_vertices:
+                r = fem_state.vertices_energy.force[i_v, i_b]
+                if qd.static(is_adjoint):
+                    r = fem_state.vertices.pos.grad[f + 1, i_v, i_b]
+                z = fem_state.vertices_solve.prec[i_v, i_b] @ r
+                fem_state.vertices_solve.x[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+                fem_state.vertices_solve.r[i_v, i_b] = r
+                fem_state.vertices_solve.z[i_v, i_b] = z
+                fem_state.vertices_solve.p[i_v, i_b] = z
+                rTr = rTr + r.dot(r)
+                rTz = rTz + r.dot(z)
+    rTr, rTz = func_block_sum(i_t, values=qd.Vector([rTr, rTz]), sh_sum=sh_sum, fem_config=fem_config)
+    if i_t == 0:
+        if is_active:
+            fem_state.envs_solve.rTr[i_b] = rTr
+            fem_state.envs_solve.rTz[i_b] = rTz
+        rTr_threshold = fem_info.pcg_threshold[None]
+        if qd.static(fem_config.requires_grad):
+            is_first_residual = True
+            if qd.static(not is_adjoint):
+                is_first_residual = fem_state.solve_loops.n_newton_left[()] == fem_info.n_newton_iterations[None]
+            if is_first_residual:
+                fem_state.envs_solve.rTr_threshold[i_b] = fem_info.pcg_threshold_rel[None] * rTr
+            rTr_threshold = fem_state.envs_solve.rTr_threshold[i_b]
+        is_pcg_active = is_active and rTr > rTr_threshold
+        fem_state.envs_solve.is_pcg_active[i_b] = is_pcg_active
+        if is_pcg_active:
+            pcg_counter[()] = 1
+
+
+@qd.func
+def func_init_pcg(
+    f: int,
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+    is_adjoint: qd.template(),
+):
+    pcg_counter[()] = 0
+    n_threads = qd.static(fem_config.env_block_dim)
+    qd.loop_config(block_dim=qd.static(n_threads if n_threads > 1 else None))
+    for i_flat in range(fem_state.envs_solve.is_active.shape[0] * n_threads):
+        sh_sum = qd.simt.block.SharedArray((2, qd.static(fem_config.n_block_tiles)), gs.qd_float)
+        i_b = i_flat // n_threads
+        i_t = i_flat % n_threads
+        func_init_pcg_env(f, i_b, i_t, sh_sum, pcg_counter, fem_state, fem_info, fem_config, is_adjoint)
+    fem_state.solve_loops.n_pcg_left[()] = fem_info.n_pcg_iterations[None]
+
+
+@qd.func
+def func_update_pcg_env(
+    i_b: int,
+    i_t: int,
+    sh_sum: qd.Tensor,
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+    update_loop_flag: qd.template(),
+):
+    """Run the step of a PCG iteration of an environment past its Ap on its block of threads (see 'func_block_sum')."""
+    n_threads = qd.static(fem_config.env_block_dim)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    is_active = fem_state.envs_solve.is_pcg_active[i_b]
+    rTz = fem_state.envs_solve.rTz[i_b]
+
+    # pTAp, then x, r, z and the new rTr, rTz
+    pTAp = gs.qd_float(0.0)
+    if is_active:
+        for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+            i_v = i_v_ * n_threads + i_t
+            if i_v < n_vertices:
+                pTAp = pTAp + fem_state.vertices_solve.p[i_v, i_b].dot(fem_state.vertices_solve.Ap[i_v, i_b])
+    pTAp = func_block_sum(i_t, values=qd.Vector([pTAp]), sh_sum=sh_sum, fem_config=fem_config)[0]
+    alpha = gs.qd_float(0.0)
+    rTr_new = gs.qd_float(0.0)
+    rTz_new = gs.qd_float(0.0)
+    if is_active:
+        alpha = rTz / pTAp
+        for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+            i_v = i_v_ * n_threads + i_t
+            if i_v < n_vertices:
+                p = fem_state.vertices_solve.p[i_v, i_b]
+                r = fem_state.vertices_solve.r[i_v, i_b] - alpha * fem_state.vertices_solve.Ap[i_v, i_b]
+                z = fem_state.vertices_solve.prec[i_v, i_b] @ r
+                fem_state.vertices_solve.x[i_v, i_b] = fem_state.vertices_solve.x[i_v, i_b] + alpha * p
+                fem_state.vertices_solve.r[i_v, i_b] = r
+                fem_state.vertices_solve.z[i_v, i_b] = z
+                rTr_new = rTr_new + r.dot(r)
+                rTz_new = rTz_new + r.dot(z)
+    rTr_new, rTz_new = func_block_sum(i_t, values=qd.Vector([rTr_new, rTz_new]), sh_sum=sh_sum, fem_config=fem_config)
+
+    # Convergence check, then the new search direction
+    rTr_threshold = fem_info.pcg_threshold[None]
+    if qd.static(fem_config.requires_grad):
+        rTr_threshold = fem_state.envs_solve.rTr_threshold[i_b]
+    is_still_active = is_active and rTr_new > rTr_threshold
+    beta = gs.qd_float(0.0)
+    if is_still_active:
+        beta = rTz_new / rTz
+        for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+            i_v = i_v_ * n_threads + i_t
+            if i_v < n_vertices:
+                fem_state.vertices_solve.p[i_v, i_b] = (
+                    fem_state.vertices_solve.z[i_v, i_b] + beta * fem_state.vertices_solve.p[i_v, i_b]
+                )
+    if i_t == 0:
+        if is_still_active:
+            fem_state.envs_solve.rTr[i_b] = rTr_new
+            fem_state.envs_solve.rTz[i_b] = rTz_new
+            if qd.static(update_loop_flag):
+                if fem_state.solve_loops.n_pcg_left[()] > 0:
+                    pcg_counter[()] = 1
+        fem_state.envs_solve.is_pcg_active[i_b] = is_still_active
+
+
+@qd.func
+def func_pcg_iter(
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    func_accumulate_vertices(
+        f=0,
+        forces=None,
+        envs_is_active=fem_state.envs_solve.is_pcg_active,
+        pcg_counter=pcg_counter,
+        fem_state=fem_state,
+        fem_info=fem_info,
+        vertex_constraints=vertex_constraints,
+        fem_config=fem_config,
+        gather_Ap=True,
+        gather_internal_force=False,
+        update_loop_flag=True,
+    )
+    n_threads = qd.static(fem_config.env_block_dim)
+    qd.loop_config(block_dim=qd.static(n_threads if n_threads > 1 else None))
+    for i_flat in range(fem_state.envs_solve.is_active.shape[0] * n_threads):
+        sh_sum = qd.simt.block.SharedArray((2, qd.static(fem_config.n_block_tiles)), gs.qd_float)
+        i_b = i_flat // n_threads
+        i_t = i_flat % n_threads
+        func_update_pcg_env(i_b, i_t, sh_sum, pcg_counter, fem_state, fem_info, fem_config, update_loop_flag=True)
+
+
+@qd.func
+def func_pcg_solve_per_env_block(
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Run the whole PCG solve of an environment by one block of threads.
+
+    The threads synchronize between the steps of an iteration within the kernel (see 'is_pcg_solved_per_env_block').
+    """
+    n_threads = qd.static(fem_config.env_block_dim)
+    n_lanes = qd.static(2**fem_config.log2_corner_lanes)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    qd.loop_config(block_dim=n_threads)
+    for i_flat in range(fem_state.envs_solve.is_active.shape[0] * n_threads):
+        i_b = i_flat // n_threads
+        i_t = i_flat % n_threads
+        sh_sum = qd.simt.block.SharedArray((2, qd.static(fem_config.n_block_tiles)), gs.qd_float)
+        for _ in range(fem_info.n_pcg_iterations[None]):
+            # Every thread of the block reads the flag behind the barrier that follows its last write
+            if not fem_state.envs_solve.is_pcg_active[i_b]:
+                break
+            for i_item_ in range((n_vertices * n_lanes + n_threads - 1) // n_threads):
+                i_item = i_item_ * n_threads + i_t
+                func_accumulate_vertex(
+                    f=0,
+                    i_b=i_b,
+                    i_v=i_item // n_lanes,
+                    i_lane=i_item % n_lanes,
+                    forces=None,
+                    envs_is_active=fem_state.envs_solve.is_pcg_active,
+                    fem_state=fem_state,
+                    fem_info=fem_info,
+                    vertex_constraints=vertex_constraints,
+                    fem_config=fem_config,
+                    gather_Ap=True,
+                    gather_internal_force=False,
+                    clip_vertex=True,
+                )
+            qd.simt.grid.mem_fence()
+            qd.simt.block.sync()
+            func_update_pcg_env(i_b, i_t, sh_sum, pcg_counter, fem_state, fem_info, fem_config, update_loop_flag=False)
+            qd.simt.grid.mem_fence()
+            qd.simt.block.sync()
+
+
+@qd.func
+def func_pcg_solve(
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    if qd.static(fem_config.is_pcg_solved_per_env_block):
+        func_pcg_solve_per_env_block(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+    else:
+        while qd.graph.do_while(pcg_counter):
+            func_pcg_iter(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+
+
+@qd.func
+def func_env_energy_part(
+    f: int,
+    i_b: int,
+    i_t: int,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    fem_config: qd.template(),
+    add_damping_alpha: qd.template(),
+):
+    """
+    Return the part of the incremental energy of an environment that a thread of its block sums (see 'func_block_sum').
+
+    The energy sums the inertia of the vertices, plus their Rayleigh mass damping if `add_damping_alpha` holds, then the
+    energy of the elements as computed last (see 'func_linesearch_iter').
+    """
+    n_threads = qd.static(fem_config.env_block_dim)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    n_elements = fem_info.elements.V.shape[0]
+    energy = gs.qd_float(0.0)
+    for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+        i_v = i_v_ * n_threads + i_t
+        if i_v < n_vertices:
+            mass_over_dt2 = fem_info.vertices.mass_over_dt2[i_v]
+            pos = fem_state.vertices.pos[f + 1, i_v, i_b]
+            diff = pos - fem_state.vertices_energy.inertia[i_v, i_b]
+            energy = energy + 0.5 * mass_over_dt2 * diff.dot(diff)
+            if qd.static(add_damping_alpha and fem_config.has_damping_alpha):
+                diff = pos - fem_state.vertices.pos[f, i_v, i_b]
+                energy = energy + 0.5 * mass_over_dt2 * diff.dot(diff) * fem_info.damping_alpha_dt[None]
+    for i_e_ in range((n_elements + n_threads - 1) // n_threads):
+        i_e = i_e_ * n_threads + i_t
+        if i_e < n_elements:
+            energy = energy + fem_state.elements_energy.energy[i_e, i_b] * fem_info.elements.V[i_e]
+    return energy
+
+
+@qd.func
+def func_init_linesearch(
+    f: int, linesearch_counter: qd.Tensor, fem_state: FEMState, fem_info: FEMInfo, fem_config: qd.template()
+):
+    linesearch_counter[()] = 0
+    n_threads = qd.static(fem_config.env_block_dim)
+    n_vertices = fem_info.vertices.mass.shape[0]
+    qd.loop_config(block_dim=qd.static(n_threads if n_threads > 1 else None))
+    for i_flat in range(fem_state.envs_solve.is_active.shape[0] * n_threads):
+        i_b = i_flat // n_threads
+        i_t = i_flat % n_threads
+        sh_sum = qd.simt.block.SharedArray((2, qd.static(fem_config.n_block_tiles)), gs.qd_float)
+        is_active = fem_state.envs_solve.is_active[i_b]
+        prev_energy = gs.qd_float(0.0)
+        m = gs.qd_float(0.0)
+        if is_active:
+            for i_v_ in range((n_vertices + n_threads - 1) // n_threads):
+                i_v = i_v_ * n_threads + i_t
+                if i_v < n_vertices:
+                    fem_state.vertices_solve.x_prev[i_v, i_b] = fem_state.vertices.pos[f + 1, i_v, i_b]
+                    m = m - fem_state.vertices_solve.x[i_v, i_b].dot(fem_state.vertices_energy.force[i_v, i_b])
+            prev_energy = func_env_energy_part(f, i_b, i_t, fem_state, fem_info, fem_config, add_damping_alpha=False)
+        prev_energy, m = func_block_sum(i_t, values=qd.Vector([prev_energy, m]), sh_sum=sh_sum, fem_config=fem_config)
+        if i_t == 0:
+            fem_state.envs_solve.is_linesearch_active[i_b] = is_active
+            if is_active:
+                linesearch_counter[()] = 1
+                fem_state.envs_solve.prev_energy[i_b] = prev_energy
+                fem_state.envs_solve.step_size[i_b] = 1.0
+                fem_state.envs_solve.m[i_b] = m
+    fem_state.solve_loops.n_linesearch_left[()] = fem_info.n_linesearch_iterations[None]
+
+
+@qd.func
+def func_linesearch_iter(
+    f: int,
+    linesearch_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    _B = fem_state.envs_solve.is_active.shape[0]
+    for i_v, i_b in qd.ndrange(*fem_state.vertices_solve.x.shape, axes=qd.static(eoa(fem_state.vertices_solve.x))):
+        # A line search iteration starts here: its loop flag drops until an environment iterates on
+        if i_b == 0 and i_v == 0:
+            linesearch_counter[()] = 0
+            fem_state.solve_loops.n_linesearch_left[()] = fem_state.solve_loops.n_linesearch_left[()] - 1
+        if fem_state.envs_solve.is_linesearch_active[i_b]:
+            fem_state.vertices.pos[f + 1, i_v, i_b] = (
+                fem_state.vertices_solve.x_prev[i_v, i_b]
+                + fem_state.envs_solve.step_size[i_b] * fem_state.vertices_solve.x[i_v, i_b]
+            )
+
+    # The energy of each element of the environments the line search runs, its linearized damping included
+    for i_e, i_b in qd.ndrange(
+        *fem_state.elements_energy.energy.shape, axes=qd.static(eoa(fem_state.elements_energy.energy))
+    ):
+        if fem_state.envs_solve.is_linesearch_active[i_b]:
+            J, F = func_element_J_F(f=f + 1, i_e=i_e, i_b=i_b, fem_state=fem_state, fem_info=fem_info)
+            actu = fem_state.elements.actu[f, i_e, i_b]
+            energy = func_element_energy(i_e, i_b, J, F, actu, fem_state, fem_info, fem_config)
+            if qd.static(fem_config.has_damping_beta):
+                S = func_element_mapping_matrix(i_e, i_b, fem_info, vertex_constraints, fem_config)
+                x = func_element_displacement(f, i_e, i_b, fem_state, fem_info)
+                dF, dP = func_elastic_product(i_e, i_b, S, x, fem_state, fem_info, fem_config)
+                energy = energy + 0.5 * fem_info.damping_beta_over_dt[None] * (dF * dP).sum()
+            fem_state.elements_energy.energy[i_e, i_b] = energy
+
+    n_threads = qd.static(fem_config.env_block_dim)
+    qd.loop_config(block_dim=qd.static(n_threads if n_threads > 1 else None))
+    for i_flat in range(_B * n_threads):
+        i_b = i_flat // n_threads
+        i_t = i_flat % n_threads
+        sh_sum = qd.simt.block.SharedArray((2, qd.static(fem_config.n_block_tiles)), gs.qd_float)
+        is_active = fem_state.envs_solve.is_linesearch_active[i_b]
+        energy = gs.qd_float(0.0)
+        if is_active:
+            energy = func_env_energy_part(f, i_b, i_t, fem_state, fem_info, fem_config, add_damping_alpha=True)
+        energy = func_block_sum(i_t, values=qd.Vector([energy]), sh_sum=sh_sum, fem_config=fem_config)[0]
+
+        if i_t == 0 and is_active:
+            step_size = fem_state.envs_solve.step_size[i_b]
+            is_still_active = (
+                energy
+                > fem_state.envs_solve.prev_energy[i_b]
+                + fem_info.linesearch_c[None] * step_size * fem_state.envs_solve.m[i_b]
+            )
+            fem_state.envs_solve.is_linesearch_active[i_b] = is_still_active
+            if is_still_active:
+                if fem_state.solve_loops.n_linesearch_left[()] > 0:
+                    linesearch_counter[()] = 1
+                fem_state.envs_solve.step_size[i_b] = step_size * fem_info.linesearch_tau[None]
+
+
+@qd.func
+def func_skip_linesearch(f: int, fem_state: FEMState, fem_info: FEMInfo):
+    for i_v, i_b in qd.ndrange(*fem_state.vertices_solve.x.shape, axes=qd.static(eoa(fem_state.vertices_solve.x))):
+        if fem_state.envs_solve.is_active[i_b]:
+            fem_state.vertices.pos[f + 1, i_v, i_b] = (
+                fem_state.vertices.pos[f + 1, i_v, i_b] + fem_state.vertices_solve.x[i_v, i_b]
+            )
+
+
+@qd.func
+def func_newton_head(
+    f: int,
+    pcg_counter: qd.Tensor,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """Compute the energy gradient, force and preconditioner of a Newton iteration, then the first PCG residual."""
+    for i_e, i_b in qd.ndrange(
+        *fem_state.elements_energy.energy.shape, axes=qd.static(eoa(fem_state.elements_energy.energy))
+    ):
+        if fem_state.envs_solve.is_active[i_b]:
+            energy, gradient = func_element_energy_gradient_damped(
+                f, i_e, i_b, fem_state, fem_info, vertex_constraints, fem_config
+            )
+            fem_state.elements_energy.energy[i_e, i_b] = energy
+            fem_state.elements_energy.gradient[i_e, i_b] = gradient
+    func_accumulate_vertices(
+        f,
+        forces=None,
+        envs_is_active=fem_state.envs_solve.is_active,
+        pcg_counter=pcg_counter,
+        fem_state=fem_state,
+        fem_info=fem_info,
+        vertex_constraints=vertex_constraints,
+        fem_config=fem_config,
+        gather_Ap=False,
+        gather_internal_force=False,
+        update_loop_flag=False,
+    )
+    func_init_pcg(f, pcg_counter, fem_state, fem_info, fem_config, is_adjoint=False)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_batch_solve(
+    f: int,
+    newton_counter: qd.types.ndarray(qd.i32, ndim=0),
+    pcg_counter: qd.types.ndarray(qd.i32, ndim=0),
+    linesearch_counter: qd.types.ndarray(qd.i32, ndim=0),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Run the Newton iterations of a substep of the implicit solver.
+
+    Each iteration solves its linear system by PCG, then searches its step along the solution.
+    """
+    newton_counter[()] = 1
+    fem_state.solve_loops.n_newton_left[()] = fem_info.n_newton_iterations[None]
+    # FIXME: quadrants#1083 - the statements before a graph do_while run again on every pass when the loop body
+    # opens with bare statements, so each loop body opens with a for loop.
+    while qd.graph.do_while(newton_counter):
+        func_newton_head(f, pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+        func_pcg_solve(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+        if qd.static(fem_config.has_linesearch):
+            func_init_linesearch(f, linesearch_counter, fem_state, fem_info, fem_config)
+            while qd.graph.do_while(linesearch_counter):
+                func_linesearch_iter(f, linesearch_counter, fem_state, fem_info, vertex_constraints, fem_config)
+        else:
+            func_skip_linesearch(f, fem_state, fem_info)
+        fem_state.solve_loops.n_newton_left[()] = fem_state.solve_loops.n_newton_left[()] - 1
+        if fem_state.solve_loops.n_newton_left[()] <= 0:
+            newton_counter[()] = 0
+
+
+@qd.func
+def func_seed_force_adjoint(fem_state: FEMState):
+    for i_v, i_b in qd.ndrange(
+        *fem_state.vertices_energy.force.shape, axes=qd.static(eoa(fem_state.vertices_energy.force))
+    ):
+        fem_state.vertices_energy.force.grad[i_v, i_b] = fem_state.vertices_solve.x[i_v, i_b]
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_solve_adjoint(
+    f: int,
+    pcg_counter: qd.types.ndarray(qd.i32, ndim=0),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """Run the adjoint solve of a substep, which seeds the adjoint of the forces (see '_implicit_solve_grad')."""
+    func_init_pcg(f, pcg_counter, fem_state, fem_info, fem_config, is_adjoint=True)
+    func_pcg_solve(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+    func_seed_force_adjoint(fem_state)
+
+
+@qd.kernel(fastcache=True)
+def kernel_solve_stage(
+    f: int,
+    pcg_counter: qd.types.ndarray(qd.i32, ndim=0),
+    linesearch_counter: qd.types.ndarray(qd.i32, ndim=0),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+    stage: qd.template(),
+):
+    """
+    Run a stage of the implicit solve of a substep, or of its adjoint solve (see 'FEMSolver._solve_on_host').
+
+    The adjoint solve seeds the adjoint of the forces with its solution (see '_implicit_solve_grad').
+    """
+    if qd.static(stage == FEMSolveStage.INIT_NEWTON):
+        fem_state.solve_loops.n_newton_left[()] = fem_info.n_newton_iterations[None]
+    if qd.static(stage == FEMSolveStage.END_NEWTON):
+        fem_state.solve_loops.n_newton_left[()] = fem_state.solve_loops.n_newton_left[()] - 1
+    if qd.static(stage == FEMSolveStage.NEWTON_HEAD):
+        func_newton_head(f, pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+    if qd.static(stage == FEMSolveStage.INIT_ADJOINT):
+        func_init_pcg(f, pcg_counter, fem_state, fem_info, fem_config, is_adjoint=True)
+    if qd.static(stage == FEMSolveStage.PCG_ITER):
+        if qd.static(fem_config.is_pcg_solved_per_env_block):
+            func_pcg_solve_per_env_block(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+        else:
+            func_pcg_iter(pcg_counter, fem_state, fem_info, vertex_constraints, fem_config)
+    if qd.static(stage == FEMSolveStage.SEED_ADJOINT):
+        func_seed_force_adjoint(fem_state)
+    if qd.static(stage == FEMSolveStage.INIT_LINESEARCH):
+        func_init_linesearch(f, linesearch_counter, fem_state, fem_info, fem_config)
+    if qd.static(stage == FEMSolveStage.LINESEARCH_ITER):
+        func_linesearch_iter(f, linesearch_counter, fem_state, fem_info, vertex_constraints, fem_config)
+    if qd.static(stage == FEMSolveStage.SKIP_LINESEARCH):
+        func_skip_linesearch(f, fem_state, fem_info)
+
+
+@qd.kernel
+def kernel_compute_implicit_force(
+    f: int,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Compute the forces at the end of a substep of the implicit solver, whose autodiff alone runs (see
+    '_implicit_solve_grad').
+
+    The elements scatter their forces, which autodiff reverses, where the solve gathers.
+    """
+    for i_e, i_b in qd.ndrange(
+        *fem_state.elements_energy.energy.shape, axes=qd.static(eoa(fem_state.elements_energy.energy))
+    ):
+        _, gradient = func_element_energy_gradient_damped(
+            f, i_e, i_b, fem_state, fem_info, vertex_constraints, fem_config
+        )
+        i_vs = fem_info.elements.el2v[i_e]
+        S = func_element_mapping_matrix(i_e, i_b, fem_info, vertex_constraints, fem_config)
+        force = -fem_info.elements.V[i_e] * gradient @ S.transpose()
+        for i_k in qd.static(range(4)):
+            qd.atomic_add(fem_state.vertices_energy.force[i_vs[i_k], i_b], force[:, i_k])
+    for i_v, i_b in qd.ndrange(
+        *fem_state.vertices_energy.force.shape, axes=qd.static(eoa(fem_state.vertices_energy.force))
+    ):
+        qd.atomic_add(
+            fem_state.vertices_energy.force[i_v, i_b],
+            func_vertex_inertia_force(f, i_v, i_b, fem_state, fem_info, vertex_constraints, fem_config),
+        )
+
+
+@qd.kernel(fastcache=True)
+def kernel_material_data_grad(
+    f: int,
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """
+    Carry the adjoint of the data the materials compute from the start of the substep to the start positions, element
+    by element.
+
+    The forces seeded with lambda pull on that data (see '_implicit_solve_grad').
+    """
+    for i_e, i_b in qd.ndrange(*fem_state.elements.actu.shape[1:], axes=qd.static(eoa(fem_state.elements.actu))):
+        i_vs = fem_info.elements.el2v[i_e]
+        S = func_element_mapping_matrix(i_e, i_b, fem_info, vertex_constraints, fem_config)
+        # The forces -V * gradient @ S^T on the vertices dotted with lambda give <gradient, -V * lambda @ S>
+        vertices_lambda = qd.Matrix.cols(
+            [fem_state.vertices_energy.force.grad[i_vs[i_k], i_b] for i_k in qd.static(range(4))]
+        )
+        gradient_grad = -fem_info.elements.V[i_e] * vertices_lambda @ S
+        _, F_start = func_element_J_F(f, i_e, i_b, fem_state, fem_info)
+        _, F = func_element_J_F(f=f + 1, i_e=i_e, i_b=i_b, fem_state=fem_state, fem_info=fem_info)
+        dF_damping = qd.Matrix.zero(gs.qd_float, 3, 3)
+        if qd.static(fem_config.has_damping_beta):
+            dF_damping = (
+                fem_info.damping_beta_over_dt[None] * func_element_displacement(f, i_e, i_b, fem_state, fem_info) @ S
+            )
+        actu = fem_state.elements.actu[f, i_e, i_b]
+        F_start_grad = func_element_precompute_grad(
+            i_e, i_b, F_start, F, dF_damping, gradient_grad, actu, fem_state, fem_info, fem_config
+        )
+        # F_start = D B, D holding the positions of the first three vertices relative to the last in its columns
+        D_grad = F_start_grad @ fem_info.elements.B[i_e].transpose()
+        for i_k in qd.static(range(3)):
+            qd.atomic_add(fem_state.vertices.pos.grad[f, i_vs[i_k], i_b], D_grad[:, i_k])
+        qd.atomic_add(fem_state.vertices.pos.grad[f, i_vs[3], i_b], -D_grad[:, 0] - D_grad[:, 1] - D_grad[:, 2])
+
+
+@qd.kernel(fastcache=True)
+def kernel_setup_pos_vel(f: int, fem_state: FEMState, fem_info: FEMInfo):
+    """Set the velocities of the vertices at the end of a substep of the implicit solver from their displacement."""
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.vel))):
+        fem_state.vertices.vel[f + 1, i_v, i_b] = (
+            fem_state.vertices.pos[f + 1, i_v, i_b] - fem_state.vertices.pos[f, i_v, i_b]
+        ) / fem_info.substep_dt[None]
+
+
+@qd.kernel(fastcache=True)
+def kernel_copy_frame(source: int, target: int, fem_state: FEMState):
+    for i_v, i_b in qd.ndrange(*fem_state.vertices.pos.shape[1:], axes=qd.static(eoa(fem_state.vertices.pos))):
+        fem_state.vertices.pos[target, i_v, i_b] = fem_state.vertices.pos[source, i_v, i_b]
+        fem_state.vertices.vel[target, i_v, i_b] = fem_state.vertices.vel[source, i_v, i_b]
+
+
+@qd.kernel(fastcache=True)
+def kernel_get_forces(
+    f: int,
+    forces: qd.types.ndarray(),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    vertex_constraints: FEMVertexConstraints,
+    fem_config: qd.template(),
+):
+    """Gather the internal elastic force on every vertex, one row per environment."""
+    func_accumulate_vertices(
+        f,
+        forces,
+        envs_is_active=None,
+        pcg_counter=None,
+        fem_state=fem_state,
+        fem_info=fem_info,
+        vertex_constraints=vertex_constraints,
+        fem_config=fem_config,
+        gather_Ap=False,
+        gather_internal_force=True,
+        update_loop_flag=False,
+    )
+
+
+# ------------------------------------------------------------------------------------
+# --------------------------------------- io -----------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.func
+def func_add_vertices_and_surfaces(
+    v_start: int,
+    el_start: int,
+    s_start: int,
+    mass: float,
+    friction_mu: float,
+    verts: qd.types.ndarray(),
+    tri2v: qd.types.ndarray(),
+    tri2el: qd.types.ndarray(),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+):
+    """
+    Add the vertices of an entity at rest and its surface triangles.
+
+    The vertices start with mass `mass` and friction coefficient `friction_mu`, and the triangles reference the elements
+    `tri2el` offset by `el_start`.
+    """
+    for i_v_, i_b in qd.ndrange(
+        verts.shape[0], fem_state.vertices.pos.shape[2], axes=qd.static(eoa(fem_state.vertices.pos))
+    ):
+        i_v = i_v_ + v_start
+        fem_state.vertices.pos[0, i_v, i_b] = qd.Vector([verts[i_v_, 0], verts[i_v_, 1], verts[i_v_, 2]])
+        fem_state.vertices.vel[0, i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+
+    for i_v_ in range(verts.shape[0]):
+        i_v = i_v_ + v_start
+        fem_info.vertices.mass[i_v] = mass
+        fem_info.vertices.mass_over_dt2[i_v] = 0.0
+        fem_info.vertices.friction_mu[i_v] = friction_mu
+
+    for i_s_ in range(tri2v.shape[0]):
+        i_s = i_s_ + s_start
+        fem_info.surfaces.tri2v[i_s] = qd.Vector(
+            [tri2v[i_s_, i_k] + v_start for i_k in qd.static(range(3))], dt=gs.qd_int
+        )
+        fem_info.surfaces.tri2el[i_s] = tri2el[i_s_] + el_start
+
+
+@qd.kernel(fastcache=True)
+def kernel_add_elements(
+    v_start: int,
+    el_start: int,
+    s_start: int,
+    model: int,
+    mu: float,
+    lam: float,
+    rho: float,
+    friction_mu: float,
+    muscle_stiffness: float,
+    verts: qd.types.ndarray(),
+    elems: qd.types.ndarray(),
+    tri2v: qd.types.ndarray(),
+    tri2el: qd.types.ndarray(),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+    is_muscle: bool,
+):
+    """Add the vertices, elements and surface triangles of an entity at rest, with the parameters of its material."""
+    func_add_vertices_and_surfaces(
+        v_start, el_start, s_start, 0.0, friction_mu, verts, tri2v, tri2el, fem_state, fem_info
+    )
+
+    for i_e_ in range(elems.shape[0]):
+        i_e = i_e_ + el_start
+        i_vs = qd.Vector([elems[i_e_, i_k] + v_start for i_k in qd.static(range(4))], dt=gs.qd_int)
+        pos_d = fem_state.vertices.pos[0, i_vs[3], 0]
+        B_inv = qd.Matrix.cols([fem_state.vertices.pos[0, i_vs[i_k], 0] - pos_d for i_k in qd.static(range(3))])
+        fem_info.elements.B[i_e] = B_inv.inverse()
+        det = B_inv.determinant()
+        # The determinant is negative for vertices in the expected order
+        if det >= 0.0:
+            fem_info.has_inverted_elements[()] = True
+        V = qd.abs(det) / 6.0
+        fem_info.elements.V[i_e] = V
+        fem_info.elements.el2v[i_e] = i_vs
+        fem_info.elements.model[i_e] = model
+        fem_info.elements.mu[i_e] = mu
+        fem_info.elements.lam[i_e] = lam
+        fem_info.elements.friction_mu[i_e] = friction_mu
+        fem_info.elements.mass_scaled[i_e] = rho * V * fem_info.vol_scale[None]
+        fem_info.elements.is_muscle[i_e] = is_muscle
+        fem_info.elements.muscle_stiffness[i_e] = muscle_stiffness
+        fem_info.elements.muscle_group[i_e] = 0
+        fem_info.elements.muscle_direction[i_e] = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+
+    # The elements add their mass to their vertices in order, so the vertex masses are reproducible bitwise
+    qd.loop_config(serialize=True)
+    for i_e_ in range(elems.shape[0]):
+        i_e = i_e_ + el_start
+        mass = 0.25 * rho * fem_info.elements.V[i_e]
+        for i_k in qd.static(range(4)):
+            i_v = fem_info.elements.el2v[i_e][i_k]
+            fem_info.vertices.mass[i_v] = fem_info.vertices.mass[i_v] + mass
+            fem_info.vertices.mass_over_dt2[i_v] = fem_info.vertices.mass_over_dt2[i_v] + mass * fem_info.dt2_inv[None]
+
+    for i_v_ in range(verts.shape[0]):
+        i_v = i_v_ + v_start
+        fem_info.vertices.mass_inv[i_v] = 1.0 / fem_info.vertices.mass[i_v]
+
+    for i_e_, i_b in qd.ndrange(
+        elems.shape[0], fem_state.vertices.pos.shape[2], axes=qd.static(eoa(fem_state.elements.actu))
+    ):
+        fem_state.elements.actu[0, i_e_ + el_start, i_b] = 0.0
+
+
+@qd.kernel(fastcache=True)
+def kernel_add_cloth(
+    v_start: int,
+    s_start: int,
+    verts: qd.types.ndarray(),
+    tri2v: qd.types.ndarray(),
+    tri2el: qd.types.ndarray(),
+    fem_state: FEMState,
+    fem_info: FEMInfo,
+):
+    """Add the vertices and surface triangles of a cloth entity, each triangle being its own element."""
+    func_add_vertices_and_surfaces(v_start, s_start, s_start, 1.0, 0.0, verts, tri2v, tri2el, fem_state, fem_info)
+
+
+@qd.kernel(fastcache=True)
+def kernel_add_vverts(
+    vvert_start: int,
+    vface_start: int,
+    v_start: int,
+    verts_idx: qd.types.ndarray(),
+    uvs: qd.types.ndarray(element_dim=1),
+    vfaces: qd.types.ndarray(element_dim=1),
+    fem_info: FEMInfo,
+):
+    for i_vv_ in range(verts_idx.shape[0]):
+        fem_info.vverts_vert_idx[i_vv_ + vvert_start] = verts_idx[i_vv_] + v_start
+    for i_vv_ in range(uvs.shape[0]):
+        fem_info.vverts_uvs[i_vv_ + vvert_start] = uvs[i_vv_]
+    for i_vf_ in range(vfaces.shape[0]):
+        fem_info.vfaces_indices[i_vf_ + vface_start] = vfaces[i_vf_] + vvert_start
+
+
+@qd.kernel(fastcache=True)
+def kernel_update_vverts_render(f: int, fem_state: FEMState, fem_info: FEMInfo):
+    """Move the visual vertices to the position of the simulated vertex each one stands for, in single precision."""
+    for i_vv, i_b in qd.ndrange(*fem_state.vverts_render.pos.shape, axes=qd.static(eoa(fem_state.vverts_render.pos))):
+        i_v = fem_info.vverts_vert_idx[i_vv]
+        fem_state.vverts_render.pos[i_vv, i_b] = qd.cast(fem_state.vertices.pos[f, i_v, i_b], qd.f32)
+
+
+# ------------------------------------------------------------------------------------
+# -------------------------------- vertex constraints --------------------------------
+# ------------------------------------------------------------------------------------
+
+
+@qd.kernel(fastcache=True)
+def kernel_clear_vertex_constraints(vertex_constraints: FEMVertexConstraints):
+    for i_v, i_b in qd.ndrange(
+        *vertex_constraints.is_constrained.shape, axes=qd.static(eoa(vertex_constraints.is_constrained))
+    ):
+        vertex_constraints.is_constrained[i_v, i_b] = False
+        vertex_constraints.link_idx[i_v, i_b] = -1
+
+
+@qd.kernel(fastcache=True)
+def kernel_set_vertex_constraints(
+    verts_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    link_idx: int,
+    stiffness: float,
+    target_poss: qd.types.ndarray(),
+    link_init_pos: qd.types.ndarray(),
+    link_init_quat: qd.types.ndarray(),
+    fem_state: FEMState,
+    vertex_constraints: FEMVertexConstraints,
+    is_soft_constraint: bool,
+):
+    """Constrain some vertices, those following a link keeping their offset to where it stands."""
+    for i_v_, i_b_ in qd.ndrange(
+        verts_idx.shape[1], envs_idx.shape[0], axes=qd.static(eoa(vertex_constraints.is_constrained))
+    ):
+        i_b = envs_idx[i_b_]
+        i_v = verts_idx[i_b_, i_v_]
+        # The earlier occurrences of a repeated vertex are -1 (see 'drop_repeated_index'). Between two steps, the state
+        # sits in frame 0 (see 'Solver.has_frames').
+        if i_v >= 0:
+            vertex_constraints.is_constrained[i_v, i_b] = True
+            vertex_constraints.is_soft_constraint[i_v, i_b] = is_soft_constraint
+            vertex_constraints.stiffness[i_v, i_b] = stiffness
+            vertex_constraints.link_idx[i_v, i_b] = link_idx
+            vertex_constraints.target_pos[i_v, i_b] = qd.Vector(
+                [target_poss[i_b_, i_v_, 0], target_poss[i_b_, i_v_, 1], target_poss[i_b_, i_v_, 2]]
+            )
+            vertex_constraints.link_offset_pos[i_v, i_b] = fem_state.vertices.pos[0, i_v, i_b] - qd.Vector(
+                [link_init_pos[i_b_, 0], link_init_pos[i_b_, 1], link_init_pos[i_b_, 2]]
+            )
+            vertex_constraints.link_init_quat[i_v, i_b] = qd.Vector(
+                [link_init_quat[i_b_, 0], link_init_quat[i_b_, 1], link_init_quat[i_b_, 2], link_init_quat[i_b_, 3]]
+            )
+
+
+@qd.kernel(fastcache=True)
+def kernel_remove_vertex_constraints(
+    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), vertex_constraints: FEMVertexConstraints
+):
+    for i_v_, i_b_ in qd.ndrange(
+        verts_idx.shape[1], envs_idx.shape[0], axes=qd.static(eoa(vertex_constraints.is_constrained))
+    ):
+        i_b = envs_idx[i_b_]
+        i_v = verts_idx[i_b_, i_v_]
+        vertex_constraints.is_constrained[i_v, i_b] = False

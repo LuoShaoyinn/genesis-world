@@ -3,7 +3,9 @@
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
+from genesis.engine.bvh import BVHTreeState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo, RigidErrorCode
+from .data import ConstraintState
 import genesis.utils.geom as gu
 from genesis.utils.raycast_qd import bvh_ray_cast
 from ..abd.forward_dynamics import func_vel_at_point
@@ -12,7 +14,7 @@ from ..abd.misc import func_apply_coupling_force
 
 @qd.func
 def func_remove_dynamic_equality(
-    i_e, i_b, constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo,
+    i_e, i_b, constraint_state: ConstraintState, dyn_info: DynInfo,
 ):
     """Swap-remove a dynamic equality, including all soft-weld state."""
     last = constraint_state.qd_n_equalities[i_b] - 1
@@ -34,7 +36,7 @@ def func_remove_dynamic_equality(
 @qd.func
 def func_set_weld_anchors(
     i_e, i_b, link1_idx, link2_idx, anchor1, anchor2,
-    dyn_state: array_class.DynState, dyn_info: array_class.DynInfo,
+    dyn_state: DynState, dyn_info: DynInfo,
 ):
     """Store world-space attachment points in their respective link frames."""
     pos1 = gu.qd_inv_transform_by_trans_quat(
@@ -55,9 +57,9 @@ def func_init_weld_record(
     link1_idx,
     link2_idx,
     eq_type,
-    dyn_state: array_class.DynState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
 ):
     """Capture the links' current relative pose for either dynamic weld type."""
     shared_pos = dyn_state.links.pos[link1_idx, i_b]
@@ -80,10 +82,10 @@ def kernel_request_suction_weld(
     envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(),
     stiffness: qd.types.ndarray(), damping: qd.types.ndarray(), max_wrench: qd.types.ndarray(),
     max_cast_distance: qd.f32,
-    tree_a: array_class.BVHTreeState, tree_env_a: qd.types.ndarray(),
-    tree_b: array_class.BVHTreeState, tree_env_b: qd.types.ndarray(), has_tree_b: qd.template(),
-    dyn_state: array_class.DynState, constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
+    tree_a: BVHTreeState, tree_env_a: qd.types.ndarray(),
+    tree_b: BVHTreeState, tree_env_b: qd.types.ndarray(), has_tree_b: qd.template(),
+    dyn_state: DynState, constraint_state: ConstraintState,
+    dyn_info: DynInfo, rigid_info: RigidInfo,
     rigid_config: qd.template(), errno: qd.Tensor,
 ):
     qd.loop_config(serialize=rigid_config.para_level < gs.PARA_LEVEL.ALL)
@@ -123,7 +125,7 @@ def kernel_request_suction_weld(
                 if i_e < 0:
                     i_e = constraint_state.qd_n_equalities[i_b]
                     if i_e == rigid_info.n_candidate_equalities[None]:
-                        errno[i_b] = errno[i_b] | array_class.ErrorCode.OVERFLOW_DYNAMIC_EQUALITIES
+                        errno[i_b] = errno[i_b] | RigidErrorCode.OVERFLOW_DYNAMIC_EQUALITIES
                     else:
                         constraint_state.qd_n_equalities[i_b] = i_e + 1
                 if i_e < rigid_info.n_candidate_equalities[None]:
@@ -142,7 +144,7 @@ def kernel_request_suction_weld(
 @qd.kernel(fastcache=True)
 def kernel_get_suction_welded(
     envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), out: qd.types.ndarray(),
-    constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
+    constraint_state: ConstraintState, dyn_info: DynInfo, rigid_info: RigidInfo,
 ):
     for i in range(envs_idx.shape[0]):
         b, frame = envs_idx[i], links_idx[i]
@@ -156,8 +158,8 @@ def kernel_get_suction_welded(
 @qd.kernel(fastcache=True)
 def kernel_get_suction_wrench(
     envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(), ghost_force: qd.types.ndarray(),
-    out: qd.types.ndarray(), constraint_state: array_class.ConstraintState,
-    dyn_state: array_class.DynState, dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo,
+    out: qd.types.ndarray(), constraint_state: ConstraintState,
+    dyn_state: DynState, dyn_info: DynInfo, rigid_info: RigidInfo,
 ):
     for i in range(envs_idx.shape[0]):
         b, frame = envs_idx[i], links_idx[i]
@@ -187,7 +189,7 @@ def kernel_get_suction_wrench(
 
 @qd.func
 def func_update_soft_weld_wrenches(
-    i_b, dyn_state: array_class.DynState, constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo
+    i_b, dyn_state: DynState, constraint_state: ConstraintState, dyn_info: DynInfo
 ):
     # Equality rows are first in the solve. Keep a broken record (rather
     # than moving records here) so the current substep's solved forces and
@@ -253,8 +255,8 @@ def func_update_soft_weld_wrenches(
 @qd.kernel(fastcache=True)
 def kernel_release_suction(
     envs_idx: qd.types.ndarray(), links_idx: qd.types.ndarray(),
-    constraint_state: array_class.ConstraintState, dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    constraint_state: ConstraintState, dyn_info: DynInfo,
+    rigid_info: RigidInfo,
 ):
     for i in range(envs_idx.shape[0]):
         b, frame = envs_idx[i], links_idx[i]
@@ -274,10 +276,10 @@ def kernel_release_suction(
 def kernel_apply_suction_ghost_spring(
     frame: qd.i32, max_cast_distance: qd.f32,
     stiffness: qd.types.ndarray(), damping: qd.types.ndarray(), ghost_force: qd.types.ndarray(),
-    tree_a: array_class.BVHTreeState, tree_env_a: qd.types.ndarray(),
-    tree_b: array_class.BVHTreeState, tree_env_b: qd.types.ndarray(), has_tree_b: qd.template(),
-    dyn_state: array_class.DynState, constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo, rigid_info: array_class.RigidInfo, rigid_config: qd.template(),
+    tree_a: BVHTreeState, tree_env_a: qd.types.ndarray(),
+    tree_b: BVHTreeState, tree_env_b: qd.types.ndarray(), has_tree_b: qd.template(),
+    dyn_state: DynState, constraint_state: ConstraintState,
+    dyn_info: DynInfo, rigid_info: RigidInfo, rigid_config: qd.template(),
 ):
     for b in range(ghost_force.shape[0]):
         for axis in qd.static(range(3)):

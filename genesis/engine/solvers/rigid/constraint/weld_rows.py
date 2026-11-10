@@ -3,7 +3,9 @@
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
+from genesis.engine.bvh import BVHTreeState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo, RigidErrorCode
+from .data import ConstraintState
 import genesis.utils.geom as gu
 
 
@@ -11,10 +13,10 @@ import genesis.utils.geom as gu
 def func_equality_weld(
     i_b: int,
     i_e: int,
-    dyn_state: array_class.DynState,
-    constraint_state: array_class.ConstraintState,
-    dyn_info: array_class.DynInfo,
-    rigid_info: array_class.RigidInfo,
+    dyn_state: DynState,
+    constraint_state: ConstraintState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
     rigid_config: qd.template(),
     func_equality_jdotv: qd.template(),
     _append_relevant_dof: qd.template(),

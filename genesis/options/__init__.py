@@ -11,10 +11,8 @@ from .solvers import (
     PBDOptions,
     RigidOptions,
     SAPCouplerOptions,
-    SFOptions,
     SimOptions,
     SPHOptions,
-    ToolOptions,
 )
 from .vis import ViewerOptions, VisOptions
 
@@ -32,10 +30,8 @@ __all__ = [
     "RigidOptions",
     "SAPCouplerOptions",
     "SceneOptions",
-    "SFOptions",
     "SimOptions",
     "SPHOptions",
-    "ToolOptions",
     "ViewerOptions",
     "VisOptions",
 ]

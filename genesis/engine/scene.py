@@ -10,8 +10,9 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
+from collections.abc import Callable, Iterable
 from functools import cached_property
-from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, BinaryIO, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -24,10 +25,9 @@ import genesis.utils.mesh as mu
 from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
-from genesis.engine.materials.base import EntityT, Material
+from genesis.engine.materials.base import Material
 from genesis.engine.states.solvers import SimState, SimulatorCheckpoint
 from genesis.options import (
-    SceneOptions,
     BaseCouplerOptions,
     FEMOptions,
     KinematicOptions,
@@ -35,10 +35,9 @@ from genesis.options import (
     PBDOptions,
     ProfilingOptions,
     RigidOptions,
-    SFOptions,
+    SceneOptions,
     SimOptions,
     SPHOptions,
-    ToolOptions,
     ViewerOptions,
     VisOptions,
 )
@@ -50,7 +49,7 @@ from genesis.recorders import RecorderManager
 from genesis.recorders.trajectory import Trajectory, save_checkpoint
 from genesis.repr_base import RBC
 from genesis.utils import serialization
-from genesis.utils.array_class import DataItem, check_data
+from genesis.utils.data import DataItem, Namespace, check_data, namespace
 from genesis.utils.misc import sanitize_index, tensor_to_array
 from genesis.utils.serialization import ARRAY_MEMBER, MANIFEST_NAME, pixel_less_textures
 from genesis.utils.tools import RunningMean
@@ -62,7 +61,7 @@ if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity import RigidEntity
     from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.simulator import Simulator
-    from genesis.options.sensors.options import SensorOptions, SensorT
+    from genesis.options.sensors.options import SensorOptions
     from genesis.recorders import Recorder
 
 
@@ -148,8 +147,6 @@ class Scene(RBC):
     ----------
     sim_options : gs.options.SimOptions
         The options configuring the overarching `simulator`, which in turn manages all the solvers.
-    tool_options : gs.options.ToolOptions
-        The options configuring the tool_solver (``scene.sim.ToolSolver``).
     rigid_options : gs.options.RigidOptions
         The options configuring the rigid_solver (``scene.sim.RigidSolver``).
     mpm_options : gs.options.MPMOptions
@@ -158,8 +155,6 @@ class Scene(RBC):
         The options configuring the sph_solver (``scene.sim.SPHSolver``).
     fem_options : gs.options.FEMOptions
         The options configuring the fem_solver (``scene.sim.FEMSolver``).
-    sf_options : gs.options.SFOptions
-        The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
     coupler_options : gs.options.CouplerOptions
@@ -182,13 +177,11 @@ class Scene(RBC):
     def __init__(
         self,
         sim_options: SimOptions | None = None,
-        tool_options: ToolOptions | None = None,
         rigid_options: RigidOptions | None = None,
         kinematic_options: KinematicOptions | None = None,
         mpm_options: MPMOptions | None = None,
         sph_options: SPHOptions | None = None,
         fem_options: FEMOptions | None = None,
-        sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
         vis_options: VisOptions | None = None,
@@ -204,13 +197,11 @@ class Scene(RBC):
 
         individual_options = (
             sim_options,
-            tool_options,
             rigid_options,
             kinematic_options,
             mpm_options,
             sph_options,
             fem_options,
-            sf_options,
             pbd_options,
             coupler_options,
             vis_options,
@@ -225,13 +216,11 @@ class Scene(RBC):
         else:
             self.options = SceneOptions(
                 sim=sim_options,
-                tool=tool_options,
                 rigid=rigid_options,
                 kinematic=kinematic_options,
                 mpm=mpm_options,
                 sph=sph_options,
                 fem=fem_options,
-                sf=sf_options,
                 pbd=pbd_options,
                 coupler=coupler_options,
                 vis=vis_options,
@@ -246,8 +235,10 @@ class Scene(RBC):
         # description
         self._desc = SceneDescription(options=self.options)
 
-        # simulator
-        self._sim = Simulator(scene=self, options=self.options)
+        # simulator, its components opting in the data of one another within the namespace of the scene (see Namespace)
+        self._namespace = Namespace("scene")
+        with namespace(self._namespace):
+            self._sim = Simulator(scene=self, options=self.options)
         # The smoothed step rate the log reports, and the steps and stepping time of the sample being gathered
         self._step_rate_mean = RunningMean(alpha=self.options.profiling.FPS_tracker_alpha)
         self._n_sample_steps = 0
@@ -299,6 +290,9 @@ class Scene(RBC):
             if getattr(self, "_sim", None) is not None:
                 self._sim.destroy()
                 self._sim = None
+                # The opt-in requests of the namespace hold callables bound to the components of the simulator, which
+                # would keep its data alive with the scene (see 'opt_in').
+                self._namespace = None
 
                 # Reference cycles leave the Quadrants arrays of the simulator to a later garbage collection, which
                 # aborts the process if it runs on a thread without their CUDA context, e.g. the viewer render thread.
@@ -320,7 +314,7 @@ class Scene(RBC):
     ) -> "RigidEntity": ...
 
     @overload
-    def add_entity(
+    def add_entity[EntityT: "Entity"](
         self,
         morph: Morph | Iterable[Morph],
         material: Material[EntityT] = ...,
@@ -395,7 +389,7 @@ class Scene(RBC):
         if vis_mode is not None:
             surface.vis_mode = vis_mode
         # validate and populate default surface.vis_mode considering morph type
-        if isinstance(material, (gs.materials.Kinematic, gs.materials.Tool)):
+        if isinstance(material, gs.materials.Kinematic):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
@@ -420,15 +414,6 @@ class Scene(RBC):
                 surface.vis_mode = "particle"
 
             if surface.vis_mode not in ("particle", "recon"):
-                gs.raise_exception(
-                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
-                )
-
-        elif isinstance(material, gs.materials.SF.Smoke):
-            if surface.vis_mode is None:
-                surface.vis_mode = "particle"
-
-            if surface.vis_mode not in ("particle",):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
@@ -496,7 +481,7 @@ class Scene(RBC):
 
         Returns
         -------
-        entities : List[genesis.Entity]
+        entities : list[genesis.Entity]
             The created entities.
         """
         if not isinstance(morph, gs.morphs.USD):
@@ -594,7 +579,7 @@ class Scene(RBC):
         self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
 
     @gs.assert_unbuilt
-    def add_sensor(self, sensor_options: "SensorOptions[SensorT]") -> "SensorT":
+    def add_sensor[SensorT: "Sensor"](self, sensor_options: "SensorOptions[SensorT]") -> SensorT:
         """
         Add a sensor to the scene.
 
@@ -605,7 +590,8 @@ class Scene(RBC):
         sensor_options : SensorOptions
             The options for the sensor.
         """
-        return self._sim._sensor_manager.create_sensor(sensor_options)
+        with namespace(self._namespace):
+            return self._sim._sensor_manager.create_sensor(sensor_options)
 
     @gs.assert_built
     def read_sensors(self, envs_idx=None) -> "dict[type[Sensor], torch.Tensor]":
@@ -622,7 +608,7 @@ class Scene(RBC):
 
         Returns
         -------
-        dict[Type[Sensor], torch.Tensor]
+        dict[type[Sensor], torch.Tensor]
             For each sensor class present in the scene, a tensor of shape (B, [history,] class_cache_size).
         """
         return self._sim._sensor_manager.read_sensors(entity_idx=None, envs_idx=envs_idx)
@@ -879,8 +865,8 @@ class Scene(RBC):
         with gs.logger.timer(f"Building scene ~~~<{self._uid}>~~~..."):
             self._parallelize(n_envs, env_spacing, n_envs_per_row, center_envs_at_origin)
 
-            # simulator
-            self._sim.build()
+            with namespace(self._namespace):
+                self._sim.build()
 
             # reset state
             self._reset()
@@ -889,15 +875,14 @@ class Scene(RBC):
 
         with gs.logger.timer("Compiling simulation kernels..."):
             self._sim.step()
-            if self._sim.rigid_solver.is_active:
-                try:
-                    self._sim.rigid_solver.check_errno()
-                except gs.GenesisException as e:
-                    gs.logger.warning(
-                        "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
-                        "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will fail "
-                        f"with: {e}"
-                    )
+            try:
+                self._sim.check_errno()
+            except gs.GenesisException as e:
+                gs.logger.warning(
+                    "The initial state is invalid. Register a valid one with 'scene.reset(state)', or overwrite it "
+                    "manually following 'scene.build' and every call to 'scene.reset()', otherwise stepping will fail "
+                    f"with: {e}"
+                )
             self._reset()
 
         # visualizer
@@ -993,7 +978,7 @@ class Scene(RBC):
                     self._init_state = state
             self._sim.reset(state, envs_idx)
         else:
-            self._init_state = self._get_state()
+            self._init_state = self._sim.get_state()
         self._restart()
 
     def _restart(self, refresh_viewer=True):
@@ -1015,10 +1000,11 @@ class Scene(RBC):
         """
         Differentiates `loss` through the recorded rollout and restores the pre-backward physics state.
 
-        Unrolling the gradient tape rewinds the physics state to step 0, so this method snapshots the current state
-        first, runs the backward pass, and restores the snapshot afterwards. The scene then sits at the same physics
-        state as before the call, with gradients populated and forward / backward re-armed, ready to continue the
-        rollout or to be reset. The registered initial state (`reset()` with no argument) is preserved.
+        The backward pass of each step restores the state the step started from, which rewinds the physics state to the
+        first step the loss reaches, so this method snapshots the current state first, runs the backward pass, and
+        restores the snapshot afterwards. The scene then sits at the same physics state as before the call, with
+        gradients populated and forward / backward re-armed, ready to continue the rollout or to be reset. The
+        registered initial state (`reset()` with no argument) is preserved.
 
         Parameters
         ----------
@@ -1031,32 +1017,32 @@ class Scene(RBC):
         snapshot : SimState
             The physics state the scene was restored to.
         """
-        # Snapshot the current state before the gradient-tape unroll rewinds physics to step 0. The clocks go with
-        # it: the unroll winds them down step by step, and the restore below puts the physics back where they were.
-        snapshot = self.get_state()
+        # Snapshot the current state before the backward pass rewinds the physics. The clocks go with it: the backward
+        # pass of each step winds them down, and the restore below puts the physics back where they were.
+        snapshot = self._sim.get_state()
         steps = self._sim._steps.clone()
         # The autograd nodes of the steps unroll the rollout within this backward pass (see genesis.grad.bridge).
         torch.autograd.backward(loss, *args, **kwargs)
         # keep_init semantics: see _reset. Restoring the snapshot puts the physics back where the forward pass left
-        # it, so the clocks snapshotted above are put back with it rather than left at zero.
+        # it, and the clocks snapshotted above with it.
         self._reset(snapshot, keep_init=True)
         self._sim._steps[:] = steps
         return snapshot
 
-    def _get_state(self):
-        return self._sim.get_state()
-
     @gs.assert_built
     def get_state(self):
         """
-        Returns the current state of the scene.
+        Returns the current state of the scene, which 'reset' restores.
+
+        It holds what every solver steps from, as a copy outside of the autograd graph of a differentiable rollout. The
+        getters of the entities query the state with gradients.
 
         Returns
         -------
         state : genesis.SimState
             The state of the scene at the current time step.
         """
-        return self._get_state()
+        return self._sim.get_state()
 
     def register_pre_step_callback(self, callback):
         """Register a callback invoked at the start of each ``step()``, on the stepping thread. A callback
@@ -1082,7 +1068,8 @@ class Scene(RBC):
                 gs.raise_exception("Forward simulation not allowed after backward pass. Please reset scene state.")
             # The recorders read the state a step starts from, with the inputs the step consumes: 'Simulator.step'
             # zeroes the applied forces at its end. The pre-step callbacks ran, so their inputs are read as well.
-            with step_timer.phase("recorders"):
+            # The recorders read the state for themselves, outside of the autograd graph of a differentiable rollout
+            with step_timer.phase("recorders"), torch.no_grad():
                 self._recorder_manager.step(self._sim.cur_step_global)
             self._sim.step()
 
@@ -1115,6 +1102,21 @@ class Scene(RBC):
                     )
                 else:
                     gs.logger.info(f"Running at ~<{rate:.2f}>~ FPS.")
+
+    @gs.assert_built
+    def get_error_envs_mask(self) -> torch.Tensor:
+        """
+        Return whether each environment flagged an error since its last reset, such as an overflow of contacts or a 'nan'.
+
+        A flagged error raises at the beginning of the next step, before anything else, until it is cleared: by resetting
+        the state of the environment, or with 'clear_errno'.
+        """
+        return self._sim.get_error_envs_mask()
+
+    @gs.assert_built
+    def clear_errno(self, envs_idx=None):
+        """Clear the errors flagged for the given environments, all of them if None (see 'get_error_envs_mask')."""
+        self._sim.clear_errno(envs_idx)
 
     def stop_recording(self):
         # The recorders read before each step, so the state the last step left is recorded here, whatever the
@@ -1569,7 +1571,7 @@ class Scene(RBC):
         # callback. Every solver holds the same force fields, so one solver names them all.
         rejected_kinds = Counter(type(entity).__name__ for entity in self.entities if entity.desc is None)
         rejected_kinds.update(type(emitter).__name__ for emitter in self._emitters)
-        rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields)
+        rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields.fields)
         omitted_kinds = Counter(type(sensor).__name__ for sensor in self._sim._sensor_manager.sensors)
         if self._visualizer is not None:
             omitted_kinds.update(type(camera).__name__ for camera in self._visualizer.cameras)
@@ -1816,8 +1818,8 @@ class Scene(RBC):
         The scene must be built from the description the state was read from, with the same environment layout, since
         the arrays written back are the ones that build allocates. A state from another layout is rejected, and a state
         from another build by the names of the arrays that differ. Everything around the state restarts as under
-        'reset': the gradient tape, the sensors and the recorders forget the run that led here, and the visualizer
-        redraws, the interactive viewer when a refresh is due.
+        'reset': the autograd graph of the rollout, the sensors and the recorders forget the run that led here, and the
+        visualizer redraws, the interactive viewer when a refresh is due.
 
         Parameters
         ----------
@@ -2027,11 +2029,6 @@ class Scene(RBC):
     def emitters(self):
         """All the emitters in the scene."""
         return self._emitters
-
-    @property
-    def tool_solver(self):
-        """The scene's `tool_solver`, managing all the `ToolEntity` in the scene."""
-        return self._sim.tool_solver
 
     @property
     def rigid_solver(self):

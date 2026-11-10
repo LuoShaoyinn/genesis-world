@@ -1,15 +1,16 @@
 """Linear bounding volume hierarchies (LBVH) over sets of axis-aligned boxes: build and box queries.
 
 A set holds one tree per batch over the same number of leaves. The caller writes the box of each leaf into the state,
-builds the set, and traverses the trees it gets back (see BVHTreeState in array_class). The build follows
+builds the set, and traverses the trees it gets back (see BVHTreeState). The build follows
 Karras (2012, "Maximizing Parallelism in the Construction of BVHs, Octrees, and k-d Trees").
 
 A leaf carries two indices: i_a names it by its box, in the order the caller wrote them, and i_leaf by its slot in the
 sorted order the tree is laid out in, the one leaves_idx maps back to i_a.
 """
 
+import dataclasses
 import math
-import os
+from enum import IntEnum
 from typing import NamedTuple
 
 import quadrants as qd
@@ -17,8 +18,129 @@ from quadrants.algorithms import sort as radix_sort
 from quadrants.algorithms import sort_scratch_slots
 
 import genesis as gs
-import genesis.utils.array_class as array_class
+from genesis.utils.data import Config, Data, DataKind, Size, field
 from genesis.utils.misc import get_gpu_core_count
+
+
+class BVH_SORT_KIND(IntEnum):
+    """The sort ordering the leaf keys of a set of BVH trees."""
+
+    # The device-wide radix sort of quadrants over every key of the set (GPU, large trees)
+    DEVICE_RADIX = 0
+    # The rank of each leaf among the keys of its tree (small trees)
+    RANK = 1
+    # A radix sort per tree, its chunks in parallel (CPU, large trees)
+    PER_TREE_RADIX = 2
+
+
+class BVH_FIT_KIND(IntEnum):
+    """The bottom-up fit of the node boxes of a set of BVH trees."""
+
+    # One thread per leaf walking to the root, the arrival counters sequentially consistent (CPU)
+    LEAF_WALK = 0
+    # The leaf walk with a device fence on each side of the relaxed arrival atomic (GPU)
+    FENCED_LEAF_WALK = 1
+    # One block per tree sweeping the nodes level by level, every barrier uniform (Metal, see quadrants#925)
+    BLOCK_SWEEP = 2
+
+
+class BVHConfig(Config):
+    """The compile-time shape of a set of linear bounding volume hierarchies (LBVH).
+
+    A leaf key packs the tree, the morton code and the leaf index in that order, so one flat sort orders every tree.
+    """
+
+    # The bits of a morton code, three interleaved coordinates of the same width
+    morton_bits: int
+    # The bits a sort must order, a multiple of 16 up to 64
+    end_bit: int
+    # Scan depth of the device-wide radix sort (see quadrants.algorithms.sort), 1 to 8
+    log256_max_n: int
+    # BVH_SORT_KIND
+    sort_kind: int
+    # BVH_FIT_KIND
+    fit_kind: int
+    # SORT_MAX_CHUNKS capped by the CPU threads of quadrants
+    sort_max_chunks: int
+
+
+# Sizes of a set of linear bounding volume hierarchies (LBVH): its trees, the leaves of each tree, the slots of its
+# device-wide radix sort, the rows of chunk histograms of its host radix sort and the lanes of its extent reduction.
+BVH_TREES = Size("bvh_trees")
+BVH_LEAVES = Size("bvh_leaves")
+SORT_SLOTS = Size("sort_slots")
+SORT_CHUNKS = Size("sort_chunks")
+EXTENT_LANES = Size("extent_lanes")
+# The (tree, leaf, query) triplets a box query of a BVH holds
+QUERY_RESULTS = Size("query_results")
+# The scratch of each sort and fit (see BVH_SORT_KIND and BVH_FIT_KIND)
+DEVICE_RADIX_SORT = "device_radix_sort"
+PER_TREE_RADIX_SORT = "per_tree_radix_sort"
+BLOCK_SWEEP_FIT = "block_sweep_fit"
+
+
+class BVHTreeState(Data, kind=DataKind.SCRATCH, shape=(BVH_TREES, 2 * BVH_LEAVES - 1)):
+    """What a traversal reads of a set of linear bounding volume hierarchies (LBVH).
+
+    The n_leaves - 1 internal nodes come first, then the leaves, so node n_leaves - 1 + i holds the i-th sorted leaf,
+    whose index is leaves_idx[i_t, i]. A leaf node holds -1 in nodes_left.
+    """
+
+    nodes_left: qd.Tensor = field(int)
+    nodes_right: qd.Tensor = field(int)
+    nodes_min: qd.Tensor = field((float, 3))
+    nodes_max: qd.Tensor = field((float, 3))
+    leaves_idx: qd.Tensor = field(int, shape=(BVH_TREES, BVH_LEAVES))
+
+
+class BVHLeaves(Data, kind=DataKind.SCRATCH, shape=(BVH_TREES, BVH_LEAVES)):
+    """The boxes of the leaves of a set of linear bounding volume hierarchies (LBVH), written before a build."""
+
+    aabbs_min: qd.Tensor = field((float, 3))
+    aabbs_max: qd.Tensor = field((float, 3))
+
+
+class BVHState(Data, kind=DataKind.SCRATCH):
+    """The linear bounding volume hierarchies (LBVH) of a set of trees, built by func_build_bvh."""
+
+    tree: BVHTreeState
+    leaves: BVHLeaves
+    leaves_keys: qd.Tensor = field(qd.u64, shape=(BVH_TREES * BVH_LEAVES,))
+    keys_scratch: qd.Tensor = field(qd.u64, shape=(BVH_TREES * BVH_LEAVES,))
+    sort_scratch: qd.Tensor = field(qd.u32, shape=(SORT_SLOTS,), labels=DEVICE_RADIX_SORT)
+    sort_hist: qd.Tensor = field(int, shape=(SORT_CHUNKS, 256), labels=PER_TREE_RADIX_SORT)
+    n_keys: qd.Tensor = field(int, shape=())
+    nodes_parent: qd.Tensor = field(int, shape=(BVH_TREES, 2 * BVH_LEAVES - 1))
+    nodes_fitted: qd.Tensor = field(int, shape=(BVH_TREES, BVH_LEAVES - 1))
+    fit_frontier: qd.Tensor = field(int, shape=(BVH_TREES, 2, BVH_LEAVES - 1), labels=BLOCK_SWEEP_FIT)
+    lanes_min: qd.Tensor = field((float, 3), shape=(BVH_TREES, EXTENT_LANES))
+    lanes_max: qd.Tensor = field((float, 3), shape=(BVH_TREES, EXTENT_LANES))
+    trees_min: qd.Tensor = field((float, 3), shape=(BVH_TREES,))
+    trees_max: qd.Tensor = field((float, 3), shape=(BVH_TREES,))
+
+
+class BVHQueryResults(Data, kind=DataKind.SCRATCH):
+    """The (tree, leaf, query) triplets a box query of a BVH collects, and their count, above the capacity on overflow.
+
+    See func_bvh_query_aabb.
+    """
+
+    triplets: qd.Tensor = field((int, 3), shape=(QUERY_RESULTS,))
+    count: qd.Tensor = field(int, shape=(1,))
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class BVHQueryState:
+    """A box query of a set of trees: the leaves tested, the trees traversed and the pairs found.
+
+    Leaf i_q of tree i_t of 'leaves' is tested against tree i_t of 'tree' (see func_bvh_query_leaves). It holds arrays
+    of other structs, apart from its results.
+    """
+
+    leaves: BVHLeaves
+    tree: BVHTreeState
+    results: BVHQueryResults
+
 
 # Bits of a morton code: three interleaved 10-bit coordinates.
 MORTON_BITS = 30
@@ -29,30 +151,40 @@ MORTON_BITS = 30
 RANK_SORT_MAX_LEAVES_CPU = 256
 RANK_SORT_LEAVES_PER_CORE = 0.75
 # Lanes reducing the extent of one tree, each over a strided slice of its leaves, folded by one thread per tree.
-EXTENT_LANES = 64
+TREE_EXTENT_LANES = 64
 # Most chunks of the leaves of one tree the host radix sort counts and scatters in parallel (see func_build_bvh). The
-# chunks bring parallelism to a set of few trees; a set of many trees is parallel over its trees already, and every
-# chunk costs a histogram of 256 bins per pass.
+# chunks bring parallelism to a build of few trees, a build of many trees being parallel over its trees already, and
+# every chunk costs a histogram of 256 bins per pass.
 SORT_MAX_CHUNKS = 64
 
 
 class BVHData(NamedTuple):
     """A set of linear bounding volume hierarchies (LBVH): its state and the static config of its kernels."""
 
-    state: array_class.BVHState
-    config: array_class.BVHStaticConfig
+    state: BVHState
+    config: BVHConfig
 
 
-def get_bvh_data(n_trees: int, n_leaves: int, is_active: bool = True) -> BVHData:
-    """Return a set of trees, one per batch, over the same number of leaves each.
+def is_rank_sort(n_trees_built: int, n_leaves: int) -> bool:
+    """Return whether a build of BVH trees sorts its keys by rank.
 
-    A set switched off takes the empty shape on every tensor (see maybe_shape in array_class.py), for the tree a
-    kernel argument carries but a static configuration skips.
+    The build covers n_trees_built trees over n_leaves leaves each (see RANK_SORT_LEAVES_PER_CORE for the bound).
     """
-    if is_active and n_leaves < 1:
-        gs.raise_exception(f"A BVH set needs at least one leaf per tree, got {n_leaves}.")
+    if gs.backend == gs.cpu:
+        return n_leaves <= RANK_SORT_MAX_LEAVES_CPU
+    max_leaves = RANK_SORT_LEAVES_PER_CORE * get_gpu_core_count()
+    return n_trees_built * n_leaves**3 <= max_leaves**3
 
-    # The config: the bits of the leaf keys a sort orders, and the sort the backend and the tree size take
+
+def get_bvh_config(n_trees: int, n_leaves: int, n_trees_built: int | None = None) -> BVHConfig:
+    """Return the static config of a build of the first trees of a set of BVH trees.
+
+    The set holds n_trees trees over n_leaves leaves each, and the build covers its first n_trees_built trees. If None,
+    n_trees_built resolves to n_trees. Defaults to None. The bits of the keys and the scan depth of the radix sort cover
+    the whole set, while the sort kind follows the trees built, so the builds of one set differ by their sort alone.
+    """
+    if n_trees_built is None:
+        n_trees_built = n_trees
     n_keys = n_trees * n_leaves
     leaf_bits = max(1, (n_leaves - 1).bit_length())
     tree_bits = (n_trees - 1).bit_length()
@@ -65,41 +197,67 @@ def get_bvh_data(n_trees: int, n_leaves: int, is_active: bool = True) -> BVHData
     log256_max_n = 1
     while 256**log256_max_n < n_keys:
         log256_max_n += 1
-    if gs.backend == gs.cpu:
-        is_rank_sort = n_leaves <= RANK_SORT_MAX_LEAVES_CPU
-    else:
-        max_leaves = RANK_SORT_LEAVES_PER_CORE * get_gpu_core_count()
-        is_rank_sort = n_trees * n_leaves**3 <= max_leaves**3
     # Outside performance mode the radix sort serves every set, with the widest keys and a scan depth reaching any key
-    # count a device holds. The choice of the rank sort stays per set, its single pass being much faster on small trees.
+    # count a device holds. The rank sort is still chosen per build, its single pass being much faster on small trees.
     if gs.use_ndarray:
         end_bit = 64
         log256_max_n = max(log256_max_n, 4)
-    if is_rank_sort:
-        sort_kind = array_class.BVH_SORT_KIND.RANK
+    if is_rank_sort(n_trees_built, n_leaves):
+        sort_kind = BVH_SORT_KIND.RANK
     elif gs.backend == gs.cpu:
-        sort_kind = array_class.BVH_SORT_KIND.PER_TREE_RADIX
+        sort_kind = BVH_SORT_KIND.PER_TREE_RADIX
     else:
-        sort_kind = array_class.BVH_SORT_KIND.DEVICE_RADIX
+        sort_kind = BVH_SORT_KIND.DEVICE_RADIX
     # FIXME: quadrants#925 - Metal lowers a fence to a control barrier, so the leaf walk, whose fences sit in divergent
     # flow, reads stale boxes there. One block per tree sweeps the nodes level by level instead, every barrier uniform.
     if gs.backend == gs.cpu:
-        fit_kind = array_class.BVH_FIT_KIND.LEAF_WALK
+        fit_kind = BVH_FIT_KIND.LEAF_WALK
     elif gs.backend == gs.metal:
-        fit_kind = array_class.BVH_FIT_KIND.BLOCK_SWEEP
+        fit_kind = BVH_FIT_KIND.BLOCK_SWEEP
     else:
-        fit_kind = array_class.BVH_FIT_KIND.FENCED_LEAF_WALK
-    bvh_config = array_class.BVHStaticConfig(
-        morton_bits=MORTON_BITS, end_bit=end_bit, log256_max_n=log256_max_n, sort_kind=sort_kind, fit_kind=fit_kind
+        fit_kind = BVH_FIT_KIND.FENCED_LEAF_WALK
+    return BVHConfig(
+        morton_bits=MORTON_BITS,
+        end_bit=end_bit,
+        log256_max_n=log256_max_n,
+        sort_kind=sort_kind,
+        fit_kind=fit_kind,
+        sort_max_chunks=min(SORT_MAX_CHUNKS, qd.cfg.cpu_max_num_threads),
     )
 
-    # The state: the scratch of the device-wide radix sort is sized by quadrants, the lanes of the extent are fixed
-    n_sort_scratch = (
-        sort_scratch_slots(n_keys, log256_max_n) if sort_kind == array_class.BVH_SORT_KIND.DEVICE_RADIX else 0
-    )
-    n_sort_chunks = max(1, min(SORT_MAX_CHUNKS, (os.cpu_count() or 1) // n_trees))
-    bvh_state = array_class.get_bvh_state(
-        n_trees, n_leaves, n_sort_scratch, n_sort_chunks, EXTENT_LANES, bvh_config, is_active
+
+def get_bvh_data(n_trees: int, n_leaves: int, is_active: bool = True) -> BVHData:
+    """Return a set of trees, one per batch, over the same number of leaves each, and the config building all of them.
+
+    A set switched off holds placeholders alone (see 'unused' in Data), for the tree a kernel argument carries but a
+    static configuration skips. The state serves a build of any number of its first trees, each build taking the config
+    that get_bvh_config returns for the number of trees it covers.
+    """
+    if is_active and n_leaves < 1:
+        gs.raise_exception(f"A BVH set needs at least one leaf per tree, got {n_leaves}.")
+    bvh_config = get_bvh_config(n_trees, n_leaves)
+
+    # The state: the scratch of the device-wide radix sort is sized by quadrants, the histograms of the host radix sort
+    # hold the chunks of every tree built (see func_build_bvh), and the lanes of the extent are fixed.
+    n_sort_scratch = 0
+    if bvh_config.sort_kind == BVH_SORT_KIND.DEVICE_RADIX:
+        n_sort_scratch = sort_scratch_slots(n_trees * n_leaves, bvh_config.log256_max_n)
+    bvh_state = BVHState(
+        sizes=dict(
+            bvh_trees=n_trees,
+            bvh_leaves=n_leaves,
+            sort_slots=n_sort_scratch,
+            sort_chunks=n_trees * max(1, bvh_config.sort_max_chunks // n_trees),
+            extent_lanes=TREE_EXTENT_LANES,
+        ),
+        # A set switched off leaves every array unused, else the scratch of the sort and the fit it runs alone
+        unused=dict(
+            device_radix_sort=bvh_config.sort_kind != BVH_SORT_KIND.DEVICE_RADIX,
+            per_tree_radix_sort=bvh_config.sort_kind != BVH_SORT_KIND.PER_TREE_RADIX,
+            block_sweep_fit=bvh_config.fit_kind != BVH_FIT_KIND.BLOCK_SWEEP,
+        )
+        if is_active
+        else True,
     )
 
     return BVHData(bvh_state, bvh_config)
@@ -116,7 +274,7 @@ def _func_expand_bits(v: qd.u32) -> qd.u32:
 
 
 @qd.func
-def _func_delta(i_t: int, i_leaf: int, j_leaf: int, bvh_state: array_class.BVHState) -> int:
+def _func_delta(i_t: int, i_leaf: int, j_leaf: int, bvh_state: BVHState) -> int:
     """Return the common prefix length of the keys of two sorted leaves, -1 when the second one is out of range."""
     n_leaves = bvh_state.leaves.aabbs_min.shape[1]
     delta = -1
@@ -129,7 +287,7 @@ def _func_delta(i_t: int, i_leaf: int, j_leaf: int, bvh_state: array_class.BVHSt
 
 
 @qd.func
-def _func_fit_ancestors(i_t: int, i_leaf: int, bvh_state: array_class.BVHState, bvh_config: qd.template()):
+def _func_fit_ancestors(i_t: int, i_leaf: int, bvh_state: BVHState, bvh_config: qd.template()):
     """Walk from a sorted leaf to the root, fitting each node whose two children are fitted.
 
     The leaves of a tree walk at once. The second child to arrive at a node fits it and goes on, the first one stops,
@@ -146,10 +304,10 @@ def _func_fit_ancestors(i_t: int, i_leaf: int, bvh_state: array_class.BVHState, 
             break
         # The box of this node must be visible to the sibling's thread before the arrival it may win: a device fence
         # on each side of the relaxed atomic of the GPU, the sequentially consistent atomic alone on the CPU
-        if qd.static(bvh_config.fit_kind == array_class.BVH_FIT_KIND.FENCED_LEAF_WALK):
+        if qd.static(bvh_config.fit_kind == BVH_FIT_KIND.FENCED_LEAF_WALK):
             qd.simt.grid.mem_fence()
         n_arrived = qd.atomic_add(bvh_state.nodes_fitted[i_t, i_parent], 1)
-        if qd.static(bvh_config.fit_kind == array_class.BVH_FIT_KIND.FENCED_LEAF_WALK):
+        if qd.static(bvh_config.fit_kind == BVH_FIT_KIND.FENCED_LEAF_WALK):
             qd.simt.grid.mem_fence()
         if n_arrived == 0:
             break
@@ -165,9 +323,7 @@ def _func_fit_ancestors(i_t: int, i_leaf: int, bvh_state: array_class.BVHState, 
 
 
 @qd.func
-def _func_push_fit_parent(
-    i_t: int, i_n: int, i_next: int, is_active: bool, sh_frontier_count, bvh_state: array_class.BVHState
-):
+def _func_push_fit_parent(i_t: int, i_n: int, i_next: int, is_active: bool, sh_frontier_count, bvh_state: BVHState):
     """Count the arrival of a node at its parent, and push the parent into the next frontier on the second arrival.
 
     An inactive lane takes part with a zero increment, so that every lane of the block runs the same atomics.
@@ -186,7 +342,7 @@ def _func_push_fit_parent(
 
 
 @qd.func
-def _func_fit_tree_block(i_t: int, i_lane: int, bvh_state: array_class.BVHState, block_dim: int):
+def _func_fit_tree_block(i_t: int, i_lane: int, bvh_state: BVHState, block_dim: int):
     """Fit the node boxes of a tree by one block of threads, sweeping a frontier of ready nodes up the tree.
 
     A round fits the nodes both children of which were fitted by earlier rounds and pushes their parents, on their
@@ -240,13 +396,16 @@ def _func_fit_tree_block(i_t: int, i_lane: int, bvh_state: array_class.BVHState,
 
 
 @qd.func
-def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), eps: float):
-    """Build every tree of the set from the boxes of its leaves, at the top level of a kernel.
+def func_build_bvh(n_trees: int, bvh_state: BVHState, bvh_config: qd.template(), eps: float):
+    """Build the first trees of the set from the boxes of their leaves, at the top level of a kernel.
 
     The passes run in order: the extent of each tree, the morton key of each leaf, the sort of the keys, the leaf index
-    of each sorted slot, the radix tree and the node boxes.
+    of each sorted slot, the radix tree and the node boxes. The build covers n_trees trees, under the config
+    get_bvh_config returns for that number of trees built.
     """
-    n_trees, n_leaves = bvh_state.leaves.aabbs_min.shape
+    n_leaves = bvh_state.leaves.aabbs_min.shape[1]
+    # The device-wide radix sort reads its key count on the device
+    bvh_state.n_keys[()] = n_trees * n_leaves
 
     # Extent of each tree over its leaf centers: each lane folds a strided slice of the leaves, then one thread per
     # tree folds the lanes, so the reduction needs no floating-point atomic
@@ -293,7 +452,7 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
         ) | key
 
     # Sort of the keys, every key unique through its leaf bits so the order is total
-    if qd.static(bvh_config.sort_kind == array_class.BVH_SORT_KIND.DEVICE_RADIX):
+    if qd.static(bvh_config.sort_kind == BVH_SORT_KIND.DEVICE_RADIX):
         radix_sort(
             bvh_state.leaves_keys,
             bvh_state.keys_scratch,
@@ -306,7 +465,7 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
             end_bit=qd.static(bvh_config.end_bit),
             log256_max_n=qd.static(bvh_config.log256_max_n),
         )
-    elif qd.static(bvh_config.sort_kind == array_class.BVH_SORT_KIND.RANK):
+    elif qd.static(bvh_config.sort_kind == BVH_SORT_KIND.RANK):
         # Each leaf ranks itself among the keys of its tree
         for i_t, i_a in qd.ndrange(n_trees, n_leaves):
             key = bvh_state.leaves_keys[i_t * n_leaves + i_a]
@@ -322,13 +481,17 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
         # split over chunks: the chunks count their digits and scatter their keys in parallel, one thread per tree
         # turning the counts into offsets in between. The passes ping-pong between the keys and the scratch and end
         # in the keys. The passes unroll statically: a loop of the kernel is parallel at its top level alone, so a
-        # runtime loop over the passes would serialize the chunks.
-        n_sort_chunks = bvh_state.sort_hist.shape[1]
+        # runtime loop over the passes would serialize the chunks. Row i_h of sort_hist holds the histogram of chunk i_c
+        # of tree i_t, and a build of fewer trees than the set splits the same rows into more chunks.
+        n_sort_chunks = qd.max(
+            1, qd.min(qd.static(bvh_config.sort_max_chunks), bvh_state.sort_hist.shape[0] // n_trees)
+        )
         for i_pass in qd.static(range(qd.static(bvh_config.end_bit) // 8)):
             shift = 8 * i_pass
             for i_t, i_c in qd.ndrange(n_trees, n_sort_chunks):
+                i_h = i_t * n_sort_chunks + i_c
                 for i_d in range(256):
-                    bvh_state.sort_hist[i_t, i_c, i_d] = 0
+                    bvh_state.sort_hist[i_h, i_d] = 0
                 for i_a in range(i_c * n_leaves // n_sort_chunks, (i_c + 1) * n_leaves // n_sort_chunks):
                     key = qd.u64(0)
                     if qd.static(i_pass % 2 == 0):
@@ -336,15 +499,17 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
                     else:
                         key = bvh_state.keys_scratch[i_t * n_leaves + i_a]
                     digit = qd.i32((key >> shift) & qd.u64(0xFF))
-                    bvh_state.sort_hist[i_t, i_c, digit] += 1
+                    bvh_state.sort_hist[i_h, digit] = bvh_state.sort_hist[i_h, digit] + 1
             for i_t in range(n_trees):
                 total = 0
                 for i_d in range(256):
                     for i_c in range(n_sort_chunks):
-                        count = bvh_state.sort_hist[i_t, i_c, i_d]
-                        bvh_state.sort_hist[i_t, i_c, i_d] = total
+                        i_h = i_t * n_sort_chunks + i_c
+                        count = bvh_state.sort_hist[i_h, i_d]
+                        bvh_state.sort_hist[i_h, i_d] = total
                         total += count
             for i_t, i_c in qd.ndrange(n_trees, n_sort_chunks):
+                i_h = i_t * n_sort_chunks + i_c
                 for i_a in range(i_c * n_leaves // n_sort_chunks, (i_c + 1) * n_leaves // n_sort_chunks):
                     key = qd.u64(0)
                     if qd.static(i_pass % 2 == 0):
@@ -352,8 +517,8 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
                     else:
                         key = bvh_state.keys_scratch[i_t * n_leaves + i_a]
                     digit = qd.i32((key >> shift) & qd.u64(0xFF))
-                    slot = bvh_state.sort_hist[i_t, i_c, digit]
-                    bvh_state.sort_hist[i_t, i_c, digit] = slot + 1
+                    slot = bvh_state.sort_hist[i_h, digit]
+                    bvh_state.sort_hist[i_h, digit] = slot + 1
                     if qd.static(i_pass % 2 == 0):
                         bvh_state.keys_scratch[i_t * n_leaves + slot] = key
                     else:
@@ -413,7 +578,7 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
         bvh_state.nodes_parent[i_t, i_right] = i_n
 
     # Node boxes, bottom-up from the leaves (see BVH_FIT_KIND for the regimes)
-    if qd.static(bvh_config.fit_kind == array_class.BVH_FIT_KIND.BLOCK_SWEEP):
+    if qd.static(bvh_config.fit_kind == BVH_FIT_KIND.BLOCK_SWEEP):
         FIT_BLOCK_DIM = qd.static(128)
         qd.loop_config(block_dim=FIT_BLOCK_DIM)
         for i_flat in range(n_trees * FIT_BLOCK_DIM):
@@ -424,12 +589,12 @@ def func_build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), e
 
 
 @qd.kernel(fastcache=True)
-def build_bvh(bvh_state: array_class.BVHState, bvh_config: qd.template(), eps: float):
+def build_bvh(bvh_state: BVHState, bvh_config: qd.template(), eps: float):
     """Build every tree of the set from the boxes of its leaves.
 
     The kernel runs func_build_bvh for a caller outside a kernel.
     """
-    func_build_bvh(bvh_state, bvh_config, eps)
+    func_build_bvh(bvh_state.leaves.aabbs_min.shape[0], bvh_state, bvh_config, eps)
 
 
 @qd.func
@@ -444,8 +609,8 @@ def func_bvh_query_aabb(
     i_q: int,
     query_min,
     query_max,
-    bvh_tree_state: array_class.BVHTreeState,
-    query_results: array_class.BVHQueryResults,
+    bvh_tree_state: BVHTreeState,
+    query_results: BVHQueryResults,
     filter: qd.template(),
     filter_ctx: qd.template(),
 ):
@@ -487,7 +652,7 @@ def func_bvh_query_aabb(
 
 
 @qd.func
-def func_bvh_query_leaves(query_state: array_class.BVHQueryState, filter: qd.template(), filter_ctx: qd.template()):
+def func_bvh_query_leaves(query_state: BVHQueryState, filter: qd.template(), filter_ctx: qd.template()):
     """Query every leaf box of a set against the tree of the same index in another set.
 
     See func_bvh_query_aabb for the results and their overflow.

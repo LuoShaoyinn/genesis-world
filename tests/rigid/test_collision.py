@@ -35,7 +35,7 @@ def _ellipsoid_mjcf_path(tmp_path, semi_axes):
     return str(path)
 
 
-@pytest.mark.required
+@pytest.mark.required("sparse")
 @pytest.mark.mujoco_compatibility(False)
 @pytest.mark.parametrize("mode", range(9))
 @pytest.mark.parametrize("model_name", ["collision_edge_cases"])
@@ -1313,8 +1313,7 @@ def test_contact_forces(show_viewer):
     assert torch.quantile(torch.cat(all_errors), 0.95) < 2e-4
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("gjk_collision", [True, False])
+@pytest.mark.parametrize("gjk_collision", [True, pytest.param(False, marks=pytest.mark.required)])
 def test_contact_pruning(gjk_collision, show_viewer):
     GEOM_HALF_SIZE = 0.1
     MARGIN = 1e-4
@@ -1625,15 +1624,14 @@ def test_contact_pruning_authored_decomp(gjk_collision, show_viewer):
         assert is_vertical and is_pruned
 
 
-@pytest.mark.required
 @pytest.mark.parametrize(
     "model_name",
     [
         "side_by_side_capsules",
-        "collinear_capsules",
-        "side_by_side_cylinders",
+        pytest.param("collinear_capsules", marks=pytest.mark.required),
+        pytest.param("side_by_side_cylinders", marks=pytest.mark.required),
         "collinear_cylinders",
-        "collinear_spheres",
+        pytest.param("collinear_spheres", marks=pytest.mark.required),
     ],
 )
 def test_contact_pruning_degenerated_hull(model_name, xml_path, show_viewer):
@@ -1740,8 +1738,6 @@ def test_num_contact_overflow(
     show_viewer,
     caplog,
 ):
-    from genesis.engine.simulator import RATE_CHECK_ERRNO
-
     N_BOWLS = 4
     rigid_options = gs.options.RigidOptions(
         max_collision_pairs=max_collision_pairs,
@@ -1788,6 +1784,7 @@ def test_num_contact_overflow(
 
     with caplog.at_level("WARNING"):
         scene.build()
+    qposs_init = [entity.get_qpos() for entity in scene.entities[1:]]
     log_text = " ".join(record.getMessage() for record in caplog.records)
     if is_warned_by_build is not None:
         assert ("The initial state is invalid" in log_text) is is_warned_by_build
@@ -1814,11 +1811,46 @@ def test_num_contact_overflow(
     )
     assert solver.constraint_solver.len_constraints == expected_len_constraints
 
-    # errno is only polled every RATE_CHECK_ERRNO substeps, so one extra step is required to guarantee that an
-    # error triggered by the first steps gets raised.
+    # An error flagged by a step raises at the beginning of the next step on CPU, and at worst of the one after it on
+    # GPU, where the check may not block, so an error flagged by the first step raises within that many steps. The
+    # other errors, whose phase is left unpinned, raise within the window over which the bowls pile up.
+    n_steps_raise = 2 if gs.backend == gs.cpu else 3
     with nullcontext() if error_pattern is None else pytest.raises(gs.GenesisException, match=error_pattern):
-        for _ in range(RATE_CHECK_ERRNO + 1):
+        for _ in range(n_steps_raise if is_warned_by_build else 15):
             scene.step()
+
+    if error_pattern is not None:
+        # Setting a valid state clears the error, so the simulation proceeds once the bodies are lifted apart in the air
+        assert scene.get_error_envs_mask().all()
+        for i, entity in enumerate(scene.entities[1:]):
+            entity.set_qpos([3.0 * i, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0])
+        assert not scene.get_error_envs_mask().any()
+        for _ in range(n_steps_raise):
+            scene.step()
+
+        # A training loop resets the envs a step flagged right after it, so that the next step proceeds
+        for entity, qpos in zip(scene.entities[1:], qposs_init):
+            entity.set_qpos(qpos)
+        n_resets = 0
+        for _ in range(15):
+            scene.step()
+            if scene.get_error_envs_mask().any():
+                for i, entity in enumerate(scene.entities[1:]):
+                    entity.set_qpos([3.0 * i, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0])
+                n_resets += 1
+        assert n_resets > 0
+
+        # So do clearing the errors and resetting the scene, from a state that flags one again
+        for clear in (scene.clear_errno, scene.reset):
+            for entity, qpos in zip(scene.entities[1:], qposs_init):
+                entity.set_qpos(qpos)
+            for _ in range(15):
+                scene.step()
+                if scene.get_error_envs_mask().any():
+                    break
+            assert scene.get_error_envs_mask().all()
+            clear()
+            assert not scene.get_error_envs_mask().any()
 
 
 @pytest.mark.required
@@ -1908,12 +1940,21 @@ def test_filter_neutral_self_collisions(show_viewer):
 
 
 @pytest.mark.required
-def test_contype_conaffinity(show_viewer, tol):
+@pytest.mark.parametrize("model_name", ["free_bodies_in_one_model"])
+def test_contype_conaffinity(xml_path, show_viewer, tol):
     GRAVITY = (0.0, 0.0, -10.0)
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             gravity=GRAVITY,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_neutral_collision=True,
+            enable_adjacent_collision=True,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.5, -3.0, 2.5),
+            camera_lookat=(0.5, 2.0, 0.5),
         ),
         show_viewer=show_viewer,
     )
@@ -1969,10 +2010,49 @@ def test_contype_conaffinity(show_viewer, tol):
         ),
         visualize_contact=True,
     )
-    scene.build()
+    free_bodies = scene.add_entity(
+        gs.morphs.MJCF(
+            file=xml_path,
+        ),
+    )
+    # Each variant of a heterogeneous entity excludes its own body pairs: the same bodies hinged on a world whose geom
+    # reaches into the first body, each variant excluding a different one of the two overlapping body pairs
+    VARIANTS_EXCLUDED_BODIES = (("free_0", "free_1"), ("world", "free_0"))
+    hinged_mjcfs = []
+    for excluded_bodies in VARIANTS_EXCLUDED_BODIES:
+        mjcf = ET.parse(xml_path).getroot()
+        for joint in mjcf.iter("freejoint"):
+            joint.tag = "joint"
+            joint.attrib |= dict(type="hinge", axis="0 0 1")
+        geom_attrib = dict(type="box", size="0.05 0.05 0.05", pos="0.05 4.0 0.4", contype="3", conaffinity="5")
+        ET.SubElement(mjcf.find("worldbody"), "geom", **geom_attrib)
+        mjcf.find("contact/exclude").attrib |= dict(zip(("body1", "body2"), excluded_bodies))
+        hinged_mjcfs.append(ET.tostring(mjcf, encoding="unicode"))
+    hinged_bodies = scene.add_entity(
+        morph=[gs.morphs.MJCF(file=hinged_mjcf, pos=(0.0, 2.0, 0.0)) for hinged_mjcf in hinged_mjcfs],
+    )
+    scene.build(n_envs=2)
+    variants_excluded_links = [
+        frozenset([hinged_bodies.get_link(name).idx for name in excluded_bodies])
+        for excluded_bodies in VARIANTS_EXCLUDED_BODIES
+    ]
 
+    # The bitmasks of an MJCF are kept as authored, and the body pairs it excludes never collide
+    assert_equal([(geom.contype, geom.conaffinity) for geom in free_bodies.geoms], [(3, 5)] * 3)
     for _ in range(80):
         scene.step()
+        assert not tensor_to_array(free_bodies.get_contacts(with_entity=free_bodies)["valid_mask"]).any()
+        # Every environment carries one variant: its own excluded pair never collides, the other one does
+        contacts = hinged_bodies.get_contacts(with_entity=hinged_bodies)
+        links_a, links_b, is_valid = [tensor_to_array(contacts[key]) for key in ("link_a", "link_b", "valid_mask")]
+        for i_env, (excluded_links, colliding_links) in enumerate(
+            (variants_excluded_links, variants_excluded_links[::-1])
+        ):
+            contact_link_pairs = {
+                frozenset(link_pair)
+                for link_pair in zip(links_a[i_env, is_valid[i_env]], links_b[i_env, is_valid[i_env]])
+            }
+            assert excluded_links not in contact_link_pairs and colliding_links in contact_link_pairs
 
     assert_allclose(box1.get_pos(), (0.0, 0.0, 0.25), atol=5e-4)
     assert_allclose(box2.get_pos(), (0.0, 0.0, 0.75), atol=2e-3)
@@ -1983,7 +2063,7 @@ def test_contype_conaffinity(show_viewer, tol):
 @pytest.mark.required
 @pytest.mark.precision("32")
 @pytest.mark.parametrize("backend", [gs.gpu])
-@pytest.mark.parametrize("contact_pruning_tolerance", [0.02, None], ids=["prune", "noprune"])
+@pytest.mark.parametrize("contact_pruning_tolerance", [0.02, None])
 @pytest.mark.parametrize(
     "prefer_decomposed_solver",
     [
@@ -1991,7 +2071,6 @@ def test_contype_conaffinity(show_viewer, tol):
         pytest.param(True, marks=pytest.mark.use_deterministic_algorithms(False)),
         None,
     ],
-    ids=["monolith", "decomposed", "deterministic"],
 )
 def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_tolerance, monkeypatch, show_viewer):
     # Run-to-run reproducibility on GPU: from an identical initial state, every trial must reproduce a bit-identical
@@ -2008,16 +2087,16 @@ def test_gpu_simulation_determinism(prefer_decomposed_solver, contact_pruning_to
     #   - contact set    -> narrowphase / pruning
     #   - contact order  -> contact sort
     #   - dofs velocity  -> constraint solve
-    from genesis.utils.array_class import RigidSimStaticConfig
+    from genesis.engine.solvers.rigid.data import RigidConfig
 
     if prefer_decomposed_solver is not None:
-        init_orig = RigidSimStaticConfig.__init__
+        init_orig = RigidConfig.__init__
 
         def init_forced(self, *args, **kwargs):
             kwargs["prefer_decomposed_solver"] = int(prefer_decomposed_solver)
             init_orig(self, *args, **kwargs)
 
-        monkeypatch.setattr(RigidSimStaticConfig, "__init__", init_forced)
+        monkeypatch.setattr(RigidConfig, "__init__", init_forced)
 
     N_TRIALS = 4
     N_STEPS = 25

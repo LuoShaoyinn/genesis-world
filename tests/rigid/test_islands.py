@@ -64,8 +64,7 @@ def test_constraint_capacity_covers_friction_rows(show_viewer):
     assert constraint_solver.constraint_state.island.constraint_id.shape[0] >= constraint_solver.len_constraints
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.parametrize("n_envs", [0, pytest.param(2, marks=pytest.mark.required)])
 def test_partition_logics(show_viewer, n_envs, multi_free_body_path):
     # The welded pair never touches, so only the equality edge couples them: without it the partition would split them
     # and the weld would be solved across two islands. A fixed body carries no dofs and joins no island. The
@@ -401,20 +400,20 @@ def test_monolith_seed_oversaturated(show_viewer, monkeypatch):
     # enable_cooperative_constraint_kernels is bounded by get_gpu_core_count(), so faking extreme GPU saturation
     # (get_gpu_core_count -> 1) disables the cooperative kernels at 2 envs - a small-scale stand-in for the
     # >get_gpu_core_count() env regime. With the monolith arm pinned, the seed factor + gradient come from the monolith
-    # body itself (see has_per_env_solve_seed in array_class.py). A stale Mgrad drops the boxes through the floor.
+    # body itself (see has_per_env_solve_seed in rigid/data.py). A stale Mgrad drops the boxes through the floor.
     import genesis.engine.solvers.rigid.rigid_solver as rigid_solver
-    from genesis.utils.array_class import RigidSimStaticConfig
+    from genesis.engine.solvers.rigid.data import RigidConfig
 
     monkeypatch.setattr(rigid_solver, "get_gpu_core_count", lambda: 1)
     # The gap is in the monolith arm's init path, so pin the arm (otherwise the autotuner might pick the decomposed
     # arm, which always seeds and would hide the regression).
-    _orig_static_config_init = RigidSimStaticConfig.__init__
+    _orig_config_init = RigidConfig.__init__
 
     def _force_monolith(self, *args, **kwargs):
         kwargs["prefer_decomposed_solver"] = 0
-        _orig_static_config_init(self, *args, **kwargs)
+        _orig_config_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(RigidSimStaticConfig, "__init__", _force_monolith)
+    monkeypatch.setattr(RigidConfig, "__init__", _force_monolith)
 
     scene = gs.Scene(
         show_viewer=show_viewer,
@@ -680,7 +679,7 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
         ),
         show_viewer=show_viewer,
     )
-    scene.add_entity(gs.morphs.Plane())
+    plane = scene.add_entity(gs.morphs.Plane())
     box_force = scene.add_entity(
         gs.morphs.Box(
             size=(0.1, 0.1, 0.1),
@@ -741,10 +740,22 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
             pos=(9.0, 0.0, 0.1),
         )
     )
+    box_weld = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(11.0, 0.0, 0.5),
+        )
+    )
     box_on_platform = scene.add_entity(
         gs.morphs.Box(
             size=(0.1, 0.1, 0.1),
             pos=(10.0, 0.0, 0.35),
+        )
+    )
+    box_held_by_platform = scene.add_entity(
+        gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(10.0, 0.4, 0.6),
         )
     )
     platform = scene.add_entity(
@@ -757,6 +768,8 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
     scene.build(n_envs=n_envs)
 
     solver = scene.rigid_solver
+    solver.add_weld_constraint(box_weld.base_link_idx, plane.base_link_idx)
+    solver.add_weld_constraint(box_held_by_platform.base_link_idx, platform.base_link_idx)
 
     # The forced box carries an armature while it sleeps, which its mass matrix must hold once, whatever the time spent
     # asleep, when the force wakes it.
@@ -768,8 +781,9 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
         box.set_dofs_kp([0.0, 0.0, 400.0, 0.0, 0.0, 0.0])
         box.set_dofs_kv([40.0, 40.0, 40.0, 4.0, 4.0, 4.0])
 
+    # Semi-implicit Euler integration drops a box falling from rest by g * dt^2 * n * (n + 1) / 2 over n steps
     n_fall = 8
-    free_fall_drop = 0.5 * G * (n_fall * DT) ** 2
+    free_fall_drop = 0.5 * G * DT**2 * n_fall * (n_fall + 1)
 
     for _ in range(90):
         scene.step()
@@ -800,7 +814,7 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
     z0 = box_pos.get_pos()[..., 2]
     for _ in range(n_fall):
         scene.step()
-    assert_allclose(z0 - box_pos.get_pos()[..., 2], free_fall_drop, rtol=0.2)
+    assert_allclose(z0 - box_pos.get_pos()[..., 2], free_fall_drop, tol=tol)
     assert qd_to_numpy(
         solver.dyn_state.entities.is_hibernated,
         [box.idx for box in (box_vel, box_qpos, box_cforce, box_cvel, box_cpos)],
@@ -824,7 +838,7 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
     z0 = box_qpos.get_pos()[..., 2]
     for _ in range(n_fall):
         scene.step()
-    assert_allclose(z0 - box_qpos.get_pos()[..., 2], free_fall_drop, rtol=0.2)
+    assert_allclose(z0 - box_qpos.get_pos()[..., 2], free_fall_drop, tol=tol)
     assert qd_to_numpy(
         solver.dyn_state.entities.is_hibernated, [box.idx for box in (box_cforce, box_cvel, box_cpos)]
     ).all()
@@ -836,18 +850,37 @@ def test_hibernation_wakes_on_user_input(show_viewer, n_envs, tol):
     z0 = box_base_pos.get_pos()[..., 2]
     for _ in range(n_fall):
         scene.step()
-    assert_allclose(z0 - box_base_pos.get_pos()[..., 2], free_fall_drop, rtol=0.2)
+    assert_allclose(z0 - box_base_pos.get_pos()[..., 2], free_fall_drop, tol=tol)
     assert qd_to_numpy(
         solver.dyn_state.entities.is_hibernated, [box.idx for box in (box_cforce, box_cvel, box_cpos)]
     ).all()
 
-    # A fixed link has no state to wake, but a body resting on it wakes when it moves rather than float where it was
+    # A fixed link has no state to wake, but a box resting on it or welded to it wakes when it moves rather than float
+    # where it was. The weld pulls its box down faster than gravity alone, without overshooting the platform drop.
+    z0_platform = platform.get_pos()[..., 2]
+    z0_held = box_held_by_platform.get_pos()[..., 2]
     platform.set_pos((10.0, 0.0, -0.15))
-    assert not qd_to_numpy(solver.dyn_state.entities.is_hibernated, box_on_platform.idx).all()
+    assert not qd_to_numpy(
+        solver.dyn_state.entities.is_hibernated, [box.idx for box in (box_on_platform, box_held_by_platform)]
+    ).any()
     z0 = box_on_platform.get_pos()[..., 2]
     for _ in range(n_fall):
         scene.step()
-    assert_allclose(z0 - box_on_platform.get_pos()[..., 2], free_fall_drop, rtol=0.2)
+    assert_allclose(z0 - box_on_platform.get_pos()[..., 2], free_fall_drop, tol=tol)
+    held_drop = z0_held - box_held_by_platform.get_pos()[..., 2]
+    assert ((free_fall_drop < held_drop) & (held_drop < z0_platform - platform.get_pos()[..., 2])).all()
+    assert qd_to_numpy(
+        solver.dyn_state.entities.is_hibernated, [box.idx for box in (box_cforce, box_cvel, box_cpos)]
+    ).all()
+
+    # A box held in the air by a weld falls once the weld is deleted, in the selected environment only
+    solver.delete_weld_constraint(box_weld.base_link_idx, plane.base_link_idx, envs_idx=0 if n_envs else None)
+    is_weld_selected = np.arange(max(n_envs, 1)) == 0
+    assert_equal(qd_to_numpy(solver.dyn_state.entities.is_hibernated, box_weld.idx, keepdim=False), ~is_weld_selected)
+    z0 = box_weld.get_pos()[..., 2]
+    for _ in range(n_fall):
+        scene.step()
+    assert_allclose(z0 - box_weld.get_pos()[..., 2], is_weld_selected * free_fall_drop, tol=tol)
     assert qd_to_numpy(
         solver.dyn_state.entities.is_hibernated, [box.idx for box in (box_cforce, box_cvel, box_cpos)]
     ).all()

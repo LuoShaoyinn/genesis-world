@@ -2,13 +2,15 @@ import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import quadrants as qd
 import torch
 import torch.nn.functional as F
 
+import quadrants as qd
+
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils import array_class
+from genesis.engine.solvers.rigid.collider.data import ColliderState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
 
 if TYPE_CHECKING:
     from genesis.engine.solvers.rigid.rigid_solver import RigidSolver
@@ -217,7 +219,7 @@ class PathPlanner(ABC):
         obj_geom_end: qd.i32,
         ignore_geom_pairs: qd.types.ndarray(),
         out: qd.types.ndarray(),
-        collider_state: array_class.ColliderState,
+        collider_state: ColliderState,
         is_plan_with_obj: qd.i32,
     ):
         for i_b_ in range(envs_idx.shape[0]):
@@ -235,7 +237,7 @@ class PathPlanner(ABC):
         obj_geom_start: qd.i32,
         obj_geom_end: qd.i32,
         ignore_geom_pairs: qd.types.ndarray(),
-        collider_state: array_class.ColliderState,
+        collider_state: ColliderState,
         is_plan_with_obj: qd.i32,
     ) -> qd.i32:
         is_collision_detected = qd.cast(False, gs.qd_int)
@@ -380,9 +382,9 @@ class RRT(PathPlanner):
         envs_idx: qd.types.ndarray(),
         q_limit_lower: qd.types.ndarray(),
         q_limit_upper: qd.types.ndarray(),
-        dyn_state: array_class.DynState,
-        dyn_info: array_class.DynInfo,
-        rigid_info: array_class.RigidInfo,
+        dyn_state: DynState,
+        dyn_info: DynInfo,
+        rigid_info: RigidInfo,
     ):
         """
         Step 1 includes:
@@ -439,7 +441,7 @@ class RRT(PathPlanner):
                     i_l_base = dyn_info.entities.link_start[self._entity._idx_in_solver]
                     I_l_base = [i_l_base, i_b] if qd.static(self._solver.rigid_config.batch_links_info) else i_l_base
                     i_l_root = dyn_info.links.root_idx[I_l_base]
-                    gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_root(
+                    gs.engine.solvers.rigid.abd.forward_kinematics.func_forward_kinematics_root(
                         i_l_root,
                         i_b,
                         rigid_info.qpos,
@@ -451,7 +453,7 @@ class RRT(PathPlanner):
                     )
                     for i_r in range(rigid_info.roots_link_idx.shape[0]):
                         i_l_root = rigid_info.roots_link_idx[i_r]
-                        gs.engine.solvers.rigid.rigid_solver.func_update_geoms_root(
+                        gs.engine.solvers.rigid.abd.forward_kinematics.func_update_geoms_root(
                             i_l_root,
                             i_b,
                             dyn_state,
@@ -459,7 +461,6 @@ class RRT(PathPlanner):
                             rigid_info,
                             self._solver.rigid_config,
                             force_update_all_geoms=False,
-                            is_backward=False,
                         )
 
     @qd.kernel
@@ -469,7 +470,7 @@ class RRT(PathPlanner):
         obj_geom_start: qd.i32,
         obj_geom_end: qd.i32,
         ignore_geom_pairs: qd.types.ndarray(),
-        collider_state: array_class.ColliderState,
+        collider_state: ColliderState,
         ignore_collision: qd.i32,
         is_plan_with_obj: qd.i32,
     ):
@@ -729,9 +730,9 @@ class RRTConnect(PathPlanner):
         qpos: qd.Tensor,
         q_limit_lower: qd.types.ndarray(),
         q_limit_upper: qd.types.ndarray(),
-        dyn_state: array_class.DynState,
-        dyn_info: array_class.DynInfo,
-        rigid_info: array_class.RigidInfo,
+        dyn_state: DynState,
+        dyn_info: DynInfo,
+        rigid_info: RigidInfo,
         forward_pass: qd.i32,
     ):
         """
@@ -805,7 +806,7 @@ class RRTConnect(PathPlanner):
                     i_l_base = dyn_info.entities.link_start[self._entity._idx_in_solver]
                     I_l_base = [i_l_base, i_b] if qd.static(self._solver.rigid_config.batch_links_info) else i_l_base
                     i_l_root = dyn_info.links.root_idx[I_l_base]
-                    gs.engine.solvers.rigid.rigid_solver.func_forward_kinematics_root(
+                    gs.engine.solvers.rigid.abd.forward_kinematics.func_forward_kinematics_root(
                         i_l_root,
                         i_b,
                         rigid_info.qpos,
@@ -817,7 +818,7 @@ class RRTConnect(PathPlanner):
                     )
                     for i_r in range(rigid_info.roots_link_idx.shape[0]):
                         i_l_root = rigid_info.roots_link_idx[i_r]
-                        gs.engine.solvers.rigid.rigid_solver.func_update_geoms_root(
+                        gs.engine.solvers.rigid.abd.forward_kinematics.func_update_geoms_root(
                             i_l_root,
                             i_b,
                             dyn_state,
@@ -825,7 +826,6 @@ class RRTConnect(PathPlanner):
                             rigid_info,
                             self._solver.rigid_config,
                             force_update_all_geoms=False,
-                            is_backward=False,
                         )
 
     @qd.kernel
@@ -835,8 +835,8 @@ class RRTConnect(PathPlanner):
         obj_geom_start: qd.i32,
         obj_geom_end: qd.i32,
         ignore_geom_pairs: qd.types.ndarray(),
-        collider_state: array_class.ColliderState,
-        rigid_info: array_class.RigidInfo,
+        collider_state: ColliderState,
+        rigid_info: RigidInfo,
         forward_pass: qd.i32,
         ignore_collision: qd.i32,
         is_plan_with_obj: qd.i32,

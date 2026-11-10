@@ -17,7 +17,7 @@ permissions:
   contents: read
   actions: read
   pull-requests: write
-  checks: write
+  statuses: write
 
 jobs:
   comment-if-regressed:
@@ -39,7 +39,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install deps
         run: |
@@ -136,11 +136,11 @@ jobs:
             /tmp/mem.csv
           if-no-files-found: warn
 
-      - name: Publish PR check
+      - name: Publish report and PR status
         id: publish_check
         uses: actions/github-script@v8
         env:
-          CHECK_NAME: Benchmark Comparison
+          CHECK_NAME: '_Artifact: Benchmark Comparison'
           CHECK_OUTPUT: ${{ env.CHECK_OUTPUT }}
           HAS_REGRESSIONS: ${{ env.HAS_REGRESSIONS }}
           HAS_ALERTS: ${{ env.HAS_ALERTS }}
@@ -155,13 +155,13 @@ jobs:
             }
 
             let summary;
-            let conclusion = 'success';
+            let state = 'success';
             if ((process.env.HAS_ERRORS || '0') === '1') {
               summary = '❌ The comparison failed to run. See the job log.';
-              conclusion = 'failure';
+              state = 'failure';
             } else if ((process.env.HAS_REGRESSIONS || '0') === '1') {
-              summary = '🔴 Regressions detected. See tables below.';
-              conclusion = 'failure';
+              summary = '❗ Regressions detected. See tables below.';
+              state = 'failure';
             } else if ((process.env.HAS_ALERTS || '0') === '1') {
               summary = '⚠️ Large deviation detected. See tables below.';
             } else {
@@ -174,20 +174,25 @@ jobs:
               || context.payload.pull_request?.head.sha
               || context.sha;
 
-            const check = await github.rest.checks.create({
+            // Write the detailed report to this job's summary and publish a commit status on the tested commit.
+            // Link the status to this workflow run.
+            await core.summary
+              .addHeading(process.env.CHECK_NAME)
+              .addRaw(summary, true)
+              .addRaw(body, true)
+              .write();
+            const reportUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+              `/actions/runs/${context.runId}`;
+            await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              head_sha: headSha,
-              name: process.env.CHECK_NAME,
-              status: 'completed',
-              conclusion: conclusion,
-              output: {
-                title: process.env.CHECK_NAME,
-                summary,
-                text: body || undefined
-              }
+              sha: headSha,
+              context: process.env.CHECK_NAME,
+              state,
+              target_url: reportUrl,
+              description: summary,
             });
-            core.setOutput("check-url", check.data.html_url);
+            core.setOutput("check-url", reportUrl);
 
       - name: Add PR comment
         if: ${{ env.HAS_REGRESSIONS == '1' || env.HAS_ALERTS == '1' }}
@@ -206,20 +211,25 @@ jobs:
               if (!run) {
                 throw new Error(`Event '${context.eventName}' carries no pull request to comment on.`);
               }
-              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                owner: run.head_repository.owner.login,
-                repo: run.head_repository.name,
-                commit_sha: run.head_sha,
+              // Look the pull request up by head branch, closed ones included, since the benchmarks may complete after
+              // it is closed: 'repos.listPullRequestsAssociatedWithCommit' returns the merged and open ones alone. The
+              // match on the commit and the preference for an open pull request follow the setup of production.yml.
+              const { data } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'all',
+                head: `${run.head_repository.owner.login}:${run.head_branch}`,
               });
-              if (!data || !data.length) {
-                throw new Error(
-                  `No pull request is associated with commit ${run.head_sha} of ${run.head_repository.full_name}.`);
+              const pulls = data.filter((pull) => pull.head.sha === run.head_sha);
+              const pull = pulls.find((pull) => pull.state === 'open') ?? pulls[0];
+              if (!pull) {
+                throw new Error(`Commit ${run.head_sha} heads no pull request of ${context.repo.repo}.`);
               }
-              prNumber = data[0].number;
+              prNumber = pull.number;
             }
 
             const title = (process.env.HAS_REGRESSIONS || '0') === '1'
-              ? '🔴 Benchmark Regression Detected' : '⚠️ Abnormal Benchmark Result Detected';
+              ? '❗ Benchmark Regression Detected' : '⚠️ Abnormal Benchmark Result Detected';
             const comment = `**${title} ➡️ [Report](${process.env.REPORT_URL})**`;
 
             await github.rest.issues.createComment({

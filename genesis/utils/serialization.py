@@ -12,17 +12,17 @@ import io
 import json
 import os
 import pathlib
-import sys
 import types
 import typing
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterable, Mapping, Sequence, Set
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from functools import lru_cache, partial
 from typing import Callable, NamedTuple
 
 import numpy as np
+
 from frozendict import frozendict
 from pydantic import AfterValidator, TypeAdapter, ValidationError, ValidationInfo
 
@@ -152,29 +152,11 @@ def _field_check(cls: type, name: str) -> TypeAdapter:
     return TypeAdapter(admitted)
 
 
-def _resolve_quoted(hint, namespace: dict):
-    """Returns a declaration holding the classes it names, where Python 3.10 left a quoted name unresolved.
-
-    Until Python 3.11, a name quoted inside a generic - 'list["Joint"]' - stays the string it was written as, and a
-    declaration read as a string states nothing about what it holds.
-    """
-    if not isinstance(hint, types.GenericAlias):
-        return hint
-    args = typing.get_args(hint)
-    return typing.get_origin(hint)[
-        tuple(namespace[arg] if isinstance(arg, str) else _resolve_quoted(arg, namespace) for arg in args)
-    ]
-
-
 def _declared_fields(cls: type) -> dict[str, type]:
     """Return the declared type of each field of a class. Those types drive how a value loads back."""
     if issubclass(cls, Options):
         return {name: info.annotation for name, info in cls.model_fields.items()}
-    hints = typing.get_type_hints(cls)
-    if sys.version_info < (3, 11):
-        namespace = vars(sys.modules[cls.__module__])
-        return {name: _resolve_quoted(hint, namespace) for name, hint in hints.items()}
-    return hints
+    return typing.get_type_hints(cls)
 
 
 def _unwrap_annotation(expect):
@@ -249,9 +231,9 @@ def _has_declared_fields(expect) -> bool:
     )
 
 
-def _layout(cls: type) -> list[str] | dict[str, int]:
+def _layout(cls: type) -> list[str] | dict[str, int | str]:
     """What one class is made of: the value of every member where it enumerates, its field names otherwise."""
-    if issubclass(cls, IntEnum):
+    if issubclass(cls, (IntEnum, StrEnum)):
         return {member.name: member.value for member in cls}
     return sorted(_declared_fields(cls))
 
@@ -284,7 +266,7 @@ def declared_schema(expect: dict) -> dict:
             if not isinstance(declared, type) or declared in seen:
                 continue
             seen.add(declared)
-            if issubclass(declared, IntEnum):
+            if issubclass(declared, (IntEnum, StrEnum)):
                 layout[declared.__name__] = _layout(declared)
             elif _has_declared_fields(declared):
                 for cls in _classes_by_name(declared).values():
@@ -344,11 +326,16 @@ def _store_array(value, exported: "Exported") -> int:
     """
     layout = value.__array_interface__
     key = (layout["data"][0], layout["shape"], layout["strides"], layout["typestr"])
-    slot = exported.slots.get(key)
+    # The address of an empty array is arbitrary (pickle protocol 5 loads every empty array at one address), so keying
+    # it would make the slots depend on how the arrays were created. Each empty array is stored in a slot of its own.
+    # Leaving it out of the file instead would require the manifest to record its shape and dtype, since the manifest
+    # holds nothing but the slot index of each array.
+    slot = exported.slots.get(key) if value.nbytes > 0 else None
     if slot is None:
         slot = len(exported.values)
-        exported.slots[key] = slot
-        exported.stored.append(value)
+        if value.nbytes > 0:
+            exported.slots[key] = slot
+            exported.stored.append(value)
         exported.values.append(np.require(value, requirements="C"))
     return slot
 
@@ -377,7 +364,7 @@ def _export_value(value, expect, exported: "Exported"):
         return _export_any(value, exported)
     if isinstance(value, np.generic):
         return value.item()
-    if isinstance(value, IntEnum):
+    if isinstance(value, (IntEnum, StrEnum)):
         exported.classes.add(type(value))
         return value.name
     codec = _class_codec(type(value))
@@ -469,7 +456,7 @@ def _load_value(raw, expect, loaded: list[np.ndarray]):
     expect = _unwrap_annotation(expect)
     if expect is typing.Any or expect is object:
         return _load_any(raw, loaded)
-    if isinstance(expect, type) and issubclass(expect, IntEnum):
+    if isinstance(expect, type) and issubclass(expect, (IntEnum, StrEnum)):
         return expect[raw]
     if isinstance(raw, dict) and "@class" in raw:
         cls = _classes_by_name(expect).get(raw["@class"])

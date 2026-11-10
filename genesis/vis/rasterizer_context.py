@@ -10,7 +10,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 import genesis.utils.particle as pu
-from genesis.engine.solvers.base_solver import StateChange, Subscriber
+from genesis.engine.state_change import StateChange, Subscriber
 from genesis.ext import pyrender
 from genesis.ext.pyrender.jit_render import JITRenderer
 from genesis.utils.misc import qd_to_numpy, sanitize_index, tensor_to_array
@@ -262,13 +262,23 @@ class RasterizerContext:
         if self.show_cameras:
             self.on_camera_frustum()
 
-        self.on_tool()
         self.on_rigid()
         self.on_mpm()
         self.on_sph()
         self.on_pbd()
         self.on_fem()
         self.on_sensors()
+
+        # The update of the nodes of each solver, so that a change of the state of some solvers updates theirs alone
+        rigid_solvers = (self.sim.rigid_solver, self.sim.kinematic_solver)
+        self._updates_solvers = (
+            (self.update_link_frame, rigid_solvers),
+            (self.update_rigid, rigid_solvers),
+            (self.update_mpm, (self.sim.mpm_solver,)),
+            (self.update_sph, (self.sim.sph_solver,)),
+            (self.update_pbd, (self.sim.pbd_solver,)),
+            (self.update_fem, (self.sim.fem_solver,)),
+        )
 
         # segmentation mapping
         self.seg_color_map.generate_seg_colors()
@@ -546,37 +556,6 @@ class RasterizerContext:
                 self.link_frame_node.mesh.primitives[0].poses = links_T
                 self.jit.update_buffer(self.link_frame_node, "model", links_T.transpose((0, 2, 1)))
 
-    def on_tool(self):
-        if self.sim.tool_solver.is_active:
-            for tool_entity in self.sim.tool_solver.entities:
-                if tool_entity.mesh is not None:
-                    for env_i, idx in enumerate(self.rendered_envs_idx):
-                        mesh = trimesh.Trimesh(
-                            tool_entity.mesh.raw_vertices,
-                            tool_entity.mesh.faces_np.reshape([-1, 3]),
-                            tool_entity.mesh.raw_vertex_normals,
-                            process=False,
-                        )
-                        mesh.visual = mu.surface_uvs_to_trimesh_visual(tool_entity.surface, n_verts=len(mesh.vertices))
-
-                        pose = gu.trans_quat_to_T(tool_entity.init_pos, tool_entity.init_quat)
-                        double_sided = tool_entity.surface.double_sided
-                        self.add_static_node(
-                            tool_entity,
-                            pyrender.Mesh.from_trimesh(mesh, double_sided=double_sided, envs=env_i),
-                            i_b=idx,
-                            pose=pose,
-                        )
-
-    def update_tool(self):
-        if self.sim.tool_solver.is_active:
-            for tool_entity in self.sim.tool_solver.entities:
-                poss = qd_to_numpy(tool_entity.pos)[self.sim.cur_substep_local]
-                quats = qd_to_numpy(tool_entity.quat)[self.sim.cur_substep_local]
-                for idx in self.rendered_envs_idx:
-                    pose = gu.trans_quat_to_T(poss[idx], quats[idx])
-                    self.set_node_pose(self.static_nodes[(idx, tool_entity.uid)], pose=pose)
-
     def set_reflection_mat(self, geom_T):
         height = geom_T[0, 2, 3]
         self.jit.reflection_mat = np.array(
@@ -597,9 +576,11 @@ class RasterizerContext:
             yield self.sim.kinematic_solver
 
     def on_rigid(self):
-        # Reuse a single pyrender material per genesis surface so that geoms sharing one surface (e.g. the many
-        # textured submeshes of a GLB, which are kept separate to preserve baked convex decompositions) expose the
-        # same Texture instances. The renderer then keeps a single host copy and GPU upload instead of one per geom.
+        # Reuse a single pyrender material per genesis surface, and per trimesh material among the textured geoms (see
+        # 'surface_uvs_to_trimesh_visual'), so that geoms sharing either one (e.g. the many textured submeshes of a GLB,
+        # kept separate to preserve baked convex decompositions) expose the same Texture instances. The renderer then
+        # keeps a single host copy and GPU upload instead of one per geom. A surface keys its textured geoms and its
+        # untextured ones (without uvs) apart, since each kind is drawn with a material of its own.
         vis_materials = {}
         for solver in self._rigid_solvers():
             # One conversion of the geom poses per visual mode in use
@@ -612,10 +593,16 @@ class RasterizerContext:
                 geoms_T = geoms_T_by_mode[is_visual]
 
                 for geom in geoms:
-                    surface_key = id(geom.surface)
-                    mesh_node = self.add_geom_node(geom, geoms_T, material=vis_materials.get(surface_key))
+                    is_textured = is_visual and isinstance(geom.trimesh.visual, trimesh.visual.TextureVisuals)
+                    material_keys = [("surface", is_textured, id(geom.surface))]
+                    if is_textured:
+                        material_keys.append(("material", id(geom.trimesh.visual.material)))
+                    materials = [vis_materials[key] for key in material_keys if key in vis_materials]
+                    material = materials[0] if materials else None
+                    mesh_node = self.add_geom_node(geom, geoms_T, material=material)
                     if mesh_node is not None:
-                        vis_materials.setdefault(surface_key, mesh_node.primitives[0].material)
+                        for key in material_keys:
+                            vis_materials.setdefault(key, mesh_node.primitives[0].material)
 
         if self.sim.rigid_solver.is_active and any(link.visualize_contact for link in self.sim.rigid_solver.links):
             # Scale contact arrows by the parent link's overall size rather than the individual contacting geom, so
@@ -793,7 +780,7 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mu.create_box(
                                 bounds=np.array(
-                                    [self.sim.mpm_solver.boundary.lower, self.sim.mpm_solver.boundary.upper],
+                                    [self.sim.mpm_solver.boundary_lower, self.sim.mpm_solver.boundary_upper],
                                     dtype=np.float32,
                                 ),
                                 wireframe=True,
@@ -825,7 +812,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.mpm_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.mpm_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.mpm_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         vverts_all = qd_to_numpy(self.sim.mpm_solver.vverts_render.pos)
         meshes = []
         for mpm_entity in self.sim.mpm_solver.entities:
@@ -876,7 +863,7 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mu.create_box(
                                 bounds=np.array(
-                                    [self.sim.sph_solver.boundary.lower, self.sim.sph_solver.boundary.upper],
+                                    [self.sim.sph_solver.boundary_lower, self.sim.sph_solver.boundary_upper],
                                     dtype=np.float32,
                                 ),
                                 wireframe=True,
@@ -908,7 +895,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.sph_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.sph_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.sph_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         meshes = []
         for sph_entity in self.sim.sph_solver.entities:
             if sph_entity.surface.vis_mode != "recon":
@@ -983,7 +970,7 @@ class RasterizerContext:
                     pyrender.Mesh.from_trimesh(
                         mu.create_box(
                             bounds=np.array(
-                                [self.sim.pbd_solver.boundary.lower, self.sim.pbd_solver.boundary.upper],
+                                [self.sim.pbd_solver.boundary_lower, self.sim.pbd_solver.boundary_upper],
                                 dtype=np.float32,
                             ),
                             wireframe=True,
@@ -1042,7 +1029,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.pbd_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.pbd_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.pbd_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         meshes = []
         for pbd_entity in self.sim.pbd_solver.entities:
             if pbd_entity.surface.vis_mode != "recon":
@@ -1323,10 +1310,18 @@ class RasterizerContext:
     def clear_debug_objects(self):
         self.clear_external_nodes()
 
-    def update(self, force_render: bool = False):
+    def update(self, force_render: bool = False, solvers=None):
+        """
+        Sync the nodes with the state of the scene.
+
+        `solvers` restricts the sync to the nodes of those solvers, whose state changed since the last sync, the others
+        being current. A sync after a step updates the nodes of every solver, whatever `solvers`.
+        """
         # Early return if already updated previously
         if not force_render and self._t >= self.scene.sim.cur_step_global:
             return
+        if self._t < self.scene.sim.cur_step_global:
+            solvers = None
 
         # The interactive viewer draws from its own thread whatever is uploaded here
         with self.scene._visualizer.viewer_lock:
@@ -1337,18 +1332,14 @@ class RasterizerContext:
             self.clear_dynamic_nodes(only_outdated=True)
 
             # Force updating rendering-only quantities that are not updated automatically during simulation
-            self.visualizer.update_visual_states(force_render)
+            self.visualizer.update_visual_states(force_render, solvers)
 
             # Reset scene bounds to trigger recomputation. They are involved in shadow map.
             self._scene._bounds = None
 
-            self.update_link_frame()
-            self.update_tool()
-            self.update_rigid()
-            self.update_mpm()
-            self.update_sph()
-            self.update_pbd()
-            self.update_fem()
+            for update, update_solvers in self._updates_solvers:
+                if solvers is None or not solvers.isdisjoint(update_solvers):
+                    update()
             self.update_sensors()
 
             # Update camera fructum

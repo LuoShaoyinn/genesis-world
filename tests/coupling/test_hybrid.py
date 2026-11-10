@@ -1,6 +1,3 @@
-import platform
-import sys
-
 import numpy as np
 import pytest
 import torch
@@ -8,7 +5,7 @@ import torch
 import genesis as gs
 from genesis.utils.misc import tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 from ..utils.assets import get_hf_dataset
 
 
@@ -44,6 +41,13 @@ def test_rigid_mpm_muscle(show_viewer):
     scene.add_entity(
         morph=gs.morphs.Plane(),
     )
+    cube = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.85, 0.1, 0.1),
+            size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
     robot = scene.add_entity(
         morph=gs.morphs.URDF(
             file="urdf/simple/two_link_arm.urdf",
@@ -76,17 +80,21 @@ def test_rigid_mpm_muscle(show_viewer):
             friction=0.5,
         ),
     )
-    scene.build()
+    scene.build(n_envs=2)
 
     scene.reset()
+    # The soft part of the robot follows its links regardless of the activeness of the particles of another entity
+    cube.set_particles_active(gs.INACTIVE, envs_idx=[1])
     for i in range(150):
         robot.control_dofs_velocity(np.array([2.0 * np.sin(2 * np.pi * i * 0.006)] * robot.n_dofs))
         scene.step()
 
     ball_pos_delta = ball.get_pos() - torch.tensor(BALL_POS_INIT, dtype=gs.tc_float, device=gs.device)
     assert_allclose(ball_pos_delta[..., 0], 0.0, tol=1e-2)
-    assert ((0.02 < ball_pos_delta[1]) & (ball_pos_delta[1] < 0.05)).all()
+    assert ((0.02 < ball_pos_delta[..., 1]) & (ball_pos_delta[..., 1] < 0.05)).all()
     assert_allclose(ball_pos_delta[..., 2], 0.0, tol=1e-3)
+    soft_pos = robot.part_soft.get_particles_pos()
+    assert_allclose(soft_pos[0], soft_pos[1], tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -104,6 +112,7 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
             substeps=substeps,
         ),
         mpm_options=gs.options.MPMOptions(
+            enable_CPIC=True,
             lower_bound=(-0.5, -1.0, 0.0),
             upper_bound=(0.5, 1.0, 1),
         ),
@@ -146,7 +155,7 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
         ),
     )
 
-    scene.build()
+    scene.build(n_envs=2)
 
     horizon = horizon_substeps // substeps
     for i in range(horizon):
@@ -154,24 +163,22 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
 
     # Check that the sand moved the box along the negative Y direction
     pos = tensor_to_array(obj_rigid.get_pos())
-    assert pos[1] + 0.25 < 0.0
+    assert (pos[..., 1] + 0.25 < 0.0).all()
+
+    # Resetting one environment leaves the other one as it was
+    sand_pos = tensor_to_array(obj_sand.get_particles_pos())
+    scene.reset(envs_idx=[1])
+    assert_equal(obj_rigid.get_pos()[0], pos[0])
+    assert_equal(obj_sand.get_particles_pos()[0], sand_pos[0])
 
     # A rollout after a reset starts free of the coupling wrench the previous one left
-    scene.reset()
     for i in range(horizon):
         scene.step()
-    assert_allclose(obj_rigid.get_pos(), pos, tol=tol)
+    assert_allclose(obj_rigid.get_pos()[1], pos[1], tol=tol)
 
 
-@pytest.mark.slow  # ~250s
 @pytest.mark.required
-@pytest.mark.skipif(
-    sys.platform == "linux" and platform.machine() == "aarch64",
-    reason="pygel3d is not supported on Linux ARM (aarch64)",
-)
 def test_mesh_mpm_build(show_viewer):
-    # FIXME: This test is crashing on Linux (x86 & aarch64) Github-hosted runners
-
     scene = gs.Scene(
         mpm_options=gs.options.MPMOptions(
             lower_bound=(-0.5, -0.5, -0.5),
@@ -306,8 +313,79 @@ def test_deformable_parallel(show_viewer):
 
     assert_allclose(cloth.get_particles_vel(), 0.0, atol=1e-5)
     assert_allclose(mpm_cube.get_particles_vel(), 0.0, atol=2e-4)
-    assert_allclose(entity_fem._solver.get_state(0).vel, 0, atol=1e-3)
+    assert_allclose(entity_fem.get_verts_vel(), 0, atol=1e-3)
     assert_allclose(water.get_particles_vel(), 0.0, atol=5e-2)
+
+
+@pytest.mark.required
+def test_fem_mpm_coupling(precision, show_viewer, tol):
+    GRAVITY = -9.81
+    DT = 2e-3
+    N_STEPS_FREE_FALL = 10
+    N_STEPS = 100
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            substeps=10,
+            gravity=(0.0, 0.0, GRAVITY),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.1, -0.1, 0.0),
+            upper_bound=(0.1, 0.1, 0.2),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, -1.0, 0.8),
+            camera_lookat=(0.2, 0.0, 0.3),
+        ),
+        show_viewer=show_viewer,
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.0675),
+            size=(0.1, 0.1, 0.035),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    # FIXME: Building should raise when the scene cannot meet the accuracy of the simulation. The explicit time step
+    # must stay under about h / c, with h the smallest element size, c = sqrt((lambda + 2 * mu) / rho) the wave speed,
+    # lambda = E * nu / ((1 + nu) * (1 - 2 * nu)) and mu = E / (2 * (1 + nu)). The rest shape of a body accumulates
+    # a velocity noise of the order of t * E * eps / (rho * h) after a time t, with eps the machine epsilon, which must
+    # stay under the tolerance. Meanwhile, single precision takes a softer material.
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.12),
+            size=(0.05, 0.05, 0.05),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e6 if precision == "64" else 1e5,
+        ),
+    )
+    fem = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.4, 0.0, 0.5),
+            size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.FEM.Elastic(
+            E=1e6 if precision == "64" else 1e5,
+        ),
+    )
+    scene.build(n_envs=2)
+
+    for _ in range(N_STEPS_FREE_FALL):
+        scene.step()
+
+    # An unstressed body far from the grid falls freely, every vertex at the same velocity
+    assert_allclose(fem.get_verts_vel(), (0.0, 0.0, GRAVITY * DT * N_STEPS_FREE_FALL), tol=tol)
+
+    for _ in range(N_STEPS - N_STEPS_FREE_FALL):
+        scene.step()
+
+    # The box dropped on the block comes to rest on top of it. Its surface stands off the topmost particles by less
+    # than one grid cell, the reach of the coupling.
+    assert_allclose(box.get_verts_vel(), 0.0, atol=5e-3)
+    gap = box.get_verts_pos()[..., 2].min(dim=-1).values - block.get_particles_pos()[..., 2].max(dim=-1).values
+    assert ((gap > 0.0) & (gap < scene.mpm_solver.dx)).all()
 
 
 @pytest.mark.parametrize(
@@ -315,7 +393,7 @@ def test_deformable_parallel(show_viewer):
     [
         pytest.param(0, gs.materials.SPH.Liquid, marks=pytest.mark.required),
         (1, gs.materials.SPH.Liquid),
-        pytest.param(2, gs.materials.SPH.Liquid, marks=pytest.mark.required),
+        (2, gs.materials.SPH.Liquid),
         pytest.param(2, gs.materials.PBD.Liquid, marks=pytest.mark.required),
         pytest.param(2, gs.materials.MPM.Liquid, marks=pytest.mark.required),
         (2, gs.materials.MPM.Sand),
@@ -377,14 +455,30 @@ def test_fluid_emitter(n_envs, material_type, show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
-def test_sap_rigid_rigid_hydroelastic_contact(show_viewer):
-    BOX_POS = (0.0, 0.0, 0.1)
+@pytest.mark.parametrize("batch_links_info", [False, True])
+def test_sap_rigid_rigid_hydroelastic_contact(batch_links_info, show_viewer):
+    PLANES_HEIGHT = (0.1, 0.3)
     BOX_HALFHEIGHT = 0.1
+
+    # The ground is a single fixed plane facing up, and any other ground is refused
+    for ground_morphs in (
+        (gs.morphs.Terrain(),),
+        (gs.morphs.Plane(normal=(0.0, 0.6, 0.8)),),
+        (gs.morphs.Plane(), gs.morphs.Plane(pos=(0.0, 0.0, 1.0))),
+    ):
+        scene = gs.Scene(coupler_options=gs.options.SAPCouplerOptions(), show_viewer=False)
+        for morph in ground_morphs:
+            scene.add_entity(morph)
+        with pytest.raises(gs.GenesisException, match="single fixed plane facing up"):
+            scene.build()
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1 / 60,
             substeps=2,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            batch_links_info=batch_links_info,
         ),
         coupler_options=gs.options.SAPCouplerOptions(
             sap_convergence_atol=1e-10,
@@ -395,15 +489,16 @@ def test_sap_rigid_rigid_hydroelastic_contact(show_viewer):
         show_viewer=show_viewer,
         show_FPS=False,
     )
-    plane = scene.add_entity(
+    scene.add_entity(
         gs.morphs.Plane(
-            collision=False,
+            pos=(0.0, 0.0, PLANES_HEIGHT[0]),
+            batch_fixed_verts=True,
         ),
     )
     box = scene.add_entity(
         morph=gs.morphs.Box(
             size=(0.5, 0.5, 2 * BOX_HALFHEIGHT),
-            pos=(0.0, 0.0, BOX_HALFHEIGHT),
+            pos=(0.0, 0.0, PLANES_HEIGHT[0] + BOX_HALFHEIGHT),
         ),
         material=gs.materials.Rigid(),
     )
@@ -411,19 +506,25 @@ def test_sap_rigid_rigid_hydroelastic_contact(show_viewer):
     robot_1 = scene.add_entity(
         gs.morphs.MJCF(
             file=f"{asset_path}/heavy_three_joint_link.xml",
-            pos=(-0.2, -0.26, 0.0),
+            pos=(-0.2, -0.26, PLANES_HEIGHT[0]),
             scale=0.3,
         ),
     )
     robot_2 = scene.add_entity(
         gs.morphs.MJCF(
             file=f"{asset_path}/heavy_three_joint_link.xml",
-            pos=(0.17, -0.26, 0.1),
+            pos=(0.17, -0.26, PLANES_HEIGHT[0] + 0.1),
             euler=(0.0, 0.0, 90.0),
             scale=0.3,
         ),
     )
-    scene.build()
+    scene.build(n_envs=2)
+
+    # The second environment holds the whole scene higher, its ground plane included
+    for entity in scene.entities:
+        entity_pos = entity.get_pos(envs_idx=[1])
+        entity_pos[..., 2] += PLANES_HEIGHT[1] - PLANES_HEIGHT[0]
+        entity.set_pos(entity_pos, envs_idx=[1])
 
     # Run simulation
     for _ in range(80):
@@ -433,21 +534,24 @@ def test_sap_rigid_rigid_hydroelastic_contact(show_viewer):
     for entity in scene.entities:
         assert_allclose(entity.get_links_vel(), 0.0, atol=0.03)
 
-    # The box should stay at its initial position
-    assert_allclose(box.get_pos(), (0.0, 0.0, BOX_HALFHEIGHT), atol=2e-3)
+    # The box should stay at its initial position, resting on the ground plane of each environment
+    box_pos = tensor_to_array(box.get_pos())
+    assert_allclose(box_pos[..., :2], 0.0, atol=2e-3)
+    assert_allclose(box_pos[..., 2] - PLANES_HEIGHT, BOX_HALFHEIGHT, atol=2e-3)
 
     # The box, and both robots should be laying on top of each other
-    robot_1_min_corner, robot_1_max_corner = robot_1.get_AABB()
-    robot_2_min_corner, robot_2_max_corner = robot_2.get_AABB()
-    assert (robot_1_min_corner[:2] > -0.4).all() and (robot_2_min_corner[:2] > -0.4).all()
-    assert (robot_1_min_corner[:2] < 0.4).all() and (robot_2_min_corner[:2] < 0.4).all()
-    assert robot_1_max_corner[2] > 2 * BOX_HALFHEIGHT
-    assert robot_2_max_corner[2] > robot_1_max_corner[2] + 0.05
+    robot_1_aabb = tensor_to_array(robot_1.get_AABB())
+    robot_2_aabb = tensor_to_array(robot_2.get_AABB())
+    assert (robot_1_aabb[..., 0, :2] > -0.4).all() and (robot_2_aabb[..., 0, :2] > -0.4).all()
+    assert (robot_1_aabb[..., 0, :2] < 0.4).all() and (robot_2_aabb[..., 0, :2] < 0.4).all()
+    assert (robot_1_aabb[..., 1, 2] - PLANES_HEIGHT > 2 * BOX_HALFHEIGHT).all()
+    assert (robot_2_aabb[..., 1, 2] > robot_1_aabb[..., 1, 2] + 0.05).all()
 
 
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
 def test_sap_fem_vs_robot(show_viewer):
+    PLANE_HEIGHT = 0.1
     SPHERE_RADIUS = 0.2
 
     scene = gs.Scene(
@@ -468,14 +572,14 @@ def test_sap_fem_vs_robot(show_viewer):
         show_viewer=show_viewer,
         show_FPS=False,
     )
-    plane = scene.add_entity(
+    scene.add_entity(
         gs.morphs.Plane(
-            collision=False,
+            pos=(0.0, 0.0, PLANE_HEIGHT),
         ),
     )
     sphere = scene.add_entity(
         morph=gs.morphs.Sphere(
-            pos=(0.0, 0.0, SPHERE_RADIUS),
+            pos=(0.0, 0.0, PLANE_HEIGHT + SPHERE_RADIUS),
             radius=SPHERE_RADIUS,
         ),
         material=gs.materials.FEM.Elastic(
@@ -488,7 +592,7 @@ def test_sap_fem_vs_robot(show_viewer):
     robot = scene.add_entity(
         gs.morphs.MJCF(
             file=f"{asset_path}/cross.xml",
-            pos=(0.0, 0.0, 2 * SPHERE_RADIUS + 0.04),
+            pos=(0.0, 0.0, PLANE_HEIGHT + 2 * SPHERE_RADIUS + 0.04),
             scale=0.5,
         ),
     )
@@ -498,16 +602,19 @@ def test_sap_fem_vs_robot(show_viewer):
     for _ in range(50):
         scene.step()
 
-    # Check that the sphere did not move, and the slightly squished
-    state = sphere.get_state()
-    center = state.pos.mean(axis=(0, 1))
+    # Check that the sphere did not move, and is slightly squished on top of the ground plane
+    sphere_verts_pos = sphere.get_verts_pos()
+    center = sphere_verts_pos.mean(axis=0)
     assert_allclose(center[:2], 0.0, tol=0.01)
-    assert center[2] < SPHERE_RADIUS - 0.02
+    assert center[2] < PLANE_HEIGHT + SPHERE_RADIUS - 0.02
+    # FIXME: The SAP solve stops before converging on resting contacts, so the sphere sinks into the ground and
+    # oscillates. The bound covers that error until the solve converges.
+    assert_allclose(sphere_verts_pos[..., 2].min(), PLANE_HEIGHT, atol=2e-3)
 
     # Check that the ant is laying on top of the sphere
     robot_pos = robot.get_pos()
     assert_allclose(robot_pos[:2], 0.0, tol=0.03)
-    assert robot_pos[2] > (2 * SPHERE_RADIUS + 0.04) - 0.05
+    assert robot_pos[2] > (PLANE_HEIGHT + 2 * SPHERE_RADIUS + 0.04) - 0.05
 
     # Check that the legs of the ants are resting on the sphere
     assert_allclose(robot.get_qpos()[-4:].abs(), 1.0, tol=0.1)

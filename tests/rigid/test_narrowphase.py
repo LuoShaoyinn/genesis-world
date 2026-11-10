@@ -31,11 +31,13 @@ resetting errno explicit in this test.
 import copy
 import importlib.util
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from itertools import combinations
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
+
 import pytest
 import trimesh
 from scipy.spatial import ConvexHull
@@ -43,9 +45,12 @@ from scipy.spatial import ConvexHull
 import quadrants as qd
 
 import genesis as gs
-import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.collider import gjk_support, support_field
+from genesis.engine.solvers.rigid.collider.data import ColliderState, GJKInfo, GJKScratch, GJKState
+from genesis.engine.solvers.rigid.collider.support_field import SupportFieldInfo
+from genesis.engine.solvers.rigid.data import DynInfo
+from genesis.utils.data import namespace, opt_in
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..conftest import TOL_SINGLE
@@ -283,17 +288,11 @@ def create_modified_narrowphase_file(tmp_path: Path):
 
     lines = content.split("\n")
 
-    # Disable capsule-capsule analytical path in all kernels
-    lines = find_and_disable_all_conditions(lines, "capsule_contact.func_capsule_capsule_contact")
-
-    # Disable sphere-capsule analytical path in all kernels
-    lines = find_and_disable_all_conditions(lines, "capsule_contact.func_sphere_capsule_contact")
-
-    # Disable sphere-sphere analytical path in all kernels
-    lines = find_and_disable_all_conditions(lines, "capsule_contact.func_sphere_sphere_contact")
-
-    # Disable sphere-box analytical path in all kernels
-    lines = find_and_disable_all_conditions(lines, "func_sphere_box_contact")
+    # Disable the analytical detections, so that func_analytic_contact reports every pair as non-analytic
+    lines = find_and_disable_all_conditions(lines, "is_col, normal, contact_pos, penetration = capsule_contact.func_")
+    lines = find_and_disable_all_conditions(
+        lines, "is_col, normal, contact_pos, penetration = func_sphere_box_contact("
+    )
 
     # Insert errno marker in contact0's GJK path (before gjk.func_gjk call, uses i_b)
     lines = insert_errno_before_call(lines, "gjk.func_gjk(", ERRNO_CALLED_GJK_K1, "MODIFIED: GJK detection in contact0")
@@ -777,6 +776,9 @@ def test_split_vs_monolithic_narrowphase(
         ),
         vis_mode="collision",
     )
+    # The monolithic arm runs GJK on one state per environment, which the split arm leaves unused
+    with namespace(scene._namespace):
+        opt_in(GJKScratch.main, workers=2)
     # Batched build: the split arm packs its work queue across environments through one global counter, a structure
     # a single environment cannot exercise.
     scene.build(n_envs=2)
@@ -814,9 +816,8 @@ def test_split_vs_monolithic_narrowphase(
         scene.step()
         contacts_split = collider.get_contacts(as_tensor=False, to_torch=False)
 
-        # Run with monolithic narrowphase, which runs GJK on the per-env state the split arm leaves unallocated
+        # Run with monolithic narrowphase
         monkeypatch.setattr(collider, "_use_split_narrowphase", False)
-        collider.gjk.activate()
         capsule_a.set_qpos((*pos_a, *quat_a))
         capsule_b.set_qpos((*pos_b, *quat_b))
         box.set_pos(pos_box)
@@ -884,8 +885,8 @@ def test_contact_patch_full_box_box_manifold(show_viewer: bool) -> None:
         assert_allclose(penetrations, 1e-3, atol=1e-5)
 
 
-@pytest.mark.required
-@pytest.mark.parametrize("gjk_collision", [True, False])
+@pytest.mark.required("sparse")
+@pytest.mark.parametrize("gjk_collision", [False, True])
 @pytest.mark.parametrize("n_base_sides", [4, 32])
 def test_multi_contact_overlap_corners(gjk_collision, n_base_sides, show_viewer, tol):
     # A box rests on a wider base, a box or a 32-sided prism, at a random yaw and offset in each environment, so that
@@ -1166,6 +1167,9 @@ def test_mesh_support_exactness(show_viewer, tol):
         )
         for i_e, mesh in enumerate((*meshes, meshes[-1]))
     ]
+    # The support queries run on the GJK state of the monolithic narrowphase, which the split one leaves unused
+    with namespace(scene._namespace):
+        opt_in(GJKScratch.main, workers=1)
     scene.build()
 
     @qd.kernel
@@ -1175,16 +1179,16 @@ def test_mesh_support_exactness(show_viewer, tol):
         supports: qd.types.ndarray(),
         supports_count: qd.types.ndarray(),
         supports_idx: qd.types.ndarray(),
-        dyn_info: array_class.DynInfo,
-        collider_info: array_class.ColliderInfo,
+        dyn_info: DynInfo,
+        support_field_info: SupportFieldInfo,
     ):
         for i_d in range(directions.shape[0]):
             direction = qd.Vector([directions[i_d, 0], directions[i_d, 1], directions[i_d, 2]], dt=gs.qd_float)
-            support, i_v = support_field._func_support_mesh(i_g, direction, dyn_info, collider_info)
+            support, i_v = support_field._func_support_mesh(i_g, direction, dyn_info, support_field_info)
             supports_idx[i_d] = i_v
             for k in qd.static(range(3)):
                 supports[i_d, k] = support[k]
-            supports_count[i_d] = support_field._func_count_supports_mesh(i_g, direction, collider_info)
+            supports_count[i_d] = support_field._func_count_supports_mesh(i_g, direction, support_field_info)
 
     @qd.kernel
     def query_local_supports(
@@ -1192,10 +1196,11 @@ def test_mesh_support_exactness(show_viewer, tol):
         directions: qd.types.ndarray(),
         supports_world: qd.types.ndarray(),
         supports_local: qd.types.ndarray(),
-        collider_state: array_class.ColliderState,
-        gjk_state: array_class.GJKState,
-        dyn_info: array_class.DynInfo,
-        collider_info: array_class.ColliderInfo,
+        collider_state: ColliderState,
+        gjk_state: GJKState,
+        dyn_info: DynInfo,
+        gjk_info: GJKInfo,
+        support_field_info: SupportFieldInfo,
         rigid_config: qd.template(),
         collider_config: qd.template(),
     ):
@@ -1212,7 +1217,8 @@ def test_mesh_support_exactness(show_viewer, tol):
                     collider_state,
                     gjk_state,
                     dyn_info,
-                    collider_info,
+                    gjk_info,
+                    support_field_info,
                     rigid_config,
                     collider_config,
                     shrink_sphere=False,
@@ -1223,7 +1229,7 @@ def test_mesh_support_exactness(show_viewer, tol):
 
     # Directions on the boundaries of the cells of both charts, the second chart seeing a direction (x, y, z) of the
     # mesh frame as (x, -z, y)
-    support_res = qd_to_numpy(scene.rigid_solver.collider.collider_info.support_field.support_res).item()
+    support_res = qd_to_numpy(scene.rigid_solver.collider.support_field.support_field_info.support_res).item()
     theta = np.random.randint(support_res, size=N_RANDOM_DIRECTIONS // 4) / support_res * 2.0 * np.pi
     phi = np.random.uniform(0.25 * np.pi, 0.75 * np.pi, N_RANDOM_DIRECTIONS // 4)
     directions_meridian = np.stack((np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)), axis=-1)
@@ -1263,7 +1269,7 @@ def test_mesh_support_exactness(show_viewer, tol):
             supports_count,
             supports_idx,
             scene.rigid_solver.dyn_info,
-            scene.rigid_solver.collider.collider_info,
+            scene.rigid_solver.collider.support_field.support_field_info,
         )
         directions_local = directions[:8].copy()
         supports_world = np.empty_like(directions_local)
@@ -1276,7 +1282,8 @@ def test_mesh_support_exactness(show_viewer, tol):
             scene.rigid_solver.collider.collider_state,
             scene.rigid_solver.collider.gjk.gjk_state,
             scene.rigid_solver.dyn_info,
-            scene.rigid_solver.collider.collider_info,
+            scene.rigid_solver.collider.gjk.gjk_info,
+            scene.rigid_solver.collider.support_field.support_field_info,
             scene.rigid_solver.rigid_config,
             scene.rigid_solver.collider.collider_config,
         )
@@ -1301,6 +1308,6 @@ def test_mesh_support_exactness(show_viewer, tol):
         supports_count,
         supports_idx,
         scene.rigid_solver.dyn_info,
-        scene.rigid_solver.collider.collider_info,
+        scene.rigid_solver.collider.support_field.support_field_info,
     )
     assert_equal(supports_count, np.repeat((2, 4), (N_RANDOM_DIRECTIONS, 6)))

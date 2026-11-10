@@ -1,16 +1,20 @@
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-import quadrants as qd
 import torch
 import torch.nn.functional as F
+
+import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.options.sensors.options import ProbesWithNormalSensorOptionsMixin
+from genesis.utils.data import opt_in
 from genesis.utils.misc import concat_with_tensor, gaussian_crosstalk_kernel, make_tensor_field
+from genesis.utils.sdf import SDFInfo
 
 if TYPE_CHECKING:
     from genesis.utils.ring_buffer import TensorRingBuffer
@@ -551,6 +555,12 @@ class ContactDepthQuerySensorMixin:
     ``_options.contact_depth_query``, and a ``_shared_context`` ``RaycastContext``.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Queried through signed distance fields unless raycast
+        if self._options.contact_depth_query != "raycast":
+            opt_in(SDFInfo)
+
     def build(self):
         super().build()
         resolve_contact_depth_query(self._shared_metadata, self._options.contact_depth_query, type(self).__name__)
@@ -572,12 +582,7 @@ class ViscoelasticHysteresisMetadataMixin:
     has_any_hysteresis: bool = False
 
 
-ViscoelasticHysteresisSharedMetadataT = TypeVar(
-    "ViscoelasticHysteresisSharedMetadataT", bound=ViscoelasticHysteresisMetadataMixin
-)
-
-
-class ViscoelasticHysteresisMixin(Generic[ViscoelasticHysteresisSharedMetadataT]):
+class ViscoelasticHysteresisMixin[ViscoelasticHysteresisSharedMetadataT: ViscoelasticHysteresisMetadataMixin]:
     """
     Viscoelastic hysteresis (single Maxwell element, equilibrium gain normalized to 1).
 
@@ -800,10 +805,7 @@ def apply_spatial_crosstalk(
         cache_data[:, t0 : t0 + n_probes * 3] = torque_out.permute(0, 2, 3, 1).reshape(B, n_probes * 3)
 
 
-SpatialCrosstalkSharedMetadataT = TypeVar("SpatialCrosstalkSharedMetadataT", bound=SpatialCrosstalkMetadataMixin)
-
-
-class SpatialCrosstalkMixin(Generic[SpatialCrosstalkSharedMetadataT]):
+class SpatialCrosstalkMixin[SpatialCrosstalkSharedMetadataT: SpatialCrosstalkMetadataMixin]:
     """
     Adds grid spatial crosstalk to a taxel sensor on the measured branch.
 

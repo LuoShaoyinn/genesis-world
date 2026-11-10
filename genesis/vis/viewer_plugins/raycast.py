@@ -1,22 +1,22 @@
 from threading import Lock
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, override
 
 import numpy as np
 import torch
-from typing_extensions import override
 
 import genesis as gs
 from genesis.ext.pyrender.camera import OrthographicCamera
 from genesis.utils.misc import qd_to_numpy, qd_to_torch, with_lock
 from genesis.utils.raycast import Ray, RayHit
+from genesis.utils.raycast_qd import RaycastResult
 
 from .base import ViewerPlugin
 
 if TYPE_CHECKING:
+    from genesis.engine.bvh import BVHConfig, BVHState
     from genesis.engine.scene import Scene
     from genesis.engine.solvers.kinematic_solver import KinematicSolver
     from genesis.ext.pyrender.node import Node
-    from genesis.utils.array_class import BVHState, BVHStaticConfig, RaycastResult
 
 
 class RaycastTarget(NamedTuple):
@@ -24,7 +24,7 @@ class RaycastTarget(NamedTuple):
 
     solver: "KinematicSolver"
     bvh_state: "BVHState"
-    bvh_config: "BVHStaticConfig"
+    bvh_config: "BVHConfig"
     result: "RaycastResult"
     # (n_vfaces,) opt-in mask for a visual BVH; None for a collision BVH, which covers every face.
     vfaces_mask: torch.Tensor | None
@@ -54,8 +54,7 @@ class Raycaster:
     """
 
     def __init__(self, scene: "Scene", use_visual_geom: bool = False):
-        # NOTE: delayed imports to avoid pulling in rigid_solver / array_class before gs is fully initialized.
-        import genesis.utils.array_class as array_class
+        # NOTE: delayed imports to avoid pulling in rigid_solver before gs is fully initialized.
         from genesis.engine.bvh import get_bvh_data
 
         self.scene = scene
@@ -82,7 +81,7 @@ class Raycaster:
                 if n_slots == 0:
                     continue
             bvh = get_bvh_data(n_envs_max, n_slots)
-            result = array_class.get_raycast_result(n_envs_max)
+            result = RaycastResult(sizes=dict(envs=n_envs_max))
             self.targets.append(RaycastTarget(solver, bvh.state, bvh.config, result, vfaces_mask))
 
         if not self.targets:

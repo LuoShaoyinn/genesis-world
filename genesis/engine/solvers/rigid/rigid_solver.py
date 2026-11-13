@@ -1293,7 +1293,12 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
         if cups:
             # Refresh kinematics and the shared scene BVH at every physics
             # substep, before forward dynamics consumes the spring forces.
-            self.update_forward_pos()
+            if is_recording:
+                # A replay starts from state alone. Record one unconditional refresh
+                # here so both suction and dynamics share its kinematic adjoint.
+                self._update_forward_kinematics(self._scene._envs_idx)
+            else:
+                self.update_forward_pos()
             if not self._is_forward_vel_updated:
                 kernel_forward_velocity(self._scene._envs_idx, self.dyn_state, self.dyn_info,
                                         self.rigid_info, self.rigid_config, False)
@@ -1316,7 +1321,10 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
         # A differentiable scene has no SAP coupler, which a scene with 'requires_grad' refuses at build
         if is_recording:
             envs_idx = self._scene._sanitize_envs_idx(None)
-            self._update_forward_kinematics(envs_idx)
+            # Suction changes coupling wrenches, not positions or velocities, so
+            # its recorded Cartesian-space refresh is still valid for dynamics.
+            if not cups:
+                self._update_forward_kinematics(envs_idx)
             kernel_forward_dynamics_without_qacc(
                 self.dyn_state,
                 self.constraint_solver.constraint_state,

@@ -446,7 +446,11 @@ class LaunchRecorder:
                         for arg in args
                         if isinstance(arg, torch.Tensor) and arg.requires_grad
                     }
-                    kernel.grad(*(leaves.get(id(arg), arg) for arg in args))
+                    try:
+                        kernel.grad(*(leaves.get(id(arg), arg) for arg in args))
+                    except Exception as exc:
+                        exc.add_note(f"While reversing kernel {kernel.func.__name__}")
+                        raise
                     for tensor_id, leaf in leaves.items():
                         if tensor_id in tensors_grad:
                             tensors_grad[tensor_id] = tensors_grad[tensor_id] + leaf.grad

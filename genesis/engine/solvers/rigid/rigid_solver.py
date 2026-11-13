@@ -136,6 +136,7 @@ from .constraint.solver import (
 )
 
 from .suction_weld import SuctionWeldMixin
+from .constraint.weld import kernel_update_suction_wrenches, kernel_break_suction
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -1329,6 +1330,9 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
             with custom_backward(self._constraint_force_grad):
                 kernel_compute_smooth_qacc(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
                 self._func_constraint_force()
+            if cups:
+                kernel_update_suction_wrenches(self.dyn_state, self.constraint_solver.constraint_state, self.dyn_info)
+                kernel_break_suction(self.constraint_solver.constraint_state, self.dyn_info)
             kernel_update_acc(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=False)
             kernel_integrate(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, is_backward=False)
             kernel_copy_next_to_curr_clear_coupling(
@@ -1353,6 +1357,9 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
                 update_qvel(self.dyn_state, self.rigid_info, self.rigid_config)
             else:
                 self._func_constraint_force()
+                if cups:
+                    kernel_update_suction_wrenches(self.dyn_state, self.constraint_solver.constraint_state, self.dyn_info)
+                    kernel_break_suction(self.constraint_solver.constraint_state, self.dyn_info)
                 kernel_step_2(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, self._errno)
         else:
             # The work before the constraint solve is captured as three graphs, since the compile time of a kernel grows
@@ -1618,6 +1625,7 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
             qd_zero_grad(self.dyn_state.dofs)
             qd_zero_grad(self.dyn_state.joints)
             qd_zero_grad(self.rigid_info)
+            qd_zero_grad(self.dyn_info.equalities)
             qd_zero_grad(self.dyn_state.geoms)
             qd_zero_grad(self.dyn_state.entities)
 
@@ -1655,12 +1663,6 @@ class RigidSolver(SuctionWeldMixin, GravityMixin, TimeBasedMixin, KinematicSolve
         unless `partial`, and with the warm starts of the collision detection and of the constraint solve it holds as
         saved. The forward kinematics follows the wake-up, which it depends on.
         """
-        for cup in getattr(self, "_suction_cups", ()):
-            if cup._ghost_force is not None:
-                if envs_idx is None:
-                    cup._ghost_force.zero_()
-                else:
-                    cup._ghost_force[envs_idx] = 0.0
         super().set_state(state, envs_idx, partial=True)
         if self._use_hibernation and gs.use_zerocopy:
             envs_mask = indices_to_mask(envs_idx)

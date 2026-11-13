@@ -6037,7 +6037,8 @@ def func_update_contact_force(
     for i_b in range(_B):
         func_add_contacts_force_to_links(i_b, dyn_state, collider_state)
 
-        func_update_soft_weld_wrenches(i_b, dyn_state, constraint_state, dyn_info)
+        if qd.static(not rigid_config.requires_grad):
+            func_update_soft_weld_wrenches(i_b, dyn_state, constraint_state, dyn_info)
 
         # The settled islands fall asleep here, once the solve has written the forces their contacts and dofs keep
         # reporting for as long as they sleep, and before the integration skips their dofs.

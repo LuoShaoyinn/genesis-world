@@ -254,6 +254,16 @@ class LinksInfo(Data, kind=DataKind.INFO, shape=(LINKS, LINKS_INFO_ENVS)):
 
 
 class LinksState(Data, kind=DataKind.DERIVED, shape=(LINKS, ENVS)):
+    # Selected triangle plane in target-local coordinates. Discrete BVH selection is frozen in backward.
+    suction_max_wrench: qd.Tensor = field((float, 6), kind=DataKind.STATE)
+    suction_stiffness: qd.Tensor = field((float, 6), kind=DataKind.STATE, grad=True)
+    suction_damping: qd.Tensor = field((float, 6), kind=DataKind.STATE, grad=True)
+    suction_new_record: qd.Tensor = field(int, kind=DataKind.STATE)
+    suction_target: qd.Tensor = field(int, kind=DataKind.STATE)
+    suction_plane_pos: qd.Tensor = field((float, 3), kind=DataKind.STATE)
+    suction_plane_normal: qd.Tensor = field((float, 3), kind=DataKind.STATE)
+    suction_ghost_force: qd.Tensor = field((float, 3), kind=DataKind.STATE, grad=True)
+
     """The state of each link in each environment: pose, velocities, inertias, wrenches and hibernation."""
 
     # A *_bw array keeps what the backward pass reads and the forward pass overwrites
@@ -448,21 +458,27 @@ class VGeomsState(Data, kind=DataKind.DERIVED, shape=(VGEOMS, ENVS)):
     quat: qd.Tensor = field((float, 4))
 
 
-class EqualitiesInfo(Data, kind=DataKind.INFO, shape=(CANDIDATE_EQUALITIES, ENVS)):
+class EqualitiesInfo(Data, kind=DataKind.STATE, shape=(CANDIDATE_EQUALITIES, ENVS)):
+    release_source: qd.Tensor = field(int, kind=DataKind.SCRATCH)
+    release_data_grad: qd.Tensor = field((float, 18), kind=DataKind.SCRATCH)
+    release_stiffness_grad: qd.Tensor = field((float, 6), kind=DataKind.SCRATCH)
+    release_damping_grad: qd.Tensor = field((float, 6), kind=DataKind.SCRATCH)
+    release_force_grad: qd.Tensor = field((float, 6), kind=DataKind.SCRATCH)
+
     """The equality constraints of each environment: type, bound objects, data and solver parameters."""
 
     eq_obj1id: qd.Tensor = field(int)
     eq_obj2id: qd.Tensor = field(int)
     # The data of a screw constraint, the largest one, sizes the entries of all equalities (see func_screw_frame in
     # constraint/solver.py)
-    eq_data: qd.Tensor = field((float, 18))
+    eq_data: qd.Tensor = field((float, 18), grad=True)
     eq_type: qd.Tensor = field(int)
     sol_params: qd.Tensor = field((float, 7))
     soft_weld_params: qd.Tensor = field((float, 6))
-    soft_weld_stiffness: qd.Tensor = field((float, 6))
-    soft_weld_damping: qd.Tensor = field((float, 6))
+    soft_weld_stiffness: qd.Tensor = field((float, 6), grad=True)
+    soft_weld_damping: qd.Tensor = field((float, 6), grad=True)
     soft_weld_max_wrench: qd.Tensor = field((float, 6))
-    soft_weld_force: qd.Tensor = field((float, 6))
+    soft_weld_force: qd.Tensor = field((float, 6), grad=True)
     soft_weld_had_rows: qd.Tensor = field(bool)
 
 
@@ -499,7 +515,7 @@ class DynInfo(Data):
     vverts: VVertsInfo
     vfaces: VFacesInfo
     vgeoms: VGeomsInfo
-    equalities: EqualitiesInfo = field(labels=DYNAMICS)
+    equalities: EqualitiesInfo = field(labels=DYNAMICS, kind=DataKind.STATE)
 
 
 class DynState(Data):

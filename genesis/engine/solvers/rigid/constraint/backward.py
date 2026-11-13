@@ -755,7 +755,7 @@ def kernel_manual_add_equality_constraints_bw(
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
-    """Manual reverse of `add_equality_constraints` (JOINT + CONNECT + WELD).
+    """Manual reverse of `add_equality_constraints` (JOINT + CONNECT + WELD + SOFT_WELD).
 
     * JOINT   - constrains one scalar dof, optionally against another via a quartic polynomial (1 row).
     * CONNECT - 3 rows pinning `global_anchor1` to `global_anchor2` in world.
@@ -769,8 +769,9 @@ def kernel_manual_add_equality_constraints_bw(
         CONNECT / WELD:
             dyn_state.links.{pos, quat, root_COM, cd_ang, cd_vel}.grad[link1 / link2]
             dyn_state.dofs.{cdof_ang, cdof_vel, cdofd_ang, cdofd_vel, vel}.grad over each link chain
-    Model parameters (`sol_params`, `eq_data`, `dyn_info.dofs.invweight`,
-    `dyn_info.links.invweight`) are not differentiated.
+    SOFT_WELD also accumulates gradients into captured anchors/relative orientation
+    and physical stiffness/damping. Ordinary equality model parameters, solver
+    parameters and inverse weights are not differentiated.
 
     Forward recap (per equality of type JOINT):
         diff = qpos[i_qpos2] - qpos0[i_qpos2], or 0 when joint2 is omitted
@@ -1057,7 +1058,8 @@ def kernel_manual_add_equality_constraints_bw(
                 dyn_state.links.pos.grad[link2_idx, i_b] += g_ga2
                 dyn_state.links.quat.grad[link1_idx, i_b] += g_quat1
                 dyn_state.links.quat.grad[link2_idx, i_b] += g_quat2
-            else:
+            elif (dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.WELD
+                  or dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD):
                 # ----------------------------------------------------------
                 # WELD: 6 rows - 3 position + 3 orientation, all sharing
                 # a single combined pos_imp = ||all_error|| (6D).
@@ -1182,6 +1184,30 @@ def kernel_manual_add_equality_constraints_bw(
                     d_aref_d_jac_qvel = -b_coef
                     d_aref_d_ref_direct = -k_coef * imp
                     d_aref_d_imp = -k_coef * pos_error[i_3]
+                    if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD:
+                        scale = gs.qd_float(1.0)
+                        stiffness = scale * dyn_info.equalities.soft_weld_stiffness[i_e, i_b][i_3]
+                        damping = scale * dyn_info.equalities.soft_weld_damping[i_e, i_b][i_3]
+                        dt = rigid_info.substep_dt[None]
+                        raw_denom = dt * (damping + dt * stiffness)
+                        denom = qd.max(raw_denom, EPS)
+                        d_aref_d_jac_qvel = -(damping + dt * stiffness) / denom
+                        d_aref_d_ref_direct = -stiffness / denom
+                        d_aref_d_imp = 0.0
+                        d_efc_D_d_imp_pos = 0.0
+                        velocity = gs.qd_float(0.0)
+                        for k in range(constraint_state.jac_n_dofs[n_con, i_b]):
+                            dof = constraint_state.jac_dofs_idx[n_con, k, i_b]
+                            velocity += constraint_state.jac[n_con, dof, i_b] * dyn_state.dofs.vel[dof, i_b]
+                        numerator = stiffness * pos_error[i_3] + (damping + dt * stiffness) * velocity
+                        g_denom = g_aref * numerator / (denom * denom) + g_efc_D
+                        g_k = -g_aref * (pos_error[i_3] + dt * velocity) / denom
+                        g_c = -g_aref * velocity / denom
+                        if raw_denom > EPS:
+                            g_k += g_denom * dt * dt
+                            g_c += g_denom * dt
+                        dyn_info.equalities.soft_weld_stiffness.grad[i_e, i_b][i_3] += scale * g_k
+                        dyn_info.equalities.soft_weld_damping.grad[i_e, i_b][i_3] += scale * g_c
                     g_jdotv[i_3] = -g_aref
 
                     dL_d_imp_total = dL_d_imp_total + g_aref * d_aref_d_imp + g_efc_D * d_efc_D_d_imp_pos
@@ -1255,6 +1281,30 @@ def kernel_manual_add_equality_constraints_bw(
                     d_aref_d_jac_qvel = -b_coef
                     d_aref_d_ref_direct = -k_coef * imp
                     d_aref_d_imp = -k_coef * rot_error[i_3]
+                    if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD:
+                        scale = gs.qd_float(4.0)
+                        stiffness = scale * dyn_info.equalities.soft_weld_stiffness[i_e, i_b][i_3 + 3]
+                        damping = scale * dyn_info.equalities.soft_weld_damping[i_e, i_b][i_3 + 3]
+                        dt = rigid_info.substep_dt[None]
+                        raw_denom = dt * (damping + dt * stiffness)
+                        denom = qd.max(raw_denom, EPS)
+                        d_aref_d_jac_qvel = -(damping + dt * stiffness) / denom
+                        d_aref_d_ref_direct = -stiffness / denom
+                        d_aref_d_imp = 0.0
+                        d_efc_D_d_imp_rot = 0.0
+                        velocity = gs.qd_float(0.0)
+                        for k in range(constraint_state.jac_n_dofs[n_con, i_b]):
+                            dof = constraint_state.jac_dofs_idx[n_con, k, i_b]
+                            velocity += constraint_state.jac[n_con, dof, i_b] * dyn_state.dofs.vel[dof, i_b]
+                        numerator = stiffness * rot_error[i_3] + (damping + dt * stiffness) * velocity
+                        g_denom = g_aref * numerator / (denom * denom) + g_efc_D
+                        g_k = -g_aref * (rot_error[i_3] + dt * velocity) / denom
+                        g_c = -g_aref * velocity / denom
+                        if raw_denom > EPS:
+                            g_k += g_denom * dt * dt
+                            g_c += g_denom * dt
+                        dyn_info.equalities.soft_weld_stiffness.grad[i_e, i_b][i_3 + 3] += scale * g_k
+                        dyn_info.equalities.soft_weld_damping.grad[i_e, i_b][i_3 + 3] += scale * g_c
                     # Rotational bias: stored aref = aref - 0.5 * (t1 + t2 + t3)[i_3 + 1] * torquescale, the same
                     # upstream gradient reaching each of t1 / t2 / t3.
                     g_t_quat[i_3 + 1] = -0.5 * torquescale * g_aref
@@ -1432,6 +1482,16 @@ def kernel_manual_add_equality_constraints_bw(
 
                 # q_var = quat_mul(quat_body1, relpose); relpose const => drop g_v.
                 g_quat1_from_q = gu.qd_quat_mul_grad_lhs(quat_body1, relpose, g_q)
+                if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD:
+                    g_relpose = gu.qd_quat_mul_grad_rhs(quat_body1, relpose, g_q)
+                    g_relpose += gu.qd_quat_mul_grad_rhs(qdot_body1, relpose, g_qdot0r)
+                    g_anchor1 = gu.qd_inv_transform_by_quat(g_ga1, quat_body1)
+                    g_anchor2 = gu.qd_inv_transform_by_quat(g_ga2, quat_body2)
+                    for j in qd.static(range(3)):
+                        dyn_info.equalities.eq_data.grad[i_e, i_b][j + 3] += g_anchor1[j]
+                        dyn_info.equalities.eq_data.grad[i_e, i_b][j] += g_anchor2[j]
+                    for j in qd.static(range(4)):
+                        dyn_info.equalities.eq_data.grad[i_e, i_b][j + 6] += g_relpose[j]
 
                 # Anchor chain ga1, ga2 -> dyn_state.links.{pos, quat}.
                 g_quat1_anchor = gu.qd_transform_by_quat_grad_quat(anchor1_local, quat_body1, g_ga1)

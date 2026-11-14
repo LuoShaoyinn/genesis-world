@@ -1151,10 +1151,17 @@ def qd_from_torch(value: qd.Tensor | qd.Field | qd.Ndarray, tensor: torch.Tensor
     if isinstance(value, qd.Tensor):
         value = value._unwrap()
     if gs.use_zerocopy.is_supported:
-        view = qd_to_torch(value, copy=False)
-        view.copy_(tensor)
-    else:
-        value.from_torch(tensor)
+        try:
+            view = qd_to_torch(value, copy=False)
+        except (ValueError, RuntimeError, TypeError):
+            # Backend support does not imply that every dtype/layout has a
+            # zero-copy view (e.g. static u64 collision keys during replay).
+            # Mirror qd_to_torch's copy fallback when restoring these arrays.
+            pass
+        else:
+            view.copy_(tensor)
+            return
+    value.from_torch(tensor)
 
 
 @qd.func

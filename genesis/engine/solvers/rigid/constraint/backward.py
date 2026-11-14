@@ -1171,6 +1171,11 @@ def kernel_manual_add_equality_constraints_bw(
                 # bias gradients per row and reverse them after the row loops.
                 g_jdotv = gs.qd_vec3(0.0, 0.0, 0.0)
                 g_t_quat = qd.Vector([0.0, 0.0, 0.0, 0.0], dt=gs.qd_float)
+                # Static MatrixField gradient components are not dynamically indexable.
+                # Accumulate coefficient adjoints in local vectors, then add the whole
+                # vectors to storage. This also works with the ndarray backend.
+                g_soft_stiffness = gs.qd_vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                g_soft_damping = gs.qd_vec6(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
                 # ---- Position rows (3) -- mirrors CONNECT structure ----
                 n_con_orient_base = n_con_counter + 3  # rotation rows start here
@@ -1206,8 +1211,8 @@ def kernel_manual_add_equality_constraints_bw(
                         if raw_denom > EPS:
                             g_k += g_denom * dt * dt
                             g_c += g_denom * dt
-                        dyn_info.equalities.soft_weld_stiffness.grad[i_e, i_b][i_3] += scale * g_k
-                        dyn_info.equalities.soft_weld_damping.grad[i_e, i_b][i_3] += scale * g_c
+                        g_soft_stiffness[i_3] += scale * g_k
+                        g_soft_damping[i_3] += scale * g_c
                     g_jdotv[i_3] = -g_aref
 
                     dL_d_imp_total = dL_d_imp_total + g_aref * d_aref_d_imp + g_efc_D * d_efc_D_d_imp_pos
@@ -1303,8 +1308,8 @@ def kernel_manual_add_equality_constraints_bw(
                         if raw_denom > EPS:
                             g_k += g_denom * dt * dt
                             g_c += g_denom * dt
-                        dyn_info.equalities.soft_weld_stiffness.grad[i_e, i_b][i_3 + 3] += scale * g_k
-                        dyn_info.equalities.soft_weld_damping.grad[i_e, i_b][i_3 + 3] += scale * g_c
+                        g_soft_stiffness[i_3 + 3] += scale * g_k
+                        g_soft_damping[i_3 + 3] += scale * g_c
                     # Rotational bias: stored aref = aref - 0.5 * (t1 + t2 + t3)[i_3 + 1] * torquescale, the same
                     # upstream gradient reaching each of t1 / t2 / t3.
                     g_t_quat[i_3 + 1] = -0.5 * torquescale * g_aref
@@ -1320,6 +1325,10 @@ def kernel_manual_add_equality_constraints_bw(
                         dyn_state.dofs.vel.grad[i_d, i_b] += (
                             dL_d_jac_qvel_orient[i_3] * constraint_state.jac[n_con, i_d, i_b]
                         )
+
+                if dyn_info.equalities.eq_type[i_e, i_b] == gs.EQUALITY_TYPE.SOFT_WELD:
+                    dyn_info.equalities.soft_weld_stiffness.grad[i_e, i_b] += g_soft_stiffness
+                    dyn_info.equalities.soft_weld_damping.grad[i_e, i_b] += g_soft_damping
 
                 # Orientation chain walk: per i_d on chain, build g_quat3_d from
                 # the 3 orient rows, then back-prop through quat_mul/quat_mul_axis.
